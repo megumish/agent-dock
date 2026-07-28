@@ -4,6 +4,7 @@
 !.env.example
 *.pem
 *.key
+.claude/settings.local.json
 
 # Local runtime data
 work/
