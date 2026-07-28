@@ -1,0 +1,22 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local runtime data
+work/
+logs/
+.tmp/
+.DS_Store
+
+# Language and tool caches
+__pycache__/
+*.py[cod]
+node_modules/
+.venv/
+
+# Editor settings
+.vscode/
+.idea/
