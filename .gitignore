@@ -5,6 +5,7 @@
 *.pem
 *.key
 .claude/settings.local.json
+.codex/hooks.json
 
 # Local runtime data
 work/
