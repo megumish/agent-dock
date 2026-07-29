@@ -117,7 +117,7 @@
 **入口で確定する ADR**: 4a 入口 = D-05 の実験用暫定方針・D-11 の risk v0・D-17 の較正。**4a 出口／4b 入口 = routing choice ADR＋advisory exploration の予算と低リスク scope の事前確定**（4a の証拠に基づく。4a は shadow のみで探索支出をしないため予算未確定でよい。4b で randomized/switchback を使う場合は介入予算も 4b 開始前に確定）。
 
 **段階**:
-- **4a shadow routing**: 推薦を計算・記録するが提示も実行もしない。**探索推薦**（証拠の薄い候補への予算内推薦）も同様に shadow で記録する。ゲート: **coverage・較正・abstention の適切さ・無影響**（帰結差の識別は主張しない）を確認してから 4b へ
+- **4a shadow routing**: 推薦を計算・記録するが提示も実行もしない。**探索推薦**（証拠の薄い候補への推薦）も同様に shadow で記録する。ゲート: **coverage・較正・abstention の適切さ・無影響**（帰結差の識別は主張しない）を確認してから 4b へ
 - **4b advisory**: 根拠＋abstain つき提案・毎回明示承認。推薦・提示・採択/棄却を分離記録。予算内・低リスクの **advisory exploration**（探索提案の明示承認つき実行）もここで検証する
 
 **検証設計**: 4b では**事前登録した識別可能な前向き設計**（例: paired replay・低リスク領域での無作為化・switchback〈期間を区切って采配方式を交互に切り替えて比較する設計〉）で、採択・不採択双方の品質・コスト・attention を検証する。**関連（association）しか得られない場合は因果の主張をせず、その根拠だけで自動委任に進まない。4b が基準を満たさなければ routing choice ADR の再検討に戻る。**

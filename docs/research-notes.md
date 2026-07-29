@@ -44,7 +44,7 @@
 ## D-07 リプレイ方式（2026-07-29）
 
 - 事実: このリポジトリは jj（colocated git）で管理されている。
-- VCS アダプタの個別候補: jj workspace / git worktree（jj 管理との両立は要検証）/ 隔離コピー / コンテナ（Docker・Podman）。
+- VCS アダプタの個別候補: jj workspace / git worktree / 隔離コピー / コンテナ（Docker・Podman）。git worktree は、この repo が jj 管理で直接の git コマンド操作を禁止する運用のため、採用するなら jj と整合するアダプタ経由に限る。
 - 傾き: なし（jj workspace と隔離コピーを実測比較してから）。
 
 ## D-08 外部取り込み（2026-07-29）

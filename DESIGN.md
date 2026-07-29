@@ -231,6 +231,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: D-18 の契約定義 / no later than: Phase 1 入口。
 - ADRトリガ: D-18 確定と Phase 1 開始。
 - 可逆性: 高（契約の背後で差し替え可能）。
+
 ### D-02 イベント記録（型付き封筒とストレージ）
 
 - 状態: open（封筒は Phase 0 で ADR 必須）
@@ -242,6 +243,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: 封筒: not before: なし / no later than: Phase 0。v0 ストア: not before: なし / no later than: Phase 0（可逆な暫定として）。最終ストア: not before: Phase 2 の射影クエリの実態 / no later than: なし（意図的未決。**再評価トリガ: Phase 2 で v0 の限界が示された時、遅くとも Phase 3 入口の定期再評価**）。
 - ADRトリガ: Phase 0 開始（封筒・v0 ストア）、上記の再評価トリガ（最終ストア）。
 - 可逆性: 封筒は低。ストレージ・参照方式は高。
+
 ### D-03 タスク分類（taxonomy）
 
 - 状態: open
@@ -253,6 +255,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: Phase 1 のデータ / no later than: Phase 2 入口。
 - ADRトリガ: Phase 2 開始。
 - 可逆性: 高（タグは追加・再付与できる。cohort は凍結）。
+
 ### D-04 役割と適性要件
 
 - 状態: open
@@ -264,6 +267,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: 暫定役割（candidate/shadow 用）: not before: Phase 2 出口の通過 / no later than: Phase 3。最終（執行用）: not before: Phase 3–4 の候補運用データ / no later than: Phase 5。
 - ADRトリガ: Phase 3 開始（暫定）、Phase 5 開始（最終）。
 - 可逆性: 中。
+
 ### D-05 采配方式（rank / abstain）
 
 - 状態: open
@@ -275,6 +279,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: 暫定方針（実験用）: not before: Phase 2 出口の通過 / no later than: Phase 4a 入口。routing choice: not before: 4a の shadow 証拠 / no later than: 4b 入口。
 - ADRトリガ: Phase 4a 開始（暫定）、4b 開始（選定）、4b 失敗（再検討）。
 - 可逆性: 高（決定イベントの形だけ固定）。
+
 ### D-06 フィードバック UX
 
 - 状態: open
@@ -286,6 +291,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: なし / no later than: Phase 1 入口。
 - ADRトリガ: Phase 1 開始。
 - 可逆性: 高。
+
 ### D-07 リプレイ方式
 
 - 状態: open
@@ -297,6 +303,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: Phase 1 の replay manifest の蓄積 / no later than: Phase 3 入口。
 - ADRトリガ: Phase 3 開始。
 - 可逆性: 高。
+
 ### D-08 外部取り込み（3つのサブ決定）
 
 - 状態: open
@@ -308,6 +315,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: 価格 contract v0: not before: なし / no later than: 最初の real run 前（Phase 1 入口）。prior・シグナル: not before: なし / no later than: Phase 3。
 - ADRトリガ: Phase 1 開始（価格）、Phase 3 開始（prior・シグナル）。
 - 可逆性: 高。
+
 ### D-09 資格ゲート（自律委任の必要条件）
 
 - 状態: open
@@ -319,6 +327,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: 資格候補の運用（Phase 3）/ no later than: Phase 5 入口。
 - ADRトリガ: Phase 5 開始。
 - 可逆性: 中。
+
 ### D-10 鮮度・再審査（2つのサブ決定）
 
 - 状態: open
@@ -330,6 +339,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: freshness v0: not before: Phase 1 のデータ / no later than: Phase 2 入口。scheduler v0: not before: Phase 2 の射影 / no later than: Phase 3 入口。較正・定常化: not before: Phase 3 の定点観測 / no later than: Phase 5。
 - ADRトリガ: 各段階の開始。
 - 可逆性: 高。
+
 ### D-11 リスク分類と探索予算
 
 - 状態: open（境界執行の契約は D-21）
@@ -341,6 +351,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: risk v0: not before: Phase 1 の実記録 / no later than: Phase 4 入口。執行用 risk ADR: not before: Phase 4 の誤判定証拠 / no later than: Phase 5 入口。探索予算: not before: なし / no later than: 各探索形態の開始前（advisory exploration 用は 4b 入口。delegated exploration 用は Phase 5 入口に別版として確定または再承認）。**4b で randomized/switchback を使う場合の介入予算: not before: なし / no later than: 4b 開始前。**
 - ADRトリガ: Phase 4 開始（v0）、Phase 5 開始（執行用）、探索・介入の各開始（予算）。
 - 可逆性: ルールの中身は高。
+
 ### D-12 代行監査（独立性・サンプリング・不一致処理）
 
 - 状態: open
@@ -352,6 +363,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: 暫定サンプリング（初期高率）: not before: なし / no later than: Phase 3 入口。最終: not before: shadow 一致証拠の蓄積 / no later than: Phase 5b 入口。
 - ADRトリガ: Phase 3 開始（暫定）、Phase 5b 開始（最終）。
 - 可逆性: 高。
+
 ### D-13 実行プロファイルの同一性（意味契約）
 
 - 状態: open（identity は Phase 0 で ADR 必須）
@@ -363,6 +375,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: identity: not before: なし / no later than: Phase 0。equivalence・portability: not before: Phase 1–2 の構成変更の実例 / no later than: Phase 3（暫定）。
 - ADRトリガ: Phase 0 開始、Phase 3 開始。
 - 可逆性: identity は低・等価性は中。
+
 ### D-14 作業とイベントの紐付け（意味契約）
 
 - 状態: open（Phase 0 で ADR 必須）
@@ -374,6 +387,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: なし / no later than: Phase 0。
 - ADRトリガ: Phase 0 開始。
 - 可逆性: 低。
+
 ### D-15 ユーザー権限・方針の表現と権威（意味契約）
 
 - 状態: open（Phase 0 で ADR 必須）
@@ -385,6 +399,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: なし / no later than: Phase 0。
 - ADRトリガ: Phase 0 開始。
 - 可逆性: 表現形式は中・記録済み許可は不変。
+
 ### D-16 評価契約（意味契約）
 
 - 状態: open（Phase 0 で ADR 必須）
@@ -396,6 +411,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: なし / no later than: Phase 0（登録が先、データが後）。
 - ADRトリガ: Phase 0 開始。
 - 可逆性: 低（変更は新しい登録として追加）。
+
 ### D-17 射影カタログと較正（選択バイアスを含む）
 
 - 状態: open
@@ -407,17 +423,19 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: 最小形（カタログ v0 を含む）: not before: Phase 1 のデータ / no later than: Phase 2 入口。較正: not before: Phase 2–3 の保留データ / no later than: Phase 4 入口。
 - ADRトリガ: Phase 2 開始（最小形）、Phase 4 開始（較正）。
 - 可逆性: 高。
+
 ### D-18 アダプタ契約
 
 - 状態: open
 - 問い: 実行アダプタの共通契約 — capability 申告・実行レシート・cancel/retry・部分失敗・in-doubt・タイムアウト・**decision-event channel**。
 - VISION制約: 実測の忠実性。失敗も証拠。遂行中の技術判断も決定イベント（観測できない場合は欠測を明示）。
 - 選択肢と調査: 契約項目: 実測フィールドの必須/任意、レシート（実構成・可能な範囲の実サーバ/バージョン）、kill 可能性、in-doubt 表現、decision-event の有無。記述形式: 宣言的スキーマ（個別形式・参考標準は調査ノート）。**core conformance matrix**（ガード介入・cancel・レシート・unknown・保守性・ベンダー中立）で D-01 候補を比較。**minimal 契約（first-real-run gate・D-24 と共同）— 意味要件**: 実行の意図が実行前に永続化される／attempt が識別可能／開始を記録できない場合は実行しない（fail-closed）／実行の事実と結果が突き合わせ可能／unknown が表現・解決される。実現機構（outbox 等）は D-24 の候補から ADR で選ぶ。
-- 証拠計画: Phase 1 で導入済み 3 CLI の出力を契約に当てて充足度を実測。
+- 証拠計画: Phase 1 で、D-01 の ADR 時に環境 inventory で対象とした導入済み CLI 群の出力を契約に当てて充足度を実測。
 - 依存: D-24（完全性契約と共同）。
 - 決定境界: minimal（D-24 と共同）: not before: なし / no later than: 最初の real run 前（Phase 1 入口）。full: not before: minimal の運用実績 / no later than: Phase 1 出口。
 - ADRトリガ: Phase 1 開始（minimal）、Phase 1 出口（full）。
 - 可逆性: 中（拡張は可、破壊は不可）。
+
 ### D-19 スキーマ・射影の進化
 
 - 状態: open（互換原則は Phase 0 で明文化）
@@ -429,6 +447,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: 互換性・移行の原則: not before: なし / no later than: 最初のイベントの前（Phase 0）。機構: not before: Phase 1 のイベント蓄積 / no later than: Phase 2。
 - ADRトリガ: Phase 0 開始（原則）、Phase 2 開始（機構）。
 - 可逆性: 高。
+
 ### D-20 リポジトリ境界（dotfiles との責務分担）
 
 - 状態: open
@@ -440,6 +459,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: なし / no later than: Phase 1 入口。
 - ADRトリガ: Phase 1 開始。
 - 可逆性: 高。
+
 ### D-21 秘密・送信・保持境界の執行契約（意味契約）
 
 - 状態: open（Phase 0 で ADR 必須）
@@ -451,6 +471,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: なし / no later than: 最初の非 dummy 実行の前。
 - ADRトリガ: Phase 0 開始（契約）、Phase 1 開始（real 実行への適用確認）。
 - 可逆性: 「fail-closed であること」は不変。方式は高。
+
 ### D-22 資格ライフサイクル（意味契約に準ずる）
 
 - 状態: open
@@ -462,6 +483,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: candidate 運用の形: not before: Phase 2 出口の通過 / no later than: Phase 3。執行を伴う完全形: not before: Phase 3 の遷移実例 / no later than: Phase 5。
 - ADRトリガ: Phase 3 開始、Phase 5 開始。
 - 可逆性: 中。
+
 ### D-23 監査再構成契約
 
 - 状態: open
@@ -473,6 +495,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: not before: Phase 1 の決定イベントの実例 / no later than: Phase 2。
 - ADRトリガ: Phase 2 開始。
 - 可逆性: 中。
+
 ### D-24 障害・イベント完全性契約
 
 - 状態: open
@@ -484,6 +507,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 決定境界: minimal（状態機械・in-doubt）: not before: なし / no later than: 最初の real run 前（Phase 1 入口）。完全な回復手順: not before: Phase 1 の障害試験 / no later than: Phase 5。
 - ADRトリガ: Phase 1 開始（minimal）、Phase 5 開始（完全形）。
 - 可逆性: 中。
+
 ## 横断課題
 
 - **テレメトリの切り分け**: 采配の委任（routing）と評価の代行（teacher signal）は自律性の別軸。イベントにどちらの軸の自動化が関与したかを記録し、異常時に原因を切り分けられるようにする（PLAN のインシデントレーンと対）。
