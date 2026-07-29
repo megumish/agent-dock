@@ -6,7 +6,7 @@
 
 - **各フェーズはそれ自体で使える価値を出す**。
 - **決定はフェーズ入口で ADR 化する**。意味契約（D-02 封筒・D-13 identity・D-14・D-15・D-16・D-19 原則・D-21）は Phase 0 で確定し、数値・アルゴリズムは証拠が揃うまで決めない。
-- **Phase 0 は dummy-only**。real 実行は Phase 1 からとし、**first-real-run gate**（D-08 価格 v0／D-18・D-24 の**意味要件への適合**〈実行意図の事前永続化・attempt の識別可能性・開始を記録できなければ実行しない・実行事実と結果の突き合わせ可能性・unknown の表現と解決〉／価格鮮度・インシデントレーンの稼働）を Phase 1 入口に置く。意味要件を満たす実現機構は ADR で選ぶ。
+- **Phase 0 は dummy-only**。real 実行は Phase 1 からとし、**first-real-run gate**（D-08 価格 v0／D-18・D-24 の**意味要件への適合**〈唯一の定義は DESIGN D-18〉／価格鮮度・インシデントレーンの稼働）を Phase 1 入口に置く。意味要件を満たす実現機構は ADR で選ぶ。
 - **比較条件は結果を見る前に登録する**。事前登録は版と window を持ち、**cohort 定義は登録時に凍結**する（後日のタグ訂正で過去の membership を書き換えない。分類変更を使う比較は新登録）。
 - **手間の上限をフェーズ出口条件に含める**。
 - **自律性の2軸を同じフェーズで広げない**。采配の委任（Phase 4–5）と評価の代行（Phase 5b）は独立に解放する。
@@ -19,8 +19,8 @@
 1. **検証証拠**: 何が確認されたか（成果物として保存され、事前登録の版・window を参照する）
 2. **stop / rollback 条件**: **rollback とはモード・資格・導出状態の巻き戻しであり、イベントの削除ではない**
 3. **確定した ADR** の列挙
-4. **意図的に未決のまま残す Decision**: Register 上で「当該フェーズより no-later-than が後、または期限なし」の open 項目（subdecision 含む）の**スナップショットを出口 artifact として添付**する。本文には代表例のみ記載し、正は常にスナップショット
-5. **レーン health**: そのフェーズまでに始まった継続レーンの health 証拠を**出口成果物として添付**する
+4. **意図的に未決のまま残す Decision**: Register 上で「当該フェーズより no-later-than が後、または期限なし」の open 項目（subdecision 含む）を、**出口記録が当該時点の repository revision で固定参照**する（Register は repo 内にあるため複製の添付は要しない）。本文には代表例のみ記載し、正は常に参照先 revision の Register
+5. **レーン health**: そのフェーズまでに始まった継続レーンの health 証拠を**出口記録から固定参照**する（保存場所は evidence 側の決定に従う）
 
 **決裁**: ADR の採択と、フェーズ遷移（特に自律権限を広げる遷移）の最終決裁はユーザーが行う（VISION: 始動・ユーザーが最上位）。エージェントは起草と提案を行えるが、採択・遷移を自動では行わない。
 
@@ -49,14 +49,14 @@
 - 検証証拠: 縦切り1件の記録と来歴の追跡／最小ガードの fail-closed 動作／**安全 negative tests**（bypass 不能・未許可 egress の拒否・秘密の非送信/非記録・単発許可の scope/expiry/再利用拒否・保持削除の契約動作）／run 非依存イベント（方針変更）が封筒で表現できる／dummy 骨格の操作・ADR 運用に要した attention の計測（上限比）
 - stop/rollback: スキーマの作り直しは disposable なテスト名前空間のみで許す（正典記録は消さない — ユーザー起点の認可された削除を唯一の例外とする。DESIGN の優先規則参照）
 - 確定 ADR: D-02（封筒・v0 ストア）・D-13（identity）・D-14・D-15・D-16・D-19（原則）・D-21
-- 意図的未決: Register スナップショットを添付（代表例: 最終ストア〈D-02 再評価トリガつき〉・射影式・減衰値・采配アルゴリズム・taxonomy）
-- レーン health: 保持・削除（開始。この段階の health = 記録/消去契約の検証）— 証拠を出口成果物に添付
+- 意図的未決: 出口 revision の Register を固定参照（代表例: 最終ストア〈D-02 再評価トリガつき〉・射影式・減衰値・采配アルゴリズム・taxonomy）
+- レーン health: 保持・削除（開始。この段階の health = 記録/消去契約の検証）— 証拠を出口記録から固定参照
 
 ## Phase 1 — 采配を変えない観測（first real run）
 
 **目的**: 采配のやり方を変えずに、記録が増える状態（manual 経路・始動状態）。ガード・ラッパによる境界執行は加わるため厳密には挙動不変ではない — 変えないのは**采配**である。**最初の real 実行はこのフェーズの gate を通ってから。**
 
-**入口で確定する ADR（first-real-run gate を含む）**: D-18・D-24 共同 minimal（上記の意味要件への適合。実現機構は ADR で選ぶ）→ D-01（実行基盤）、D-06（フィードバック UX）、D-08 の価格 contract v0、D-20（dotfiles 境界）、D-21 の real 実行への適用確認。gate には価格鮮度・インシデントレーンの稼働開始も含む。
+**入口で確定する ADR（first-real-run gate を含む）**: D-18・D-24 共同 minimal（意味要件への適合 — 唯一の定義は DESIGN D-18。実現機構は ADR で選ぶ）→ D-01（実行基盤）、D-06（フィードバック UX）、D-08 の価格 contract v0、D-20（dotfiles 境界）、D-21 の real 実行への適用確認。gate には価格鮮度・インシデントレーンの稼働開始も含む。
 
 **成果物**:
 - 入口コマンド／スキル（manual 経路のラップ。ルータ不要）
@@ -70,8 +70,8 @@
 - 検証証拠: 対象コホートの主要経路の記録率／失敗・リトライ・in-doubt の記録実例／訂正・削除の成功実例／再構成可能な task ≥1（manifest から）／attention 上限内／wrapper 観測影響の計測結果／クラッシュ試験で欠落が**検出**されること
 - stop/rollback: **必須の意味・安全フィールドが手間制約に収められない場合は、削るのではなく停止して設計を見直す**。記録の手間超過は簡略化で対応
 - 確定 ADR: D-18（minimal→full）・D-24（minimal）・D-01・D-06・D-08（価格 v0）・D-20
-- 意図的未決: Register スナップショットを添付（代表例: taxonomy・射影・采配・リスク分類・D-12・最終ストア）
-- レーン health: 保持・削除／負担監視／インシデント／価格鮮度 — 各証拠を添付
+- 意図的未決: 出口 revision の Register を固定参照（代表例: taxonomy・射影・采配・リスク分類・D-12・最終ストア）
+- レーン health: 保持・削除／負担監視／インシデント／価格鮮度 — 各証拠を固定参照
 
 ## Phase 2 — 射影と開示
 
@@ -88,8 +88,8 @@
 - 検証証拠: 事前登録した比較の集計（版参照つき）／カタログ v0 の各軸が実データで計算・表示された実例／holdout 非混入の機械的確認／D-23 受入テスト（削除ケース含む）／rebuild と削除尊重の実演
 - stop/rollback: 不確実性の過小表示が判明したら表示を保守側に倒す
 - 確定 ADR: D-03・D-17（最小形）・D-10（freshness v0）・D-19（機構）・D-23
-- 意図的未決: Register スナップショットを添付（代表例: 較正方式・減衰の数値・采配方式・D-12・最終ストア〈再評価トリガ監視中〉）
-- レーン health: 上記に加え schema/profile migration（開始）— 各証拠を添付
+- 意図的未決: 出口 revision の Register を固定参照（代表例: 較正方式・減衰の数値・采配方式・D-12・最終ストア〈再評価トリガ監視中〉）
+- レーン health: 上記に加え schema/profile migration（開始）— 各証拠を固定参照
 
 ## Phase 3 — リプレイと審査（shadow）
 
@@ -104,11 +104,11 @@
 - 外部取り込み（prior・シグナル手動投入 → 再審査コーディネータ接続）・ドリフト定点観測の試行
 
 **出口**:
-- 検証証拠: 審査一連の実績／隔離の検証（task-domain 副作用なし〈定義は DESIGN リプレイハーネス責務。許可済み推論 egress と計測された支出は禁止対象でなくガード・予算・記録の対象〉・複数回再現・prior/シグナル非混入の negative test）／代行の領域別一致率（sample floor 充足）／シグナル→再審査の実働 ≥1
+- 検証証拠: 審査一連の実績／隔離の検証（task-domain 副作用なし〈定義は DESIGN リプレイハーネス責務〉・複数回再現・prior/シグナル非混入の negative test）／代行の領域別一致率（sample floor 充足）／シグナル→再審査の実働 ≥1
 - stop/rollback: **隔離破りは corpus 縮小ではなく即停止**。予算超過で corpus を変える場合は新しい事前登録＋開示
 - 確定 ADR: D-07・D-08（prior・シグナル）・D-10（scheduler v0）・D-12（暫定）・D-13（等価性暫定）・D-04（暫定役割）・D-22（candidate 運用）
-- 意図的未決: Register スナップショットを添付（代表例: 代行の教師信号化〈5b まで封印〉・資格の執行〈5 まで封印〉・routing 選定・探索予算・最終ストア）
-- レーン health: 上記に加え 鮮度・再審査／signal→replay／**常時 proxy 監査**（開始）— 各証拠を添付
+- 意図的未決: 出口 revision の Register を固定参照（代表例: 代行の教師信号化〈5b まで封印〉・資格の執行〈5 まで封印〉・routing 選定・探索予算・最終ストア）
+- レーン health: 上記に加え 鮮度・再審査／signal→replay／**常時 proxy 監査**（開始）— 各証拠を固定参照
 
 ## Phase 4 — 采配の shadow と助言
 
@@ -120,14 +120,14 @@
 - **4a shadow routing**: 推薦を計算・記録するが提示も実行もしない。**探索推薦**（証拠の薄い候補への予算内推薦）も同様に shadow で記録する。ゲート: **coverage・較正・abstention の適切さ・無影響**（帰結差の識別は主張しない）を確認してから 4b へ
 - **4b advisory**: 根拠＋abstain つき提案・毎回明示承認。推薦・提示・採択/棄却を分離記録。予算内・低リスクの **advisory exploration**（探索提案の明示承認つき実行）もここで検証する
 
-**検証設計**: 4b では**事前登録した識別可能な前向き設計**（paired replay・低リスク領域での無作為化・switchback〈期間を区切って采配方式を交互に切り替えて比較する設計〉等）で、採択・不採択双方の品質・コスト・attention を検証する。**関連（association）しか得られない場合は因果の主張をせず、その根拠だけで自動委任に進まない。4b が基準を満たさなければ routing choice ADR の再検討に戻る。**
+**検証設計**: 4b では**事前登録した識別可能な前向き設計**（例: paired replay・低リスク領域での無作為化・switchback〈期間を区切って采配方式を交互に切り替えて比較する設計〉）で、採択・不採択双方の品質・コスト・attention を検証する。**関連（association）しか得られない場合は因果の主張をせず、その根拠だけで自動委任に進まない。4b が基準を満たさなければ routing choice ADR の再検討に戻る。**
 
 **出口**:
 - 検証証拠: 事前登録した保留/将来データでの非劣性・総コスト・attention（版参照つき）／abstain の適切な発動／4a の無影響確認／4a→4b ゲート通過の記録／exploration recommendation の shadow 記録と 4b での承認つき探索の実例
 - stop/rollback: 採択率または品質が基準未満なら 4a に戻す（モードの巻き戻し）。4b 失敗は D-05 再検討へ
 - 確定 ADR: D-05（暫定→routing choice）・D-11（risk v0・advisory exploration 予算〈4b 入口〉）・D-17（較正）
-- 意図的未決: Register スナップショットを添付（代表例: delegated exploration の予算・scope〈Phase 5 入口〉・執行用 risk ADR〈Phase 5 前〉・資格執行・D-12 最終・最終ストア）
-- レーン health: Phase 3 までの全レーン継続 — 各証拠を添付
+- 意図的未決: 出口 revision の Register を固定参照（代表例: delegated exploration の予算・scope〈Phase 5 入口〉・執行用 risk ADR〈Phase 5 前〉・資格執行・D-12 最終・最終ストア）
+- レーン health: Phase 3 までの全レーン継続 — 各証拠を固定参照
 
 ## Phase 5 — 限定委任（采配）
 
@@ -135,7 +135,7 @@
 
 **入口で確定する ADR**: D-04（最終）・D-09・D-10（定常化）・D-11（執行用 risk ADR — Phase 4 の誤判定証拠に基づく — と、delegated exploration 用の予算・scope〈advisory 用とは別版として確定または再承認〉）・D-22（完全形）・D-24（回復完全形）。
 
-**手順**: live 開始の前に **fault injection**（同時実行の予算競合・duplicate dispatch・crash recovery と reconciliation・負荷下の kill を含む）と **negative test**（ゲート独立性・non-bypass・fail-closed・kill/予算/期限切れ）を通し、その後**役割を絞った canary**（最大 scope・window・範囲拡大条件を事前登録）から広げる。**delegated exploration（自律の探索実行）は采配の委任とは別の独立 gate として、予算・低リスク限定で同様の canary を経て解放する。**
+**手順**: live 開始の前に **fault injection**（例: 同時実行の予算競合・duplicate dispatch・crash recovery と reconciliation・負荷下の kill）と **negative test**（ゲート独立性・non-bypass・fail-closed・kill/予算/期限切れ）を通し、その後**役割を絞った canary**（最大 scope・window・範囲拡大条件を事前登録）から広げる。**delegated exploration（自律の探索実行）は采配の委任とは別の独立 gate として、予算・低リスク限定で同様の canary を経て解放する。**
 
 **即時 stop 条件**: 境界違反／イベント欠落・重複実行／kill 失敗／予算超過／非劣性の破れ／期限切れ資格の使用。
 
@@ -143,8 +143,8 @@
 - 検証証拠（別々に証拠化）: (1) routing の成功 = 事前登録した比較での品質・失敗率の非劣性＋総コストの初回改善 (2) evaluation の成功 = 自前射影が external-prior-only baseline より**予測が良く、悪い采配を減らす** (3) attention が持続的に上限内 (4) ユーザーの最終判定。加えて delegated exploration の独立 gate 通過と予算内動作の実例
 - stop/rollback: エスカレーション率が下がらない役割は 4b に戻す。委任範囲は役割ごとに独立に広げる
 - 確定 ADR: D-04（最終）・D-09・D-10（定常化）・D-11（執行用・予算）・D-22（完全形）・D-24（完全形）
-- 意図的未決: Register スナップショットを添付（代表例: D-12 最終〈5b 入口まで〉・D-02 最終ストア〈再評価トリガつき open — v0 に限界が出ない限り最終化を強制しない〉）
-- レーン health: 上記に加え 資格失効／**成功基準の継続監視**（開始）— 各証拠を添付
+- 意図的未決: 出口 revision の Register を固定参照（代表例: D-12 最終〈5b 入口まで〉・D-02 最終ストア〈再評価トリガつき open — v0 に限界が出ない限り最終化を強制しない〉）
+- レーン health: 上記に加え 資格失効／**成功基準の継続監視**（開始）— 各証拠を固定参照
 
 ## Phase 5b — 評価代行の解放（采配とは別軸）
 
@@ -158,8 +158,8 @@
 - 検証証拠: **user label always wins の運用テスト**／代行由来評価のイベント上の区別（routing 由来との切り分け）／label 品質の非劣性＋attention の削減
 - stop/rollback: 独立性または監査の欠落を検知したら該当領域の代行を自動停止し、ユーザー評価に戻す（recovery 条件は D-12）
 - 確定 ADR: D-12（最終形）
-- 意図的未決: Register スナップショットを添付（代表例: D-02 最終ストア〈再評価トリガつき open〉。他の構造的 Decision はここで全て確定 — 以後の変更は新しい D-xx として登録）
-- レーン health: 全レーン継続（常時 proxy 監査を含む）— 各証拠を添付
+- 意図的未決: 出口 revision の Register を固定参照（代表例: D-02 最終ストア〈再評価トリガつき open〉。他の構造的 Decision はここで全て確定 — 以後の変更は新しい D-xx として登録）
+- レーン health: 全レーン継続（常時 proxy 監査を含む）— 各証拠を固定参照
 
 ## 継続運用レーン（全フェーズ横断）
 
