@@ -41,7 +41,7 @@
 
 **成果物**:
 - `docs/adr/` と ADR テンプレート（承認者=ユーザーの様式を含む）
-- イベントスキーマ v0・記録の最小 CLI・replay manifest の保存開始（task 入力参照・リポジトリ revision・レシート・方針/プロトコル版・因果参照）
+- イベントスキーマ v0・記録の最小 CLI・replay manifest の保存開始（task 入力参照・リポジトリ revision〈VCS 管理下の作業のみ。他の task 種別は該当なしを記録〉・レシート・方針/プロトコル版・因果参照）
 - **歩く骨格（dummy）**: dummy アダプタで command → guard → run → event → 監査ビュー の縦切り
 - 開発環境整備 — 要件は project-local で再現可能なツールチェーン。ツール管理はユーザーの環境慣行という外部制約に従う（現状の慣行は mise。本文書による選定ではない）
 
@@ -77,15 +77,15 @@
 
 **目的**: スコアが読める・比較の材料が貯まり始める。
 
-**入口で確定する ADR**: D-03（taxonomy）、D-17 最小形、D-10 の freshness v0、D-19 機構、D-23（監査再構成契約）。
+**入口で確定する ADR**: D-03（taxonomy）、D-17 最小形（射影カタログ v0 — 各軸の意味・入力イベント — を含む）、D-10 の freshness v0、D-19 機構、D-23（監査再構成契約）。
 
 **成果物**:
-- 射影エンジン v0（値＋不確実性＋適用範囲＋鮮度・版管理と rebuild）
+- 射影エンジン v0（入口 ADR で確定したカタログ v0 の軸を実計算する。値＋不確実性＋適用範囲＋鮮度・版管理と rebuild）
 - 監査面 v0（値→根拠の一段追跡・采配理由・方針の版・上書き記録・異議＝訂正イベント・削除済みは理由つき unavailable）
 - ベースライン台帳の運用開始（holdout は gate 別の frozen cohort / future window・アクセス統制・opened=spent〈一度開いた holdout は消費済み扱いで再利用しない〉・変更は新登録）
 
 **出口**:
-- 検証証拠: 事前登録した比較の集計（版参照つき）／holdout 非混入の機械的確認／D-23 受入テスト（削除ケース含む）／rebuild と削除尊重の実演
+- 検証証拠: 事前登録した比較の集計（版参照つき）／カタログ v0 の各軸が実データで計算・表示された実例／holdout 非混入の機械的確認／D-23 受入テスト（削除ケース含む）／rebuild と削除尊重の実演
 - stop/rollback: 不確実性の過小表示が判明したら表示を保守側に倒す
 - 確定 ADR: D-03・D-17（最小形）・D-10（freshness v0）・D-19（機構）・D-23
 - 意図的未決: Register スナップショットを添付（代表例: 較正方式・減衰の数値・采配方式・D-12・最終ストア〈再評価トリガ監視中〉）
@@ -104,7 +104,7 @@
 - 外部取り込み（prior・シグナル手動投入 → 再審査コーディネータ接続）・ドリフト定点観測の試行
 
 **出口**:
-- 検証証拠: 審査一連の実績／隔離の検証（外部副作用なし・複数回再現・prior/シグナル非混入の negative test）／代行の領域別一致率（sample floor 充足）／シグナル→再審査の実働 ≥1
+- 検証証拠: 審査一連の実績／隔離の検証（task-domain 副作用なし〈定義は DESIGN リプレイハーネス責務。許可済み推論 egress と計測された支出は禁止対象でなくガード・予算・記録の対象〉・複数回再現・prior/シグナル非混入の negative test）／代行の領域別一致率（sample floor 充足）／シグナル→再審査の実働 ≥1
 - stop/rollback: **隔離破りは corpus 縮小ではなく即停止**。予算超過で corpus を変える場合は新しい事前登録＋開示
 - 確定 ADR: D-07・D-08（prior・シグナル）・D-10（scheduler v0）・D-12（暫定）・D-13（等価性暫定）・D-04（暫定役割）・D-22（candidate 運用）
 - 意図的未決: Register スナップショットを添付（代表例: 代行の教師信号化〈5b まで封印〉・資格の執行〈5 まで封印〉・routing 選定・探索予算・最終ストア）
@@ -114,7 +114,7 @@
 
 **目的**: 采配の質を、まず見せずに計測し、次に助言として提示する。**4a→4b は独立のゲートで区切る。**
 
-**入口で確定する ADR**: 4a 入口 = D-05 の実験用暫定方針・D-11 の risk v0・D-17 の較正。**4a 出口／4b 入口 = routing choice ADR**（4a の証拠に基づく。4b で randomized/switchback を使う場合は介入予算も 4b 開始前に確定）。
+**入口で確定する ADR**: 4a 入口 = D-05 の実験用暫定方針・D-11 の risk v0・D-17 の較正。**4a 出口／4b 入口 = routing choice ADR＋advisory exploration の予算と低リスク scope の事前確定**（4a の証拠に基づく。4a は shadow のみで探索支出をしないため予算未確定でよい。4b で randomized/switchback を使う場合は介入予算も 4b 開始前に確定）。
 
 **段階**:
 - **4a shadow routing**: 推薦を計算・記録するが提示も実行もしない。**探索推薦**（証拠の薄い候補への予算内推薦）も同様に shadow で記録する。ゲート: **coverage・較正・abstention の適切さ・無影響**（帰結差の識別は主張しない）を確認してから 4b へ
@@ -125,15 +125,15 @@
 **出口**:
 - 検証証拠: 事前登録した保留/将来データでの非劣性・総コスト・attention（版参照つき）／abstain の適切な発動／4a の無影響確認／4a→4b ゲート通過の記録／exploration recommendation の shadow 記録と 4b での承認つき探索の実例
 - stop/rollback: 採択率または品質が基準未満なら 4a に戻す（モードの巻き戻し）。4b 失敗は D-05 再検討へ
-- 確定 ADR: D-05（暫定→routing choice）・D-11（risk v0）・D-17（較正）
-- 意図的未決: Register スナップショットを添付（代表例: 探索予算の数値〈探索開始前〉・執行用 risk ADR〈Phase 5 前〉・資格執行・D-12 最終・最終ストア）
+- 確定 ADR: D-05（暫定→routing choice）・D-11（risk v0・advisory exploration 予算〈4b 入口〉）・D-17（較正）
+- 意図的未決: Register スナップショットを添付（代表例: delegated exploration の予算・scope〈Phase 5 入口〉・執行用 risk ADR〈Phase 5 前〉・資格執行・D-12 最終・最終ストア）
 - レーン health: Phase 3 までの全レーン継続 — 各証拠を添付
 
 ## Phase 5 — 限定委任（采配）
 
 **目的**: 資格・リスク・権限の独立ハードゲートを通る範囲で、低リスク・可逆な仕事から自動委任する。
 
-**入口で確定する ADR**: D-04（最終）・D-09・D-10（定常化）・D-11（執行用 risk ADR — Phase 4 の誤判定証拠に基づく — と探索予算）・D-22（完全形）・D-24（回復完全形）。
+**入口で確定する ADR**: D-04（最終）・D-09・D-10（定常化）・D-11（執行用 risk ADR — Phase 4 の誤判定証拠に基づく — と、delegated exploration 用の予算・scope〈advisory 用とは別版として確定または再承認〉）・D-22（完全形）・D-24（回復完全形）。
 
 **手順**: live 開始の前に **fault injection**（同時実行の予算競合・duplicate dispatch・crash recovery と reconciliation・負荷下の kill を含む）と **negative test**（ゲート独立性・non-bypass・fail-closed・kill/予算/期限切れ）を通し、その後**役割を絞った canary**（最大 scope・window・範囲拡大条件を事前登録）から広げる。**delegated exploration（自律の探索実行）は采配の委任とは別の独立 gate として、予算・低リスク限定で同様の canary を経て解放する。**
 
