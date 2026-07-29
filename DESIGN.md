@@ -338,7 +338,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - VISION制約: 古い証拠は重みを失う。資格は終身でない。トリガ=鮮度切れ・ドリフト・外部シグナル・構成変更。
 - 選択肢と調査: 重み付け: 指数減衰 / 移動窓 / 有効標本数換算。ドリフト検知: 定点観測差分の閾値 / 既存 OSS: river（ADWIN・Page-Hinkley）・evidently。スケジューラ: 経過時間×イベント量×トリガ。
 - 証拠計画: Phase 2 の射影データと Phase 3 の定点観測試行。
-- 依存: D-07, D-17。
+- 依存: freshness v0: D-17（最小形）。scheduler v0・較正定常化: D-07・D-17。
 - 決定境界: freshness v0: not before: Phase 1 のデータ / no later than: Phase 2 入口。scheduler v0: not before: Phase 2 の射影 / no later than: Phase 3 入口。較正・定常化: not before: Phase 3 の定点観測 / no later than: Phase 5。
 - ADRトリガ: 各段階の開始。
 - 可逆性: 高。
