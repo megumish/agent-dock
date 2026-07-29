@@ -6,7 +6,7 @@
 
 - **各フェーズはそれ自体で使える価値を出す**。
 - **決定はフェーズ入口で ADR 化する**。意味契約（D-02 封筒・D-13 identity・D-14・D-15・D-16・D-19 原則・D-21）は Phase 0 で確定し、数値・アルゴリズムは証拠が揃うまで決めない。
-- **Phase 0 は dummy-only**。real 実行は Phase 1 からとし、**first-real-run gate**（D-08 価格 v0／D-18・D-24 共同 minimal〈durable planned・attempt id・開始 fail-closed・receipt/outbox・unknown＋reconciliation〉／価格鮮度・インシデントレーンの稼働）を Phase 1 入口に置く。
+- **Phase 0 は dummy-only**。real 実行は Phase 1 からとし、**first-real-run gate**（D-08 価格 v0／D-18・D-24 の**意味要件への適合**〈実行意図の事前永続化・attempt の識別可能性・開始を記録できなければ実行しない・実行事実と結果の突き合わせ可能性・unknown の表現と解決〉／価格鮮度・インシデントレーンの稼働）を Phase 1 入口に置く。意味要件を満たす実現機構は ADR で選ぶ。
 - **比較条件は結果を見る前に登録する**。事前登録は版と window を持ち、**cohort 定義は登録時に凍結**する（後日のタグ訂正で過去の membership を書き換えない。分類変更を使う比較は新登録）。
 - **手間の上限をフェーズ出口条件に含める**。
 - **自律性の2軸を同じフェーズで広げない**。采配の委任（Phase 4–5）と評価の代行（Phase 5b）は独立に解放する。
@@ -21,6 +21,8 @@
 3. **確定した ADR** の列挙
 4. **意図的に未決のまま残す Decision**: Register 上で「当該フェーズより no-later-than が後、または期限なし」の open 項目（subdecision 含む）の**スナップショットを出口 artifact として添付**する。本文には代表例のみ記載し、正は常にスナップショット
 5. **レーン health**: そのフェーズまでに始まった継続レーンの health 証拠を**出口成果物として添付**する
+
+**決裁**: ADR の採択と、フェーズ遷移（特に自律権限を広げる遷移）の最終決裁はユーザーが行う（VISION: 始動・ユーザーが最上位）。エージェントは起草と提案を行えるが、採択・遷移を自動では行わない。
 
 ## フェーズ間の主要依存
 
@@ -38,10 +40,10 @@
 **入口で確定する ADR**: 対象タスクコホートと baseline・holdout 方式・手間上限・cohort 凍結（D-16）／プロファイル identity と紐付け（D-13 identity, D-14）／最小イベント封筒＋可逆な v0 ストア（D-02。最終ストアは意図的未決）／規範の表現と権威・単発許可の形・方針スナップショット（D-15）／境界執行契約（D-21）／互換性・移行の原則（D-19 原則）。
 
 **成果物**:
-- `docs/adr/` と ADR テンプレート
+- `docs/adr/` と ADR テンプレート（承認者=ユーザーの様式を含む）
 - イベントスキーマ v0・記録の最小 CLI・replay manifest の保存開始（task 入力参照・リポジトリ revision・レシート・方針/プロトコル版・因果参照）
 - **歩く骨格（dummy）**: dummy アダプタで command → guard → run → event → 監査ビュー の縦切り
-- 開発環境整備（mise によるツール管理）
+- 開発環境整備 — 要件は project-local で再現可能なツールチェーン。ツール管理はユーザーの環境慣行という外部制約に従う（現状の慣行は mise。本文書による選定ではない）
 
 **出口**:
 - 検証証拠: 縦切り1件の記録と来歴の追跡／最小ガードの fail-closed 動作／**安全 negative tests**（bypass 不能・未許可 egress の拒否・秘密の非送信/非記録・単発許可の scope/expiry/再利用拒否・保持削除の契約動作）／run 非依存イベント（方針変更）が封筒で表現できる／dummy 骨格の操作・ADR 運用に要した attention の計測（上限比）
@@ -50,15 +52,15 @@
 - 意図的未決: Register スナップショットを添付（代表例: 最終ストア〈D-02 再評価トリガつき〉・射影式・減衰値・采配アルゴリズム・taxonomy）
 - レーン health: 保持・削除（開始。この段階の health = 記録/消去契約の検証）— 証拠を出口成果物に添付
 
-## Phase 1 — 挙動を変えない観測（first real run）
+## Phase 1 — 采配を変えない観測（first real run）
 
-**目的**: 日常の仕事のやり方を変えずに、記録だけが増える状態（manual 経路・始動状態）。**最初の real 実行はこのフェーズの gate を通ってから。**
+**目的**: 采配のやり方を変えずに、記録が増える状態（manual 経路・始動状態）。ガード・ラッパによる境界執行は加わるため厳密には挙動不変ではない — 変えないのは**采配**である。**最初の real 実行はこのフェーズの gate を通ってから。**
 
-**入口で確定する ADR（first-real-run gate を含む）**: D-18・D-24 共同 minimal（durable planned・attempt id・開始 fail-closed・receipt/outbox・unknown＋reconciliation）→ D-01（実行基盤）、D-06（フィードバック UX）、D-08 の価格 contract v0、D-20（dotfiles 境界）、D-21 の real 実行への適用確認。gate には価格鮮度・インシデントレーンの稼働開始も含む。
+**入口で確定する ADR（first-real-run gate を含む）**: D-18・D-24 共同 minimal（上記の意味要件への適合。実現機構は ADR で選ぶ）→ D-01（実行基盤）、D-06（フィードバック UX）、D-08 の価格 contract v0、D-20（dotfiles 境界）、D-21 の real 実行への適用確認。gate には価格鮮度・インシデントレーンの稼働開始も含む。
 
 **成果物**:
 - 入口コマンド／スキル（manual 経路のラップ。ルータ不要）
-- 実行アダプタ（headless 起動・実測正規化・5状態の区別・レシート）
+- 実行アダプタ（headless 起動・実測正規化・実行状態の区別〈状態の語彙は D-24 の ADR で確定〉・レシート）
 - 実測の自動記録（時間・実支出・帰結参照・attention 代理指標）
 - フィードバック・訂正・削除の経路（受動優先。削除の非機微来歴は安全かつ方針が許す場合のみ — DESIGN の優先規則参照）
 - wrapper の観測影響の計測（timing・context・プロファイル）
@@ -80,7 +82,7 @@
 **成果物**:
 - 射影エンジン v0（値＋不確実性＋適用範囲＋鮮度・版管理と rebuild）
 - 監査面 v0（値→根拠の一段追跡・采配理由・方針の版・上書き記録・異議＝訂正イベント・削除済みは理由つき unavailable）
-- ベースライン台帳の運用開始（holdout は gate 別の frozen cohort / future window・アクセス統制・opened=spent・変更は新登録）
+- ベースライン台帳の運用開始（holdout は gate 別の frozen cohort / future window・アクセス統制・opened=spent〈一度開いた holdout は消費済み扱いで再利用しない〉・変更は新登録）
 
 **出口**:
 - 検証証拠: 事前登録した比較の集計（版参照つき）／holdout 非混入の機械的確認／D-23 受入テスト（削除ケース含む）／rebuild と削除尊重の実演
@@ -115,13 +117,13 @@
 **入口で確定する ADR**: 4a 入口 = D-05 の実験用暫定方針・D-11 の risk v0・D-17 の較正。**4a 出口／4b 入口 = routing choice ADR**（4a の証拠に基づく。4b で randomized/switchback を使う場合は介入予算も 4b 開始前に確定）。
 
 **段階**:
-- **4a shadow routing**: 推薦を計算・記録するが提示も実行もしない。ゲート: **coverage・較正・abstention の適切さ・無影響**（帰結差の識別は主張しない）を確認してから 4b へ
-- **4b advisory**: 根拠＋abstain つき提案・毎回明示承認。推薦・提示・採択/棄却を分離記録
+- **4a shadow routing**: 推薦を計算・記録するが提示も実行もしない。**探索推薦**（証拠の薄い候補への予算内推薦）も同様に shadow で記録する。ゲート: **coverage・較正・abstention の適切さ・無影響**（帰結差の識別は主張しない）を確認してから 4b へ
+- **4b advisory**: 根拠＋abstain つき提案・毎回明示承認。推薦・提示・採択/棄却を分離記録。予算内・低リスクの **advisory exploration**（探索提案の明示承認つき実行）もここで検証する
 
-**検証設計**: 4b では**事前登録した識別可能な前向き設計**（paired replay・低リスク領域での無作為化・switchback 等）で、採択・不採択双方の品質・コスト・attention を検証する。**関連（association）しか得られない場合は因果の主張をせず、その根拠だけで自動委任に進まない。4b が基準を満たさなければ routing choice ADR の再検討に戻る。**
+**検証設計**: 4b では**事前登録した識別可能な前向き設計**（paired replay・低リスク領域での無作為化・switchback〈期間を区切って采配方式を交互に切り替えて比較する設計〉等）で、採択・不採択双方の品質・コスト・attention を検証する。**関連（association）しか得られない場合は因果の主張をせず、その根拠だけで自動委任に進まない。4b が基準を満たさなければ routing choice ADR の再検討に戻る。**
 
 **出口**:
-- 検証証拠: 事前登録した保留/将来データでの非劣性・総コスト・attention（版参照つき）／abstain の適切な発動／4a の無影響確認／4a→4b ゲート通過の記録
+- 検証証拠: 事前登録した保留/将来データでの非劣性・総コスト・attention（版参照つき）／abstain の適切な発動／4a の無影響確認／4a→4b ゲート通過の記録／exploration recommendation の shadow 記録と 4b での承認つき探索の実例
 - stop/rollback: 採択率または品質が基準未満なら 4a に戻す（モードの巻き戻し）。4b 失敗は D-05 再検討へ
 - 確定 ADR: D-05（暫定→routing choice）・D-11（risk v0）・D-17（較正）
 - 意図的未決: Register スナップショットを添付（代表例: 探索予算の数値〈探索開始前〉・執行用 risk ADR〈Phase 5 前〉・資格執行・D-12 最終・最終ストア）
@@ -133,12 +135,12 @@
 
 **入口で確定する ADR**: D-04（最終）・D-09・D-10（定常化）・D-11（執行用 risk ADR — Phase 4 の誤判定証拠に基づく — と探索予算）・D-22（完全形）・D-24（回復完全形）。
 
-**手順**: live 開始の前に **fault injection**（同時実行の予算競合・duplicate dispatch・crash recovery と reconciliation・負荷下の kill を含む）と **negative test**（ゲート独立性・non-bypass・fail-closed・kill/予算/期限切れ）を通し、その後**役割を絞った canary**（最大 scope・window・昇格条件を事前登録）から広げる。
+**手順**: live 開始の前に **fault injection**（同時実行の予算競合・duplicate dispatch・crash recovery と reconciliation・負荷下の kill を含む）と **negative test**（ゲート独立性・non-bypass・fail-closed・kill/予算/期限切れ）を通し、その後**役割を絞った canary**（最大 scope・window・範囲拡大条件を事前登録）から広げる。**delegated exploration（自律の探索実行）は采配の委任とは別の独立 gate として、予算・低リスク限定で同様の canary を経て解放する。**
 
 **即時 stop 条件**: 境界違反／イベント欠落・重複実行／kill 失敗／予算超過／非劣性の破れ／期限切れ資格の使用。
 
 **出口**:
-- 検証証拠（別々に証拠化）: (1) routing の成功 = 事前登録した比較での品質・失敗率の非劣性＋総コストの初回改善 (2) evaluation の成功 = 自前射影が external-prior-only baseline より**予測が良く、悪い采配を減らす** (3) attention が持続的に上限内 (4) ユーザーの最終判定
+- 検証証拠（別々に証拠化）: (1) routing の成功 = 事前登録した比較での品質・失敗率の非劣性＋総コストの初回改善 (2) evaluation の成功 = 自前射影が external-prior-only baseline より**予測が良く、悪い采配を減らす** (3) attention が持続的に上限内 (4) ユーザーの最終判定。加えて delegated exploration の独立 gate 通過と予算内動作の実例
 - stop/rollback: エスカレーション率が下がらない役割は 4b に戻す。委任範囲は役割ごとに独立に広げる
 - 確定 ADR: D-04（最終）・D-09・D-10（定常化）・D-11（執行用・予算）・D-22（完全形）・D-24（完全形）
 - 意図的未決: Register スナップショットを添付（代表例: D-12 最終〈5b 入口まで〉・D-02 最終ストア〈再評価トリガつき open — v0 に限界が出ない限り最終化を強制しない〉）

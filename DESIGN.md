@@ -49,6 +49,7 @@ graph TD
     R --> G
     R -. 決定イベント .-> LOG
     G --> RUN[実行アダプタ]
+    RUN -. 結果・成果物参照 .-> E
     RUN --> LOG[(イベントログ)]
     G --> LOG
     UP[ユーザー方針レジストリ] --> G
@@ -164,7 +165,7 @@ graph TD
 監査可能性の対象はスコアだけではない: イベント来歴・采配の理由（候補集合と棄却理由）・適用された方針の版・上書き記録まで、ユーザーが一段でたどれる。**監査再構成契約**（D-23）がこの責務の受入条件を定める。異議申立ては訂正イベントとして受け付ける。
 
 ### 資格レジストリ
-（役割 × 実行プロファイル）の資格状態と根拠射影への参照。**資格は自律委任の必要条件であって、権限の十分条件ではない。** ライフサイクルは D-22 の契約に従う。Phase 3 までは candidate のみで権限を伴わない。関連: D-04, D-13, D-22。
+（役割 × 実行プロファイル）の資格状態と根拠射影への参照。**資格は自律委任の必要条件であって、権限の十分条件ではない。** ライフサイクルは D-22 の契約に従う。Phase 5 より前は candidate のみで権限を伴わない。関連: D-04, D-13, D-22。
 
 ### フィードバック取り込み
 価値判断のイベント化。明示・受動の設計は D-06 の領分（「明示は1アクション以内」は有力候補であって不変条件ではない）。訂正・削除要求の受け口もここ。関連: D-06。
@@ -194,7 +195,7 @@ graph TD
 API 実費とユーザーの手間（attention）の計測。attention は単一指標にしない（D-16）。成功基準の入力。関連: D-16。
 
 ### 障害時イベント完全性（named）
-**exactly-once は約束しないが、発見不能な欠落は許さない。** 責務は planned/started/completed/failed/unknown の状態表現・attempt の冪等性・重複検出と突き合わせ・duplicate event と duplicate execution の区別・クラッシュ回復であり、契約は D-24 が定める。
+**exactly-once は約束しないが、発見不能な欠落は許さない。** 責務は実行状態の表現（例: planned〜unknown）・attempt の冪等性・重複検出と突き合わせ・duplicate event と duplicate execution の区別・クラッシュ回復であり、契約は D-24 が定める。
 
 ## クリティカルフロー
 
@@ -205,7 +206,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 5. **外部取り込み**: シグナル: 手動投入 → トリガとして来歴記録（スコアに入らない）→ 再審査コーディネータへ。価格: 取り込み → 総コスト計算へ即時反映（更新不能時は比較を unknown 扱い）。prior: 来歴イベント＋射影の仮説入力。
 6. **エスカレーションと単発上書き**: ガードが不確実・境界超えを検知 → 選択肢＋推薦つきでユーザーへ → 裁定をイベント化（ユーザー領分の欠落なら教師信号、実証不足なら単発許可）。単発許可は scope・有効期限つきで記録され、恒久変更と別種、**資格を生まない**。
 7. **共同作業の帰属**: 複数プロファイルの関与は run 単位で記録し、根拠なく個体配賦しない（帰属規則は D-14。未決の間は「共同」のまま保持）。
-8. **失敗・リトライ・in-doubt**: 実行アダプタが planned/started/completed/failed/unknown を区別してイベント化（失敗も証拠）。リトライは新 attempt として因果参照で接続。unknown は in-doubt として表現し、突き合わせで解決する（D-24）。
+8. **失敗・リトライ・in-doubt**: 実行アダプタが実行状態（例: planned/started/completed/failed/unknown）を区別してイベント化（失敗も証拠）。リトライは新 attempt として因果参照で接続。unknown は in-doubt として表現し、突き合わせで解決する（D-24）。
 9. **代行評価の常時監査ループ**: 評価対象（探索・リプレイの成果）→ 代行評価器が審判実行を要求 → 裁定ガード → 実行 → 代行判断イベント（別種・ユーザー判断に劣後）→ 監査サンプラが一部をユーザーの二重評価へ → ユーザー判断イベント → 一致率の射影更新 → 不一致が閾値を超えたら該当領域の代行を自動停止し、訂正イベントと資格遷移（D-22）へ。
 
 ## Decision Register
@@ -221,7 +222,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 状態: open
 - 問い: エージェントを何として起動するか。
 - VISION制約: ベンダー固定しない。制御面はローカル。実測が取れること。
-- 選択肢と調査: 環境の実態（2026-07）: claude (Claude Code 2.1.214) / codex-cli 0.144.4 / gemini-cli 0.47.0 導入済み。**A. 既存エージェントCLIの headless 束ね**（Claude Code: `claude -p --output-format json` が usage・総コスト・所要時間等を返し hooks・許可機構を持つ / codex: `codex exec`＋JSON イベント / gemini: headless＋JSON）。**B. 単一ホスト完結**（他社能力が制限され前提が弱まる）。**C. 自前ハーネス**（Claude Agent SDK・各社 SDK・LiteLLM 等。計測最精密・構築最重）。
+- 選択肢と調査: 環境の実態（2026-07 のスナップショット。ADR 時に環境 inventory を取り直す）: claude (Claude Code 2.1.214) / codex-cli 0.144.4 / gemini-cli 0.47.0 導入済み。**A. 既存エージェントCLIの headless 束ね**（Claude Code: `claude -p --output-format json` が usage・総コスト・所要時間等を返し hooks・許可機構を持つ / codex: `codex exec`＋JSON イベント / gemini: headless＋JSON）。**B. 単一ホスト完結**（他社能力が制限され前提が弱まる）。**C. 自前ハーネス**（Claude Agent SDK・各社 SDK・LiteLLM 等。計測最精密・構築最重）。
 - 証拠計画: D-18 の **core conformance matrix**（ガード介入・cancel・レシート・unknown 表現・保守性・ベンダー中立性）で候補を比較。Phase 1 で1本を実測。
 - 依存: D-18。
 - 決定境界: not before: D-18 の契約定義 / no later than: Phase 1 入口。
@@ -263,7 +264,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 選択肢と調査: 初期役割候補: 采配役/設計役/実装役/大量実装役/検証役/評価代行役。要件表現: 宣言的設定ファイル（YAML＋JSON Schema 検証）/ 汎用ポリシーエンジン（OPA/Rego・Cedar — 過剰の懸念つき）/ コード内定義。
 - 証拠計画: Phase 2–3 の射影の安定。
 - 依存: D-13, D-17, D-22。
-- 決定境界: 暫定役割（candidate/shadow 用）: not before: Phase 2 の射影安定 / no later than: Phase 3。最終（執行用）: not before: Phase 3–4 の候補運用データ / no later than: Phase 5。
+- 決定境界: 暫定役割（candidate/shadow 用）: not before: Phase 2 出口の通過 / no later than: Phase 3。最終（執行用）: not before: Phase 3–4 の候補運用データ / no later than: Phase 5。
 - ADRトリガ: Phase 3 開始（暫定）、Phase 5 開始（最終）。
 - 可逆性: 中。
 - 有力候補（非拘束）: 宣言的設定ファイル。
@@ -276,7 +277,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 選択肢と調査: A. ルール＋スコアカード参照。B. LLM 采配（判断自体が評価対象）。C. 文脈付きバンディット — 既存 OSS: MABWiser・Vowpal Wabbit。
 - 証拠計画: **二段**。4a（shadow）= coverage・較正・abstain の適切さ・無影響のみを検証（**帰結差の識別は主張しない** — 反実仮想は shadow では識別不能）。4b（advisory）= 事前登録した前向き設計で非劣性・コスト・attention を検証。**4b が失敗したら routing choice ADR の再検討に戻る。**
 - 依存: D-17, D-11。
-- 決定境界: 暫定方針（実験用）: not before: Phase 2 の射影安定 / no later than: Phase 4a 入口。routing choice: not before: 4a の shadow 証拠 / no later than: 4b 入口。
+- 決定境界: 暫定方針（実験用）: not before: Phase 2 出口の通過 / no later than: Phase 4a 入口。routing choice: not before: 4a の shadow 証拠 / no later than: 4b 入口。
 - ADRトリガ: Phase 4a 開始（暫定）、4b 開始（選定）、4b 失敗（再検討）。
 - 可逆性: 高（決定イベントの形だけ固定）。
 - 有力候補（非拘束）: A の骨格に B を載せる。C は探索配分で調査継続。
@@ -416,7 +417,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 状態: open（Phase 0 で ADR 必須）
 - 問い: **2つの baseline**（routing: ドックなしの采配 / evaluation: external-prior-only）・cohort と期間・非劣性 margin・総コストと attention の単位・欠測/遅延 outcome の扱い・最小標本・判定不能の表現・事前登録の版管理・不利開示・**cohort 凍結**。
 - VISION制約: 比較条件は結果を見る前に定める。スコア形成に使っていないデータで評価。不利も開示。判定はユーザー。
-- 選択肢と調査: holdout: gate 別の frozen cohort / future window（アクセス統制・opened=spent・変更は新登録）。**cohort 定義と版は登録時に凍結し、後日のタグ訂正（D-03）で過去の membership を書き換えない。分類変更を使う比較は新しい事前登録。** attention: 複数の代理指標（エスカレーション回数・明示フィードバック回数・確認待ち時間など。単一指標にしない）。統計: statsmodels（非劣性の区間推定）。事前登録は preregistration 慣行を参考に軽量自作で足りる見込み。
+- 選択肢と調査: holdout: gate 別の frozen cohort / future window（アクセス統制・opened=spent〈一度開いた holdout は消費済み扱いで再利用しない〉・変更は新登録）。**cohort 定義と版は登録時に凍結し、後日のタグ訂正（D-03）で過去の membership を書き換えない。分類変更を使う比較は新しい事前登録。** attention: 複数の代理指標（エスカレーション回数・明示フィードバック回数・確認待ち時間など。単一指標にしない）。統計: statsmodels（非劣性の区間推定）。事前登録は preregistration 慣行を参考に軽量自作で足りる見込み。
 - 証拠計画: Phase 2 で最初の比較レポートを出し、登録条件で判定可能かを確認。
 - 依存: D-14。
 - 決定境界: not before: なし / no later than: Phase 0（登録が先、データが後）。
@@ -442,7 +443,7 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 状態: open
 - 問い: 実行アダプタの共通契約 — capability 申告・実行レシート・cancel/retry・部分失敗・in-doubt・タイムアウト・**decision-event channel**。
 - VISION制約: 実測の忠実性。失敗も証拠。遂行中の技術判断も決定イベント（観測できない場合は欠測を明示）。
-- 選択肢と調査: 契約項目: 実測フィールドの必須/任意、レシート（実構成・可能な範囲の実サーバ/バージョン）、kill 可能性、in-doubt 表現、decision-event の有無。記述形式: JSON Schema。参考: OTel semantic conventions・CloudEvents 属性。**core conformance matrix**（ガード介入・cancel・レシート・unknown・保守性・ベンダー中立）で D-01 候補を比較。**minimal 契約（first-real-run gate）**: durable な planned 記録・attempt id・開始の fail-closed・receipt/outbox・unknown＋reconciliation（D-24 と共同）。
+- 選択肢と調査: 契約項目: 実測フィールドの必須/任意、レシート（実構成・可能な範囲の実サーバ/バージョン）、kill 可能性、in-doubt 表現、decision-event の有無。記述形式: JSON Schema。参考: OTel semantic conventions・CloudEvents 属性。**core conformance matrix**（ガード介入・cancel・レシート・unknown・保守性・ベンダー中立）で D-01 候補を比較。**minimal 契約（first-real-run gate・D-24 と共同）— 意味要件**: 実行の意図が実行前に永続化される／attempt が識別可能／開始を記録できない場合は実行しない（fail-closed）／実行の事実と結果が突き合わせ可能／unknown が表現・解決される。実現機構（outbox 等）は D-24 の候補から ADR で選ぶ。
 - 証拠計画: Phase 1 で導入済み 3 CLI の出力を契約に当てて充足度を実測。
 - 依存: D-24（完全性契約と共同）。
 - 決定境界: minimal（D-24 と共同）: not before: なし / no later than: 最初の real run 前（Phase 1 入口）。full: not before: minimal の運用実績 / no later than: Phase 1 出口。
@@ -466,9 +467,9 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 ### D-20 リポジトリ境界（dotfiles との責務分担）
 
 - 状態: open
-- 問い: 入口コマンド・スキル・エージェント関連設定を、このリポジトリと megumish/dotfiles のどちらで管理するか。
+- 問い: 入口コマンド・スキル・エージェント関連設定を、このリポジトリと megumish/dotfiles（ユーザーがローカル環境のコマンド・設定を管理している別リポジトリ）のどちらで管理するか。
 - VISION制約: ドックが所有するのは評価イベント・射影・資格・采配と接続境界。
-- 選択肢と調査: **事実（evidence）**: dotfiles は既にグローバルなエージェント指示・スキル・許可設定・パッケージ管理を所有している。選択肢: A. AI 関連を本リポジトリに集約 / B. dotfiles に残し本リポジトリは参照 / C. 分割 — ドック固有の契約・アダプタ・入口・非秘密の既定値は本リポジトリ、マシンのブートストラップ・汎用設定・秘密は dotfiles。C では単一 source-of-truth・依存方向・版の握手（version handshake）を定める。**既存物: dotfiles 側の既存管理機構（ユーザーの現行運用）をそのまま活かすのが B・C の利点であり、新規ツールの導入は不要の見込み。**
+- 選択肢と調査: **事実（evidence）**: dotfiles は既にグローバルなエージェント指示・スキル・許可設定・パッケージ管理を所有している。選択肢: A. AI 関連を本リポジトリに集約 / B. dotfiles に残し本リポジトリは参照 / C. 分割 — ドック固有の契約・アダプタ・入口・非秘密の既定値は本リポジトリ、マシンのブートストラップ・汎用設定・秘密は dotfiles。C では単一 source-of-truth・依存方向・版の握手（version handshake）を定める。**既存物: dotfiles 側の既存管理機構（ユーザーの現行運用）をそのまま活かすのが B・C の利点であり、新規ツールの導入は不要の見込み。** ADR では dotfiles の所在・アクセス前提・現在の責務目録・参照できない場合の fallback を明記し、文書外の会話知識を要求しない形にする。
 - 証拠計画: Phase 1 で置き場所ごとの更新頻度・同期の手間を実測。
 - 依存: D-01。
 - 決定境界: not before: なし / no later than: Phase 1 入口。
@@ -494,13 +495,13 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 - 状態: open
 - 問い: 資格状態機械（candidate / appointed / on-hold / revoked）・任免の主体・証拠の矛盾/欠測時は hold・期限（expiry）・**ユーザーの単発許可や探索の許可が資格を生成しないこと**の保証。
 - VISION制約: 資格は役割ごとに独立に任免・失効。証拠不足は保留。許可は資格を生まない。
-- 選択肢と調査: 状態機械の表現: 宣言的定義＋遷移イベント（資格変更もイベントとして正典記録）。任免主体: Phase 5 までユーザー承認必須 / 以後も降格は自動・昇格は承認など。**既存物: FSM ライブラリ（python-statemachine・XState 等）は存在するが、本質は遷移の宣言と正典記録であり、採用は過剰の懸念つき候補（ADR で再評価）。**
+- 選択肢と調査: 状態機械の表現: 宣言的定義＋遷移イベント（資格変更もイベントとして正典記録）。任免主体: Phase 5 までユーザー承認必須 / 以後も解任・保留は自動、任用・再任は承認など（「昇格・降格」の語は使わない — VISION は役割にも資格にも上下の序列を置かない）。**既存物: FSM ライブラリ（python-statemachine・XState 等）は存在するが、本質は遷移の宣言と正典記録であり、採用は過剰の懸念つき候補（ADR で再評価）。**
 - 証拠計画: Phase 3 の候補運用で状態遷移の実例を集める。
 - 依存: D-04, D-13。
-- 決定境界: candidate 運用の形: not before: Phase 2 の射影 / no later than: Phase 3。執行を伴う完全形: not before: Phase 3 の遷移実例 / no later than: Phase 5。
+- 決定境界: candidate 運用の形: not before: Phase 2 出口の通過 / no later than: Phase 3。執行を伴う完全形: not before: Phase 3 の遷移実例 / no later than: Phase 5。
 - ADRトリガ: Phase 3 開始、Phase 5 開始。
 - 可逆性: 中。
-- 有力候補（非拘束）: 遷移イベント方式＋昇格のみ承認必須。
+- 有力候補（非拘束）: 遷移イベント方式＋任用・再任のみ承認必須。
 
 ### D-23 監査再構成契約
 
@@ -518,9 +519,9 @@ API 実費とユーザーの手間（attention）の計測。attention は単一
 ### D-24 障害・イベント完全性契約
 
 - 状態: open
-- 問い: planned / started / completed / failed / unknown の状態機械・attempt の冪等性・重複検出と突き合わせ・duplicate event と duplicate execution の区別・クラッシュ回復。
+- 問い: 実行状態の表現（候補語彙: planned/started/completed/failed/unknown）・attempt の冪等性・重複検出と突き合わせ・duplicate event と duplicate execution の区別・クラッシュ回復。状態機械の形と配送方式は ADR の選択。
 - VISION制約: 失敗も証拠。イベントは追記のみ（ユーザー起点削除を唯一の例外とする — 優先規則参照。完全性記録も例外に従う）。**exactly-once は約束しないが、発見不能な欠落は許さない**（検出と突き合わせを必須とする）。
-- 選択肢と調査: 配送・記録: at-least-once＋重複検出＋定期突き合わせ（**「検出なしのベストエフォート」は採用不可**）。**minimal（first-real-run gate・D-18 と共同）**: durable な planned 記録・attempt id・開始の fail-closed・receipt/outbox・unknown＋reconciliation。in-doubt の解決: レシート突き合わせ・ユーザー確認へのエスカレーション。**既存物**: 配送意味論の実装はメッセージキュー系 OSS に存在するが、ローカル単一利用者前提では過剰の懸念。outbox パターン等の分散システム慣行を参考に自作が軽量の見込み。
+- 選択肢と調査: 配送・記録: at-least-once＋重複検出＋定期突き合わせ（**「検出なしのベストエフォート」は採用不可**）。**minimal（first-real-run gate・D-18 と共同）**: 意味要件は D-18 参照。実現機構（状態機械の形・配送方式・outbox・突き合わせの周期）はいずれも ADR の選択。in-doubt の解決: レシート突き合わせ・ユーザー確認へのエスカレーション。**既存物**: 配送意味論の実装はメッセージキュー系 OSS に存在するが、ローカル単一利用者前提では過剰の懸念。outbox パターン等の分散システム慣行を参考に自作が軽量の見込み。
 - 証拠計画: Phase 1 で意図的なクラッシュ・二重実行の試験。Phase 5 の fault injection（同時実行の予算競合・duplicate dispatch・負荷下 kill を含む）。
 - 依存: D-02, D-18。
 - 決定境界: minimal（状態機械・in-doubt）: not before: なし / no later than: 最初の real run 前（Phase 1 入口）。完全な回復手順: not before: Phase 1 の障害試験 / no later than: Phase 5。
