@@ -27,7 +27,6 @@ agent-dock は、ローカルで制御するマルチエージェント環境を
 | [PLAN.md](./PLAN.md) | Phase 0 から Phase 5b までの工程、ADR の決定時点、出口条件、継続運用レーン、および自律権限を広げる時期を定める計画 |
 | `docs/adr/` | Phase 0 から作成する決定と理由の記録であり、採択にはユーザーの承認が必要 |
 | [docs/research-notes.md](./docs/research-notes.md) | 個別製品、版、調査時点の有力候補を記録し、ADR を拘束せず列挙外の選択肢も認める非規範のスナップショット |
-| [docs/glossary.md](./docs/glossary.md) | VISION の用語に対応する英語表記を記録し、ADR を拘束せず実装時に見直す非規範の対訳メモ |
 
 <!-- markdownlint-enable MD013 -->
 
