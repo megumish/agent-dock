@@ -7,6 +7,9 @@
 対訳は、[DESIGN.md](./DESIGN.md) が識別子として既に使っている英語（運用モードの `shadow`、資格状態の `qualified` など）と揃えている。
 選定に判断が入った語には、備考欄に理由を示す。
 
+各用語の英語は、VISION 本文でも初出の定義に併記する。
+ただし、英語をカタカナで書いただけの語（エスカレーション、スコア、リプレイ、ローカル、ドリフト、フィードバック）には併記しない。
+
 <!-- markdownlint-disable MD013 -->
 
 ## 基本概念
@@ -59,7 +62,7 @@
 
 | 日本語 | 英語 | 備考 |
 | --- | --- | --- |
-| 教師信号 | ground truth | VISION 本文に併記済み。 |
+| 教師信号 | ground truth | |
 | 観測事実 | observed fact | |
 | 評価の代行 | delegated evaluation | 運用モードの `delegated`（委任実行）と語幹を共有するため、単独の delegation とは書かず複合語で書き分ける。 |
 | 観測状態 | shadow state | DESIGN の運用モード `shadow` と同じ語で揃える。観測出力は shadow output。 |
@@ -76,7 +79,7 @@
 | --- | --- | --- |
 | 証拠 | evidence | |
 | 外部ベンチマーク | external benchmark | |
-| 外部事前情報 | external prior | prior は VISION 本文に併記済み。 |
+| 外部事前情報 | external prior | |
 | 外部シグナル | external signal | |
 | リプレイ | replay | |
 | 自前リプレイ | self-replay | |
