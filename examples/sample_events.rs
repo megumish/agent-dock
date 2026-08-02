@@ -13,12 +13,7 @@ use jiff::Timestamp;
 use uuid::Uuid;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let scenario = std::env::args().nth(1).ok_or(
-        "usage: cargo run --example sample_events -- <showcase|empty|few|many-tags|rejections|rejudged|mixed-outcomes|old-schema>",
-    )?;
-    if std::env::args().nth(2).is_some() {
-        return Err("expected exactly one scenario".into());
-    }
+    let scenario = scenario_argument(std::env::args().skip(1))?;
     let target = default_events_path()?;
     eprintln!("WARNING: this replaces the active v0.0.2 event log with synthetic data.");
     eprintln!("Stop every agent-dock process before continuing.");
@@ -28,6 +23,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Previous log backup: `{}`.", backup.display());
     }
     Ok(())
+}
+
+fn scenario_argument(mut arguments: impl Iterator<Item = String>) -> Result<String, &'static str> {
+    let scenario = arguments.next().unwrap_or_else(|| "showcase".to_owned());
+    if arguments.next().is_some() {
+        return Err("expected at most one scenario");
+    }
+    Ok(scenario)
 }
 
 fn replace_with_scenario(
@@ -263,6 +266,16 @@ fn parse(value: &str) -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_to_showcase_when_the_scenario_is_omitted() {
+        assert_eq!(scenario_argument(std::iter::empty()).unwrap(), "showcase");
+        assert_eq!(
+            scenario_argument(["empty".to_owned()].into_iter()).unwrap(),
+            "empty"
+        );
+        assert!(scenario_argument(["empty".to_owned(), "few".to_owned()].into_iter()).is_err());
+    }
 
     #[test]
     fn installs_empty_log_and_removes_temporary_lock() {
