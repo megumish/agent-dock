@@ -359,13 +359,23 @@ fn decode_event_line(line: &str) -> Result<Event, SkippedLineReason> {
             message: source.to_string(),
         }
     })?;
-    if let Some(found) = document
+    let found = document
         .get("format_version")
-        .and_then(serde_json::Value::as_str)
-        .filter(|found| *found != EVENT_FORMAT_VERSION)
-    {
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .unwrap_or_else(|| {
+            document
+                .get("schema_version")
+                .map(|value| format!("legacy schema_version {}", value))
+                .unwrap_or_else(|| "missing".to_owned())
+        });
+    if found != EVENT_FORMAT_VERSION {
         return Err(SkippedLineReason::UnsupportedFormat {
-            found: found.to_owned(),
+            found,
             expected: EVENT_FORMAT_VERSION,
         });
     }
@@ -639,9 +649,10 @@ mod tests {
     }
 
     #[test]
-    fn treats_missing_or_non_string_format_versions_as_invalid_events() {
+    fn treats_missing_legacy_and_non_string_format_versions_as_unsupported() {
         for line in [
             "{}",
+            "{\"schema_version\":\"0.0.1\"}",
             "{\"format_version\":null}",
             "{\"format_version\":1}",
             "{\"format_version\":[]}",
@@ -651,7 +662,7 @@ mod tests {
         ] {
             assert!(matches!(
                 decode_event_line(line),
-                Err(SkippedLineReason::InvalidEvent { .. })
+                Err(SkippedLineReason::UnsupportedFormat { .. })
             ));
         }
     }

@@ -926,10 +926,14 @@ mod tests {
     }
 
     #[test]
-    fn keeps_a_log_containing_only_an_invalid_event() {
+    fn keeps_a_log_containing_only_an_invalid_current_format_event() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        fs::write(&path, "{}\n").unwrap();
+        fs::write(
+            &path,
+            format!("{{\"format_version\":{EVENT_FORMAT_VERSION:?}}}\n"),
+        )
+        .unwrap();
         let mut ask = |_: &str, _: bool| panic!("invalid events do not require confirmation");
         let history = read_event_history_with(&EventLog::new(&path), &mut ask)
             .unwrap()
