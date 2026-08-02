@@ -148,7 +148,10 @@ fn load_or_create_config_with(
         }
 
         println!("Configuration does not exist: {}", path.display());
-        if !ask("Create default Claude, Codex, and Gemini profiles?", true)? {
+        if !ask(
+            "Create default Claude, Codex, Gemini, and Antigravity profiles?",
+            true,
+        )? {
             println!("No configuration was created.");
             return Ok(None);
         }

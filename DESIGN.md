@@ -54,7 +54,7 @@ graph LR
 
 ## 0.1.0 の乗組員
 
-導入済みの三つのエージェント CLI（Claude Code、Codex CLI、Gemini CLI）のヘッドレス実行を、共通の実行アダプタで包む。
+導入済みの四つのエージェント CLI（Claude Code、Codex CLI、Gemini CLI、Antigravity CLI）のヘッドレス実行を、共通の実行アダプタで包む。
 モデルの違いを含めて数個の実行プロファイルを登録し、助言が選び分けられる選択肢を確保する。
 三社の CLI を最初から扱うことで、特定ベンダーに固定しないという VISION の非目標も初日から満たす。
 

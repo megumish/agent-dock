@@ -13,7 +13,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::ExecutionProfile;
+use crate::{ExecutionProfile, PromptTransport};
 
 const TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(3);
 
@@ -73,9 +73,20 @@ pub async fn execute(
     command
         .args(&spec.args)
         .current_dir(&spec.working_directory)
-        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    let stdin_prompt = match spec.prompt_transport {
+        PromptTransport::Stdin => {
+            command.stdin(std::process::Stdio::piped());
+            Some(request.prompt)
+        }
+        PromptTransport::Argument => {
+            command
+                .arg(request.prompt)
+                .stdin(std::process::Stdio::null());
+            None
+        }
+    };
     command.as_std_mut().process_group(0);
 
     let started = Instant::now();
@@ -86,16 +97,19 @@ pub async fn execute(
     let process_id = child.id().ok_or(ExecutionError::MissingProcessId)?;
     on_event(ExecutionEvent::Started { process_id });
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or(ExecutionError::MissingPipe("stdin"))?;
-    let prompt = request.prompt;
-    let stdin_task = tokio::spawn(async move {
-        stdin.write_all(prompt.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.shutdown().await
-    });
+    let stdin_task = if let Some(prompt) = stdin_prompt {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or(ExecutionError::MissingPipe("stdin"))?;
+        Some(tokio::spawn(async move {
+            stdin.write_all(prompt.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.shutdown().await
+        }))
+    } else {
+        None
+    };
 
     let stdout = child
         .stdout
@@ -120,7 +134,8 @@ pub async fn execute(
         }
     };
 
-    if let Err(source) = stdin_task.await.map_err(ExecutionError::Task)?
+    if let Some(stdin_task) = stdin_task
+        && let Err(source) = stdin_task.await.map_err(ExecutionError::Task)?
         && source.kind() != io::ErrorKind::BrokenPipe
     {
         return Err(ExecutionError::Io(source));
@@ -258,6 +273,13 @@ mod tests {
         }
     }
 
+    fn antigravity_profile(executable: PathBuf) -> ExecutionProfile {
+        ExecutionProfile {
+            adapter: AdapterKind::Antigravity,
+            ..profile(executable)
+        }
+    }
+
     #[tokio::test]
     async fn streams_stdin_stdout_and_stderr() {
         let directory = tempfile::tempdir().unwrap();
@@ -304,6 +326,49 @@ mod tests {
             Some(ExecutionEvent::Started { .. })
         ));
         assert_eq!(events.last(), Some(&ExecutionEvent::Finished));
+    }
+
+    #[tokio::test]
+    async fn passes_antigravity_prompt_as_an_argument() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = write_script(
+            directory.path(),
+            "#!/bin/sh\nprintf 'flag:%s\\n' \"$1\"\nprintf 'received:%s\\n' \"$2\"\n",
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let (_, cancellation) = oneshot::channel();
+
+        let outcome = execute(
+            &antigravity_profile(executable),
+            ExecutionRequest {
+                prompt: "hello from dock".to_owned(),
+                working_directory: directory.path().to_path_buf(),
+            },
+            cancellation,
+            move |event| captured.lock().unwrap().push(event),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ExecutionOutcome::Completed {
+                exit_code: Some(0),
+                ..
+            }
+        ));
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::Output { source: OutputSource::Stdout, line }
+                if line == "flag:-p"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::Output { source: OutputSource::Stdout, line }
+                if line == "received:hello from dock"
+        )));
     }
 
     #[tokio::test]
