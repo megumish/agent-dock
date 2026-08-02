@@ -21,6 +21,8 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+const ACCEPT_RESULT_DEFAULT: bool = true;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -192,7 +194,7 @@ async fn run() -> Result<i32, AppError> {
         return Ok(process_exit_code);
     }
 
-    let accepted = match confirm_required("Accept this result?") {
+    let accepted = match confirm("Accept this result?", ACCEPT_RESULT_DEFAULT) {
         Ok(accepted) => accepted,
         Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
             return Ok(process_exit_code);
@@ -365,17 +367,6 @@ fn confirm(prompt: &str, default: bool) -> io::Result<bool> {
             return Ok(confirmed);
         }
         eprintln!("Please answer y or n.");
-    }
-}
-
-fn confirm_required(prompt: &str) -> io::Result<bool> {
-    loop {
-        let input = read_line(&format!("{prompt} [y/n]"))?;
-        match input.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            _ => eprintln!("Please answer y or n."),
-        }
     }
 }
 
@@ -593,6 +584,11 @@ mod tests {
         assert_eq!(parse_confirmation("N", true), Some(false));
         assert_eq!(parse_confirmation("no", true), Some(false));
         assert_eq!(parse_confirmation("maybe", true), None);
+    }
+
+    #[test]
+    fn defaults_an_empty_acceptance_answer_to_accepted() {
+        assert_eq!(parse_confirmation("", ACCEPT_RESULT_DEFAULT), Some(true));
     }
 
     #[test]
