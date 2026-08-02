@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod config;
 pub mod execution;
+pub mod record;
 
 pub use adapter::{AdapterKind, CommandSpec, ExecutionProfile, PromptTransport};
 pub use config::{
@@ -8,4 +9,8 @@ pub use config::{
 };
 pub use execution::{
     ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionRequest, OutputSource, execute,
+};
+pub use record::{
+    EVENT_FORMAT_VERSION, Event, EventKind, EventLog, FailureKind, ProfileSnapshot, ReadEvents,
+    RecordError, RecordedExecutionOutcome, SkippedLine, Verdict, default_events_path,
 };

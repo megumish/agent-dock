@@ -12,11 +12,13 @@ use thiserror::Error;
 
 use crate::{AdapterKind, ExecutionProfile, adapter::ProfileValidationError};
 
-pub const CONFIG_API_VERSION: &str = "agent-dock/config/v1alpha1";
+pub const CONFIG_API_VERSION: &str = "agent-dock/config/v1alpha2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub api_version: String,
+    pub record_prompt: bool,
+    pub tag_candidates: Vec<String>,
     pub profiles: Vec<ExecutionProfile>,
 }
 
@@ -39,9 +41,11 @@ pub enum ReplaceConfigOutcome {
 }
 
 impl Config {
-    pub fn defaults() -> Self {
+    pub fn defaults(record_prompt: bool) -> Self {
         Self {
             api_version: CONFIG_API_VERSION.to_owned(),
+            record_prompt,
+            tag_candidates: Vec::new(),
             profiles: [
                 ("codex-default", "Codex (default)", AdapterKind::Codex),
                 ("claude-default", "Claude (default)", AdapterKind::Claude),
@@ -98,7 +102,7 @@ impl Config {
         path: &Path,
         expected: &ConfigRevision,
     ) -> Result<ReplaceConfigOutcome, ConfigError> {
-        let config = Self::defaults();
+        let config = Self::defaults(false);
         config.validate()?;
         let source = toml::to_string_pretty(&config).map_err(ConfigError::Serialize)?;
         let parent = path
@@ -149,8 +153,8 @@ impl Config {
         result
     }
 
-    pub fn create_default(path: &Path) -> Result<Self, ConfigError> {
-        let config = Self::defaults();
+    pub fn create_default(path: &Path, record_prompt: bool) -> Result<Self, ConfigError> {
+        let config = Self::defaults(record_prompt);
         config.validate()?;
         let source = toml::to_string_pretty(&config).map_err(ConfigError::Serialize)?;
         let parent = path
@@ -294,7 +298,7 @@ mod tests {
 
     #[test]
     fn uses_codex_as_the_default_profile() {
-        let config = Config::defaults();
+        let config = Config::defaults(false);
         assert_eq!(config.profiles[0].id, "codex-default");
     }
 
@@ -302,18 +306,18 @@ mod tests {
     fn creates_and_loads_default_without_overwriting() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/config.toml");
-        let created = Config::create_default(&path).unwrap();
+        let created = Config::create_default(&path, true).unwrap();
         assert_eq!(created, Config::load(&path).unwrap());
         assert!(matches!(
-            Config::create_default(&path),
+            Config::create_default(&path, false),
             Err(ConfigError::Create { .. })
         ));
     }
 
     #[test]
     fn rejects_unknown_schema() {
-        let mut config = Config::defaults();
-        config.api_version = "agent-dock/config/v1alpha2".to_owned();
+        let mut config = Config::defaults(false);
+        config.api_version = "agent-dock/config/v9".to_owned();
         assert!(matches!(
             config.validate(),
             Err(ConfigError::UnsupportedApi { .. })
@@ -322,7 +326,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_profile_ids() {
-        let mut config = Config::defaults();
+        let mut config = Config::defaults(false);
         config.profiles.push(config.profiles[0].clone());
         assert!(matches!(
             config.validate(),
@@ -336,7 +340,7 @@ mod tests {
         let path = directory.path().join("config.toml");
         fs::write(
             &path,
-            "api_version = \"agent-dock/config/v1alpha1\"\n[[profiles]]\nid = \"unknown\"\nname = \"Unknown\"\nadapter = \"other\"\n",
+            "api_version = \"agent-dock/config/v1alpha2\"\nrecord_prompt = false\ntag_candidates = []\n[[profiles]]\nid = \"unknown\"\nname = \"Unknown\"\nadapter = \"other\"\n",
         )
         .unwrap();
 
