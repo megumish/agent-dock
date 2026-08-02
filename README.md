@@ -41,6 +41,7 @@ alpha の期間は ADR を作らず、実装しながら技術を探索する。
 
 0.1.0-alpha.1 は、一つのタスクを登録済みの実行プロファイルへ依頼する対話型 CLI である。
 Claude Code、Codex CLI、Gemini CLI のヘッドレス実行を扱う。
+対応 OS は macOS に限り、ほかの OS での動作は保証しない。
 
 Rust ツールチェーンは mise で管理する。
 
