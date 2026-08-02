@@ -43,8 +43,8 @@ impl Config {
         Self {
             api_version: CONFIG_API_VERSION.to_owned(),
             profiles: [
-                ("claude-default", "Claude (default)", AdapterKind::Claude),
                 ("codex-default", "Codex (default)", AdapterKind::Codex),
+                ("claude-default", "Claude (default)", AdapterKind::Claude),
                 ("gemini-default", "Gemini (default)", AdapterKind::Gemini),
                 (
                     "antigravity-default",
@@ -291,6 +291,12 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_codex_as_the_default_profile() {
+        let config = Config::defaults();
+        assert_eq!(config.profiles[0].id, "codex-default");
+    }
 
     #[test]
     fn creates_and_loads_default_without_overwriting() {
