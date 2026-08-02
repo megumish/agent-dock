@@ -490,7 +490,7 @@ fn render_segment(score: &SegmentScore, now: Timestamp) -> String {
     let label = match &score.segment {
         Segment::Overall => "Overall".to_owned(),
         Segment::Untagged => "Untagged".to_owned(),
-        Segment::Tag(tag) => format!("Tag: {}", escape_terminal(tag)),
+        Segment::Tag(tag) => format!("Tag \"{}\"", escape_terminal(tag).replace('"', "\\\"")),
     };
     if score.execution_count == 0 {
         return format!("{label}: No history");
@@ -1046,6 +1046,23 @@ mod tests {
         assert_eq!(all.len() - visible.len(), 2);
         assert!(matches!(visible[0], Segment::Overall));
         assert!(matches!(&visible[5], Segment::Tag(tag) if tag == "tag-4"));
+    }
+
+    #[test]
+    fn quotes_tag_names_in_scorecard_labels() {
+        let score = SegmentScore {
+            segment: Segment::Tag("review: \"strict\"".to_owned()),
+            execution_count: 0,
+            excluded_count: 0,
+            acceptance: agent_dock::AcceptanceAxis::default(),
+            duration: agent_dock::DurationAxis::default(),
+            cost: agent_dock::CostAxis::default(),
+        };
+
+        assert_eq!(
+            render_segment(&score, Timestamp::now()),
+            "Tag \"review: \\\"strict\\\"\": No history"
+        );
     }
 
     #[test]
