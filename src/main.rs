@@ -1,12 +1,18 @@
-use std::{path::Path, process::ExitCode};
+use std::{
+    ffi::OsStr,
+    fs,
+    io::{self, Write},
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::ExitCode,
+};
 
 use agent_dock::{
     Config, ExecutionEvent, ExecutionOutcome, ExecutionProfile, ExecutionRequest, OutputSource,
     default_config_path, execute,
 };
-use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::oneshot;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -24,16 +30,12 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<i32, AppError> {
-    let theme = ColorfulTheme::default();
     let config_path = default_config_path()?;
     let config = if config_path.exists() {
         Config::load(&config_path)?
     } else {
         println!("Configuration does not exist: {}", config_path.display());
-        let create = Confirm::with_theme(&theme)
-            .with_prompt("Create default Claude, Codex, and Gemini profiles?")
-            .default(true)
-            .interact()?;
+        let create = confirm("Create default Claude, Codex, and Gemini profiles?", true)?;
         if !create {
             println!("No configuration was created.");
             return Ok(0);
@@ -59,33 +61,24 @@ async fn run() -> Result<i32, AppError> {
     }
 
     let working_directory = std::env::current_dir()?;
-    let prompt = read_non_empty_prompt(&theme)?;
+    let prompt = read_non_empty_prompt()?;
     let profile = loop {
         let labels: Vec<_> = available
             .iter()
             .map(|profile| format!("{} [{}]", profile.name, profile.adapter))
             .collect();
-        let selected = Select::with_theme(&theme)
-            .with_prompt("Choose a crew member")
-            .items(&labels)
-            .default(0)
-            .interact()?;
+        let selected = choose_profile(&labels)?;
         let profile = available[selected];
         print_execution_summary(profile, &prompt, &working_directory);
-        if Confirm::with_theme(&theme)
-            .with_prompt("Run this task?")
-            .default(true)
-            .interact()?
-        {
+        if confirm("Run this task?", true)? {
             break profile;
         }
     };
 
-    let cancellation = CancellationToken::new();
-    let signal_token = cancellation.clone();
+    let (cancellation_sender, cancellation_receiver) = oneshot::channel();
     let signal_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            signal_token.cancel();
+            let _ = cancellation_sender.send(());
         }
     });
     let outcome = execute(
@@ -94,7 +87,7 @@ async fn run() -> Result<i32, AppError> {
             prompt,
             working_directory,
         },
-        cancellation,
+        cancellation_receiver,
         print_event,
     )
     .await?;
@@ -114,16 +107,72 @@ async fn run() -> Result<i32, AppError> {
     Ok(outcome.process_exit_code())
 }
 
-fn read_non_empty_prompt(theme: &ColorfulTheme) -> Result<String, dialoguer::Error> {
+fn read_non_empty_prompt() -> io::Result<String> {
     loop {
-        let prompt: String = Input::with_theme(theme)
-            .with_prompt("Task")
-            .interact_text()?;
+        let prompt = read_line("Task:")?;
         if prompt_is_valid(&prompt) {
             return Ok(prompt);
         }
         eprintln!("Task must not be empty.");
     }
+}
+
+fn read_line(prompt: &str) -> io::Result<String> {
+    print!("{prompt} ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "standard input was closed",
+        ));
+    }
+    Ok(input.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+fn confirm(prompt: &str, default: bool) -> io::Result<bool> {
+    let choices = if default { "Y/n" } else { "y/N" };
+    loop {
+        let input = read_line(&format!("{prompt} [{choices}]"))?;
+        if let Some(confirmed) = parse_confirmation(&input, default) {
+            return Ok(confirmed);
+        }
+        eprintln!("Please answer y or n.");
+    }
+}
+
+fn parse_confirmation(input: &str, default: bool) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" => Some(default),
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn choose_profile(labels: &[String]) -> io::Result<usize> {
+    println!("Choose a crew member:");
+    for (index, label) in labels.iter().enumerate() {
+        println!("  {}. {label}", index + 1);
+    }
+
+    loop {
+        let input = read_line("Selection [1]:")?;
+        if let Some(index) = parse_selection(&input, labels.len()) {
+            return Ok(index);
+        }
+        eprintln!("Enter a number from 1 to {}.", labels.len());
+    }
+}
+
+fn parse_selection(input: &str, count: usize) -> Option<usize> {
+    let input = input.trim();
+    if input.is_empty() && count > 0 {
+        return Some(0);
+    }
+    let selected = input.parse::<usize>().ok()?;
+    selected.checked_sub(1).filter(|index| *index < count)
 }
 
 fn prompt_is_valid(prompt: &str) -> bool {
@@ -133,10 +182,23 @@ fn prompt_is_valid(prompt: &str) -> bool {
 fn executable_is_available(profile: &ExecutionProfile) -> bool {
     let executable = profile.executable();
     if executable.components().count() > 1 {
-        executable.is_file()
+        is_executable_file(&executable)
     } else {
-        which::which(executable).is_ok()
+        std::env::var_os("PATH")
+            .as_deref()
+            .is_some_and(|path| executable_is_in_path(&executable, path))
     }
+}
+
+fn executable_is_in_path(executable: &Path, path: &OsStr) -> bool {
+    std::env::split_paths(path)
+        .map(|directory| directory.join(executable))
+        .any(|candidate| is_executable_file(&candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 fn print_execution_summary(profile: &ExecutionProfile, prompt: &str, working_directory: &Path) {
@@ -180,8 +242,6 @@ enum AppError {
     #[error(transparent)]
     Execution(#[from] agent_dock::ExecutionError),
     #[error(transparent)]
-    Dialog(#[from] dialoguer::Error),
-    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("no configured agent CLI is available")]
     NoAvailableProfiles,
@@ -190,9 +250,7 @@ enum AppError {
 impl AppError {
     fn is_interrupted(&self) -> bool {
         match self {
-            Self::Dialog(dialoguer::Error::IO(source)) | Self::Io(source) => {
-                source.kind() == std::io::ErrorKind::Interrupted
-            }
+            Self::Io(source) => source.kind() == std::io::ErrorKind::Interrupted,
             _ => false,
         }
     }
@@ -210,6 +268,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_confirmation_answers_and_defaults() {
+        assert_eq!(parse_confirmation("", true), Some(true));
+        assert_eq!(parse_confirmation("  ", false), Some(false));
+        assert_eq!(parse_confirmation("Y", false), Some(true));
+        assert_eq!(parse_confirmation("yes", false), Some(true));
+        assert_eq!(parse_confirmation("N", true), Some(false));
+        assert_eq!(parse_confirmation("no", true), Some(false));
+        assert_eq!(parse_confirmation("maybe", true), None);
+    }
+
+    #[test]
+    fn parses_one_based_profile_selections() {
+        assert_eq!(parse_selection("", 3), Some(0));
+        assert_eq!(parse_selection("1", 3), Some(0));
+        assert_eq!(parse_selection(" 3 ", 3), Some(2));
+        assert_eq!(parse_selection("0", 3), None);
+        assert_eq!(parse_selection("4", 3), None);
+        assert_eq!(parse_selection("one", 3), None);
+        assert_eq!(parse_selection("", 0), None);
+    }
+
+    #[test]
     fn reports_an_explicit_missing_executable_as_unavailable() {
         let profile = ExecutionProfile {
             id: "missing".to_owned(),
@@ -221,5 +301,32 @@ mod tests {
         };
 
         assert!(!executable_is_available(&profile));
+    }
+
+    #[test]
+    fn finds_an_executable_in_the_given_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-agent");
+        fs::write(&executable, "#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+
+        assert!(executable_is_in_path(Path::new("fake-agent"), &path));
+        assert!(!executable_is_in_path(Path::new("missing"), &path));
+    }
+
+    #[test]
+    fn rejects_a_non_executable_file_in_the_given_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-agent");
+        fs::write(&executable, "not executable\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+
+        assert!(!executable_is_in_path(Path::new("fake-agent"), &path));
     }
 }
