@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scenario = std::env::args().nth(1).ok_or(
-        "usage: cargo run --example sample_events -- <empty|few|many-tags|rejections|rejudged|mixed-outcomes|old-schema>",
+        "usage: cargo run --example sample_events -- <all|empty|few|many-tags|rejections|rejudged|mixed-outcomes|old-schema>",
     )?;
     if std::env::args().nth(2).is_some() {
         return Err("expected exactly one scenario".into());
@@ -104,6 +104,26 @@ fn write_scenario(log: &EventLog, scenario: &str) -> Result<(), Box<dyn std::err
         return Ok(());
     }
 
+    if scenario == "all" {
+        for scenario in [
+            "few",
+            "many-tags",
+            "rejections",
+            "rejudged",
+            "mixed-outcomes",
+        ] {
+            write_current_scenario(log, scenario)?;
+        }
+        return Ok(());
+    }
+
+    write_current_scenario(log, scenario)
+}
+
+fn write_current_scenario(
+    log: &EventLog,
+    scenario: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     match scenario {
         "few" => append_run(log, "2026-07-01T00:00:00Z", &[], 1_500, Outcome::Accepted)?,
         "many-tags" => append_run(
@@ -267,6 +287,17 @@ mod tests {
         let backup = replace_with_scenario(&target, "few").unwrap().unwrap();
         assert_eq!(fs::read(backup).unwrap(), b"previous\n");
         assert!(!fs::read(&target).unwrap().is_empty());
+    }
+
+    #[test]
+    fn all_combines_every_populated_current_schema_scenario() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("events.jsonl");
+        replace_with_scenario(&target, "all").unwrap();
+
+        let history = EventLog::new(target).read_all().unwrap();
+        assert_eq!(history.events.len(), 28);
+        assert!(history.skipped_lines.is_empty());
     }
 
     #[test]
