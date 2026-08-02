@@ -11,6 +11,7 @@ use agent_dock::{
     Config, ExecutionEvent, ExecutionOutcome, ExecutionProfile, ExecutionRequest, OutputSource,
     default_config_path, execute,
 };
+use rustyline::{DefaultEditor, error::ReadlineError};
 use thiserror::Error;
 use tokio::sync::oneshot;
 
@@ -107,9 +108,10 @@ async fn run() -> Result<i32, AppError> {
     Ok(outcome.process_exit_code())
 }
 
-fn read_non_empty_prompt() -> io::Result<String> {
+fn read_non_empty_prompt() -> Result<String, ReadlineError> {
+    let mut editor = DefaultEditor::new()?;
     loop {
-        let prompt = read_line("Task:")?;
+        let prompt = editor.readline("Task: ")?;
         if prompt_is_valid(&prompt) {
             return Ok(prompt);
         }
@@ -243,6 +245,8 @@ enum AppError {
     Execution(#[from] agent_dock::ExecutionError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Readline(#[from] ReadlineError),
     #[error("no configured agent CLI is available")]
     NoAvailableProfiles,
 }
@@ -251,6 +255,7 @@ impl AppError {
     fn is_interrupted(&self) -> bool {
         match self {
             Self::Io(source) => source.kind() == std::io::ErrorKind::Interrupted,
+            Self::Readline(ReadlineError::Interrupted) => true,
             _ => false,
         }
     }
