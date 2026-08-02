@@ -48,7 +48,7 @@ Rust ツールチェーンは mise で管理する。
 
 ```console
 mise install
-mise exec -- cargo run
+mise run
 ```
 
 初回起動では、ユーザー設定ディレクトリに四つの既定プロファイルを作成するか確認する。
