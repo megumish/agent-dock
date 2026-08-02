@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     fs::{self, File, OpenOptions},
     io::Write,
@@ -247,7 +247,6 @@ impl Config {
             return Err(ConfigError::NoProfiles);
         }
         let mut names = HashSet::new();
-        let mut identities = HashSet::new();
         for profile in &self.profiles {
             profile.validate(false)?;
             if profile.name == crate::safe_test_declaration().name {
@@ -256,13 +255,32 @@ impl Config {
             if !names.insert(&profile.name) {
                 return Err(ConfigError::DuplicateProfileName(profile.name.clone()));
             }
-            let identity = profile.canonical_identity()?;
-            if !identities.insert(identity) {
-                return Err(ConfigError::DuplicateProfileIdentity(profile.id()?));
-            }
         }
+        validate_profile_identities(&self.profiles, ProfileDeclaration::id)?;
         Ok(())
     }
+}
+
+fn validate_profile_identities(
+    profiles: &[ProfileDeclaration],
+    derive_id: impl Fn(&ProfileDeclaration) -> Result<String, ProfileValidationError>,
+) -> Result<(), ConfigError> {
+    let mut identities = HashSet::new();
+    let mut identities_by_id = HashMap::new();
+    for profile in profiles {
+        let identity = profile.canonical_identity()?;
+        let id = derive_id(profile)?;
+        if !identities.insert(identity.clone()) {
+            return Err(ConfigError::DuplicateProfileIdentity(id));
+        }
+        if identities_by_id
+            .insert(id.clone(), identity.clone())
+            .is_some_and(|previous| previous != identity)
+        {
+            return Err(ConfigError::ProfileIdentityCollision(id));
+        }
+    }
+    Ok(())
 }
 
 fn config_lock_path(path: &Path) -> PathBuf {
@@ -373,6 +391,8 @@ pub enum ConfigError {
     ReservedSafeTestName(String),
     #[error("duplicate declared profile identity `{0}`")]
     DuplicateProfileIdentity(String),
+    #[error("distinct profile declarations produced the same profile ID `{0}`")]
+    ProfileIdentityCollision(String),
     #[error(transparent)]
     InvalidProfile(#[from] ProfileValidationError),
 }
@@ -550,6 +570,18 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ReservedSafeTestName(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_distinct_profile_identities_with_the_same_derived_id() {
+        let config = Config::defaults(false);
+        let result = validate_profile_identities(&config.profiles[..2], |_| {
+            Ok("synthetic-collision".to_owned())
+        });
+        assert!(matches!(
+            result,
+            Err(ConfigError::ProfileIdentityCollision(id)) if id == "synthetic-collision"
         ));
     }
 
