@@ -77,45 +77,63 @@ async fn run() -> Result<i32, AppError> {
         );
     }
     let tag_candidates = collect_tag_candidates(&config.tag_candidates, &history.events);
-    let prompt = read_non_empty_prompt()?;
-    let received_at = Timestamp::now();
-    let tags = read_tags(&tag_candidates)?;
-    let prompt_approved = if config.record_prompt {
-        confirm("Record this task prompt?", true)?
-    } else {
-        false
+    let mut editor = DefaultEditor::new()?;
+    let mut prompt = read_non_empty_prompt(&mut editor, None)?;
+    let (task_id, selected) = loop {
+        let tags = read_tags(&tag_candidates)?;
+        let prompt_approved = if config.record_prompt {
+            confirm("Record this task prompt?", true)?
+        } else {
+            false
+        };
+        let all_segments = segments_for_tags(&tags);
+        let score_segments = visible_segments(&all_segments);
+        let hidden_tags = all_segments.len() - score_segments.len();
+        let fresh_history = read_event_history(&event_log)?;
+        let projection = project(&fresh_history.events, &available, &score_segments);
+        for warning in &projection.warnings {
+            eprintln!("Warning: {}", escape_terminal(warning));
+        }
+        let choices = render_profile_choices(
+            &available,
+            &projection.scorecards,
+            hidden_tags,
+            Timestamp::now(),
+        );
+        let selected = choose_profile(&choices)?;
+        let profile = &available[selected];
+        print_execution_summary(profile, &prompt, &working_directory);
+        let confirmation = confirm_run()?;
+        match resolve_run_confirmation(
+            &prompt,
+            confirmation,
+            &mut |initial| {
+                read_non_empty_prompt(&mut editor, Some(initial)).map_err(AppError::from)
+            },
+            || {
+                let task_id = Uuid::now_v7();
+                record_approved_task(
+                    &event_log,
+                    task_received_event(
+                        task_id,
+                        tags,
+                        &prompt,
+                        config.record_prompt,
+                        prompt_approved,
+                        Timestamp::now(),
+                    ),
+                    &profile.id,
+                )?;
+                Ok((task_id, selected))
+            },
+        )? {
+            RunResolution::Edit(edited) => {
+                prompt = edited;
+            }
+            RunResolution::Run(approved) => break approved,
+        }
     };
-    let task_id = Uuid::now_v7();
-    let all_segments = segments_for_tags(&tags);
-    let score_segments = visible_segments(&all_segments);
-    let hidden_tags = all_segments.len() - score_segments.len();
-    event_log.append(&task_received_event(
-        task_id,
-        tags,
-        &prompt,
-        config.record_prompt,
-        prompt_approved,
-        received_at,
-    ))?;
-
-    let fresh_history = read_event_history(&event_log)?;
-    let projection = project(&fresh_history.events, &available, &score_segments);
-    for warning in &projection.warnings {
-        eprintln!("Warning: {}", escape_terminal(warning));
-    }
-    let choices = render_profile_choices(
-        &available,
-        &projection.scorecards,
-        hidden_tags,
-        Timestamp::now(),
-    );
-    let selected = choose_profile(&choices)?;
     let profile = &available[selected];
-    print_execution_summary(profile, &prompt, &working_directory);
-    if let Some(exit_code) = record_assignment(&event_log, task_id, &profile.id, confirm_run()?)? {
-        println!("Task was not run.");
-        return Ok(exit_code);
-    }
 
     let (cancellation_sender, cancellation_receiver) = oneshot::channel();
     let signal_task = tokio::spawn(async move {
@@ -317,10 +335,16 @@ fn read_event_history(event_log: &EventLog) -> Result<ReadEvents, AppError> {
     }
 }
 
-fn read_non_empty_prompt() -> Result<String, ReadlineError> {
-    let mut editor = DefaultEditor::new()?;
+fn read_non_empty_prompt(
+    editor: &mut DefaultEditor,
+    initial: Option<&str>,
+) -> Result<String, ReadlineError> {
     loop {
-        let prompt = editor.readline("Task: ")?;
+        let prompt = if let Some(initial) = initial {
+            editor.readline_with_initial("Task: ", (initial, ""))?
+        } else {
+            editor.readline("Task: ")?
+        };
         if prompt_is_valid(&prompt) {
             return Ok(prompt);
         }
@@ -356,7 +380,7 @@ fn confirm(prompt: &str, default: bool) -> io::Result<bool> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunConfirmation {
     Run,
-    Exit,
+    Edit,
 }
 
 fn confirm_run() -> io::Result<RunConfirmation> {
@@ -369,8 +393,26 @@ fn confirm_run_with(
     Ok(if ask("Run this task?", true)? {
         RunConfirmation::Run
     } else {
-        RunConfirmation::Exit
+        RunConfirmation::Edit
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunResolution<T> {
+    Edit(String),
+    Run(T),
+}
+
+fn resolve_run_confirmation<T>(
+    prompt: &str,
+    confirmation: RunConfirmation,
+    edit: &mut impl FnMut(&str) -> Result<String, AppError>,
+    approve: impl FnOnce() -> Result<T, AppError>,
+) -> Result<RunResolution<T>, AppError> {
+    match confirmation {
+        RunConfirmation::Run => approve().map(RunResolution::Run),
+        RunConfirmation::Edit => edit(prompt).map(RunResolution::Edit),
+    }
 }
 
 fn parse_confirmation(input: &str, default: bool) -> Option<bool> {
@@ -625,18 +667,24 @@ fn record_assignment(
     event_log: &EventLog,
     task_id: Uuid,
     profile_id: &str,
-    confirmation: RunConfirmation,
-) -> Result<Option<i32>, AppError> {
-    if confirmation == RunConfirmation::Exit {
-        return Ok(Some(0));
-    }
+) -> Result<(), AppError> {
     event_log.append(&Event::new(
         task_id,
         EventKind::Assigned {
             profile_id: profile_id.to_owned(),
         },
     ))?;
-    Ok(None)
+    Ok(())
+}
+
+fn record_approved_task(
+    event_log: &EventLog,
+    received: Event,
+    profile_id: &str,
+) -> Result<(), AppError> {
+    let task_id = received.task_id;
+    event_log.append(&received)?;
+    record_assignment(event_log, task_id, profile_id)
 }
 
 fn print_execution_summary(profile: &ExecutionProfile, prompt: &str, working_directory: &Path) {
@@ -777,32 +825,150 @@ mod tests {
     }
 
     #[test]
-    fn records_only_task_received_when_run_is_declined() {
+    fn declining_run_returns_to_editing_without_recording_events() {
         let directory = tempfile::tempdir().unwrap();
         let log = EventLog::new(directory.path().join("events.jsonl"));
-        let task_id = Uuid::now_v7();
-        log.append(&task_received_event(
-            task_id,
-            Vec::new(),
-            "do not run",
-            false,
-            false,
-            Timestamp::now(),
-        ))
-        .unwrap();
-
         let mut ask = |prompt: &str, default: bool| {
             assert_eq!(prompt, "Run this task?");
             assert!(default);
             Ok(false)
         };
         let confirmation = confirm_run_with(&mut ask).unwrap();
-        let exit_code = record_assignment(&log, task_id, "test-default", confirmation).unwrap();
-        let events = log.read_all().unwrap().events;
+        let mut first_edit = |initial: &str| -> Result<String, AppError> {
+            assert_eq!(initial, "do not run");
+            Ok("try another task".to_owned())
+        };
+        let first_attempt =
+            resolve_run_confirmation("do not run", confirmation, &mut first_edit, || {
+                record_approved_task(
+                    &log,
+                    task_received_event(
+                        Uuid::now_v7(),
+                        Vec::new(),
+                        "do not run",
+                        false,
+                        false,
+                        Timestamp::now(),
+                    ),
+                    "test-default",
+                )
+            })
+            .unwrap();
+        let RunResolution::Edit(edited) = first_attempt else {
+            panic!("declining the run must return the edited prompt")
+        };
+        assert!(log.read_all().unwrap().events.is_empty());
 
-        assert_eq!(exit_code, Some(0));
-        assert_eq!(events.len(), 1);
+        let confirmation = confirm_run_with(&mut ask).unwrap();
+        let mut second_edit = |initial: &str| -> Result<String, AppError> {
+            assert_eq!(initial, "try another task");
+            Ok("run this instead".to_owned())
+        };
+        let second_attempt =
+            resolve_run_confirmation(&edited, confirmation, &mut second_edit, || {
+                record_approved_task(
+                    &log,
+                    task_received_event(
+                        Uuid::now_v7(),
+                        Vec::new(),
+                        "try another task",
+                        false,
+                        false,
+                        Timestamp::now(),
+                    ),
+                    "test-default",
+                )
+            })
+            .unwrap();
+        let RunResolution::Edit(edited) = second_attempt else {
+            panic!("declining the run must return the edited prompt")
+        };
+
+        assert_eq!(edited, "run this instead");
+        assert!(log.read_all().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn run_confirmation_does_not_edit_the_prompt() {
+        let mut edit = |_: &str| -> Result<String, AppError> {
+            panic!("the prompt must not be edited after approval")
+        };
+
+        let resolution =
+            resolve_run_confirmation("run this", RunConfirmation::Run, &mut edit, || {
+                Ok("approved")
+            })
+            .unwrap();
+        assert_eq!(resolution, RunResolution::Run("approved"));
+    }
+
+    #[test]
+    fn run_confirmation_propagates_interrupts_and_end_of_input() {
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::UnexpectedEof] {
+            let mut ask = |_: &str, _: bool| Err(io::Error::new(kind, "stop"));
+            assert!(matches!(
+                confirm_run_with(&mut ask),
+                Err(source) if source.kind() == kind
+            ));
+        }
+    }
+
+    #[test]
+    fn prompt_editing_propagates_interrupts_and_end_of_input() {
+        let mut interrupt = |_: &str| Err(AppError::Readline(ReadlineError::Interrupted));
+        assert!(matches!(
+            resolve_run_confirmation("edit this", RunConfirmation::Edit, &mut interrupt, || {
+                Ok(())
+            }),
+            Err(AppError::Readline(ReadlineError::Interrupted))
+        ));
+
+        let mut end_of_input = |_: &str| Err(AppError::Readline(ReadlineError::Eof));
+        assert!(matches!(
+            resolve_run_confirmation(
+                "edit this",
+                RunConfirmation::Edit,
+                &mut end_of_input,
+                || Ok(())
+            ),
+            Err(AppError::Readline(ReadlineError::Eof))
+        ));
+    }
+
+    #[test]
+    fn records_received_before_assignment_only_after_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let task_id = Uuid::now_v7();
+
+        let mut edit = |_: &str| -> Result<String, AppError> {
+            panic!("an approved task must not return to editing")
+        };
+        let resolution =
+            resolve_run_confirmation("run this", RunConfirmation::Run, &mut edit, || {
+                record_approved_task(
+                    &log,
+                    task_received_event(
+                        task_id,
+                        vec!["rust".to_owned()],
+                        "run this",
+                        false,
+                        false,
+                        Timestamp::now(),
+                    ),
+                    "test-default",
+                )?;
+                Ok(task_id)
+            })
+            .unwrap();
+
+        let events = log.read_all().unwrap().events;
+        assert_eq!(resolution, RunResolution::Run(task_id));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].task_id, task_id);
         assert!(matches!(events[0].kind, EventKind::TaskReceived { .. }));
+        assert_eq!(events[1].task_id, task_id);
+        assert!(matches!(events[1].kind, EventKind::Assigned { .. }));
     }
 
     #[test]

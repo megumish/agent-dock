@@ -38,11 +38,11 @@ v0.0.x の期間は ADR を作らず、実装しながら技術を探索する�
 1. [VISION.md](./VISION.md)
 2. [DESIGN.md](./DESIGN.md)
 3. [DEPENDENCIES.md](./DEPENDENCIES.md)
-4. [現在のリリース文書](./docs/releases/v0.0.2.md)
+4. [現在のリリース文書](./docs/releases/v0.0.3.md)
 
 ## 実行
 
-現在の実装範囲と挙動は [v0.0.2 のリリース文書](./docs/releases/v0.0.2.md) に記録する。
+現在の実装範囲と挙動は [v0.0.3 のリリース文書](./docs/releases/v0.0.3.md) に記録する。
 v0.1.0 としてリリースするまで、本実装と蓄積データは開発確認専用であり、実際の仕事への利用を前提としない。
 
 Rust ツールチェーンは mise で管理する。
