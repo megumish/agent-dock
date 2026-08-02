@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::{Event, EventKind, ExecutionProfile, RecordedExecutionOutcome, Verdict};
@@ -63,7 +63,6 @@ struct Execution<'a> {
     elapsed_ms: u64,
     outcome: &'a RecordedExecutionOutcome,
     tags: &'a [String],
-    received_at: Option<Timestamp>,
 }
 
 pub fn segments_for_tags(tags: &[String]) -> Vec<Segment> {
@@ -88,7 +87,7 @@ pub fn project(
     requested: &[Segment],
 ) -> Projection {
     let mut projection = Projection::default();
-    let mut tasks: HashMap<Uuid, (&[String], Timestamp)> = HashMap::new();
+    let mut task_tags: HashMap<Uuid, &[String]> = HashMap::new();
     let execution_tasks: HashMap<Uuid, Uuid> = events
         .iter()
         .filter_map(|event| {
@@ -100,7 +99,7 @@ pub fn project(
     for event in events {
         match &event.kind {
             EventKind::TaskReceived { tags, .. } => {
-                tasks.insert(event.task_id, (tags, event.occurred_at));
+                task_tags.insert(event.task_id, tags);
             }
             EventKind::Judged {
                 execution_event_id,
@@ -150,11 +149,10 @@ pub fn project(
                 started_at: *started_at,
                 elapsed_ms: *elapsed_ms,
                 outcome,
-                tags: tasks
+                tags: task_tags
                     .get(&event.task_id)
-                    .map(|task| task.0)
+                    .copied()
                     .unwrap_or(&empty_tags),
-                received_at: tasks.get(&event.task_id).map(|task| task.1),
             });
     }
 
@@ -220,10 +218,8 @@ fn score_segment(
                     execution.outcome,
                     RecordedExecutionOutcome::Completed { .. }
                 )
-                && execution.received_at.is_some()
-                && let Some(duration) = turnaround_ms(execution)
             {
-                durations.push(duration);
+                durations.push(execution.elapsed_ms);
                 duration_latest = latest(duration_latest, execution.started_at);
             }
         }
@@ -249,17 +245,6 @@ fn score_segment(
         duration,
         cost: CostAxis::default(),
     }
-}
-
-fn turnaround_ms(execution: &Execution<'_>) -> Option<u64> {
-    let completed = execution
-        .started_at
-        .checked_add(SignedDuration::from_millis_i128(
-            execution.elapsed_ms.into(),
-        ))
-        .ok()?;
-    let elapsed = completed.duration_since(execution.received_at?).as_millis();
-    u64::try_from(elapsed).ok()
 }
 
 fn latest(current: Option<Timestamp>, value: Timestamp) -> Option<Timestamp> {
@@ -432,14 +417,14 @@ mod tests {
         );
         assert_eq!(
             (overall.duration.median_ms, overall.duration.summary.count),
-            (Some(2_000), 1)
+            (Some(1_000), 1)
         );
         assert_eq!(overall.excluded_count, 0);
         assert_eq!(projection.scorecards[0].scores[1].execution_count, 2);
     }
 
     #[test]
-    fn excludes_unjudged_cancelled_and_missing_task_from_axes() {
+    fn duration_uses_only_completed_crew_member_runtime() {
         let task_id = Uuid::now_v7();
         let cancelled = Uuid::now_v7();
         let missing_task_id = Uuid::now_v7();
@@ -459,7 +444,8 @@ mod tests {
         let projection = project(&events, &[safe_test_profile()], &[Segment::Overall]);
         let score = &projection.scorecards[0].scores[0];
         assert_eq!(score.acceptance.summary.count, 1);
-        assert_eq!(score.duration.summary.count, 0);
+        assert_eq!(score.duration.median_ms, Some(10));
+        assert_eq!(score.duration.summary.count, 1);
         assert_eq!(score.excluded_count, 1);
         assert_eq!(score.cost.summary.count, 0);
     }
