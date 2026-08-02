@@ -3,14 +3,18 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     io::Write,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
-use crate::{AdapterKind, ExecutionProfile, adapter::ProfileValidationError};
+use crate::{
+    AdapterKind, ExecutionProfile,
+    adapter::{ProfileValidationError, safe_test_profile},
+};
 
 pub const CONFIG_API_VERSION: &str = "agent-dock/config/v1alpha2";
 
@@ -46,26 +50,29 @@ impl Config {
             api_version: CONFIG_API_VERSION.to_owned(),
             record_prompt,
             tag_candidates: Vec::new(),
-            profiles: [
-                ("codex-default", "Codex (default)", AdapterKind::Codex),
-                ("claude-default", "Claude (default)", AdapterKind::Claude),
-                ("gemini-default", "Gemini (default)", AdapterKind::Gemini),
-                (
-                    "antigravity-default",
-                    "Antigravity (default)",
-                    AdapterKind::Antigravity,
-                ),
-            ]
-            .into_iter()
-            .map(|(id, name, adapter)| ExecutionProfile {
-                id: id.to_owned(),
-                name: name.to_owned(),
-                adapter,
-                executable: None,
-                model: None,
-                args: Vec::new(),
-            })
-            .collect(),
+            profiles: std::iter::once(safe_test_profile())
+                .chain(
+                    [
+                        ("codex-default", "Codex (default)", AdapterKind::Codex),
+                        ("claude-default", "Claude (default)", AdapterKind::Claude),
+                        ("gemini-default", "Gemini (default)", AdapterKind::Gemini),
+                        (
+                            "antigravity-default",
+                            "Antigravity (default)",
+                            AdapterKind::Antigravity,
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(id, name, adapter)| ExecutionProfile {
+                        id: id.to_owned(),
+                        name: name.to_owned(),
+                        adapter,
+                        executable: None,
+                        model: None,
+                        args: Vec::new(),
+                    }),
+                )
+                .collect(),
         }
     }
 
@@ -98,61 +105,6 @@ impl Config {
         Ok(config)
     }
 
-    pub fn backup_and_replace_default_if_unchanged(
-        path: &Path,
-        expected: &ConfigRevision,
-    ) -> Result<ReplaceConfigOutcome, ConfigError> {
-        let config = Self::defaults(false);
-        config.validate()?;
-        let source = toml::to_string_pretty(&config).map_err(ConfigError::Serialize)?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| ConfigError::MissingParent(path.to_path_buf()))?;
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("config.toml");
-        let (temporary_path, mut temporary) =
-            create_unique_file(parent, &format!(".{file_name}"), "tmp")?;
-        let result = (|| {
-            temporary
-                .write_all(source.as_bytes())
-                .and_then(|()| temporary.sync_all())
-                .map_err(|source| ConfigError::Write {
-                    path: temporary_path.clone(),
-                    source,
-                })?;
-            if fs::read_to_string(path).ok().as_deref() != Some(expected.0.as_str()) {
-                return Ok(ReplaceConfigOutcome::Changed);
-            }
-
-            let (backup_path, mut backup) = create_unique_file(parent, file_name, "backup")?;
-            backup
-                .write_all(expected.0.as_bytes())
-                .and_then(|()| backup.sync_all())
-                .map_err(|source| ConfigError::Write {
-                    path: backup_path.clone(),
-                    source,
-                })?;
-            if fs::read_to_string(path).ok().as_deref() != Some(expected.0.as_str()) {
-                let _ = fs::remove_file(&backup_path);
-                return Ok(ReplaceConfigOutcome::Changed);
-            }
-            fs::rename(&temporary_path, path).map_err(|source| ConfigError::Replace {
-                path: path.to_path_buf(),
-                source,
-            })?;
-            Ok(ReplaceConfigOutcome::Replaced {
-                config,
-                backup_path,
-            })
-        })();
-        if temporary_path.exists() {
-            let _ = fs::remove_file(temporary_path);
-        }
-        result
-    }
-
     pub fn create_default(path: &Path, record_prompt: bool) -> Result<Self, ConfigError> {
         let config = Self::defaults(record_prompt);
         config.validate()?;
@@ -167,6 +119,7 @@ impl Config {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(path)
             .map_err(|source| ConfigError::Create {
                 path: path.to_path_buf(),
@@ -179,6 +132,116 @@ impl Config {
                 source,
             })?;
         Ok(config)
+    }
+
+    pub fn backup_and_replace_default_if_unchanged(
+        path: &Path,
+        expected: &ConfigRevision,
+        record_prompt: bool,
+    ) -> Result<ReplaceConfigOutcome, ConfigError> {
+        let config = Self::defaults(record_prompt);
+        config.validate()?;
+        let source = toml::to_string_pretty(&config).map_err(ConfigError::Serialize)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| ConfigError::MissingParent(path.to_path_buf()))?;
+        fs::create_dir_all(parent).map_err(|source| ConfigError::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let lock_path = config_lock_path(path);
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|source| ConfigError::OpenLock {
+                path: lock_path.clone(),
+                source,
+            })?;
+        let _lock = ConfigFileLock::acquire(lock_file, &lock_path)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.toml");
+        let temporary_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::now_v7()));
+        let backup_path = parent.join(format!("{file_name}.backup.{}", Uuid::now_v7()));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary_path)
+                .map_err(|source| ConfigError::Create {
+                    path: temporary_path.clone(),
+                    source,
+                })?;
+            file.write_all(source.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|source| ConfigError::Write {
+                    path: temporary_path.clone(),
+                    source,
+                })?;
+            match fs::read_to_string(path) {
+                Ok(current) if current == expected.0 => {}
+                Ok(_) => return Ok(ReplaceConfigOutcome::Changed),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ReplaceConfigOutcome::Changed);
+                }
+                Err(source) => {
+                    return Err(ConfigError::Read {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+            let mut backup = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&backup_path)
+                .map_err(|source| ConfigError::Create {
+                    path: backup_path.clone(),
+                    source,
+                })?;
+            backup
+                .write_all(expected.0.as_bytes())
+                .and_then(|()| backup.sync_all())
+                .map_err(|source| ConfigError::Write {
+                    path: backup_path.clone(),
+                    source,
+                })?;
+            match fs::read_to_string(path) {
+                Ok(current) if current == expected.0 => {}
+                Ok(_) => return Ok(ReplaceConfigOutcome::Changed),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(ReplaceConfigOutcome::Changed);
+                }
+                Err(source) => {
+                    return Err(ConfigError::Read {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+            fs::rename(&temporary_path, path).map_err(|source| ConfigError::Replace {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(ReplaceConfigOutcome::Replaced {
+                config,
+                backup_path: backup_path.clone(),
+            })
+        })();
+        if temporary_path.exists() {
+            let _ = fs::remove_file(&temporary_path);
+        }
+        if !matches!(&result, Ok(ReplaceConfigOutcome::Replaced { .. })) && backup_path.exists() {
+            let _ = fs::remove_file(&backup_path);
+        }
+        result
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -203,28 +266,37 @@ impl Config {
     }
 }
 
-fn create_unique_file(
-    parent: &Path,
-    file_name: &str,
-    purpose: &str,
-) -> Result<(PathBuf, File), ConfigError> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    for sequence in 0..u32::MAX {
-        let path = parent.join(format!(
-            "{file_name}.{purpose}.{}.{}.{sequence}",
-            std::process::id(),
-            timestamp
-        ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(source) => return Err(ConfigError::Create { path, source }),
+fn config_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
+}
+
+struct ConfigFileLock {
+    file: File,
+}
+
+impl ConfigFileLock {
+    fn acquire(file: File, path: &Path) -> Result<Self, ConfigError> {
+        // SAFETY: flock receives an open file descriptor and a supported operation.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            Ok(Self { file })
+        } else {
+            Err(ConfigError::Lock {
+                path: path.to_path_buf(),
+                source: std::io::Error::last_os_error(),
+            })
         }
     }
-    unreachable!("u32 path suffixes were exhausted")
+}
+
+impl Drop for ConfigFileLock {
+    fn drop(&mut self) {
+        // SAFETY: the guard owns the open file until after flock returns.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 pub fn default_config_path() -> Result<PathBuf, ConfigError> {
@@ -271,6 +343,16 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("could not open configuration lock `{path}`: {source}")]
+    OpenLock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("could not lock configuration `{path}`: {source}")]
+    Lock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("could not atomically replace configuration `{path}`: {source}")]
     Replace {
         path: PathBuf,
@@ -294,12 +376,19 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, Barrier},
+        thread,
+    };
+
     use super::*;
 
     #[test]
-    fn uses_codex_as_the_default_profile() {
+    fn uses_the_safe_test_as_the_default_profile() {
         let config = Config::defaults(false);
-        assert_eq!(config.profiles[0].id, "codex-default");
+        assert_eq!(config.profiles[0].id, "test-default");
+        assert_eq!(config.profiles[0].adapter, AdapterKind::Test);
     }
 
     #[test]
@@ -308,6 +397,10 @@ mod tests {
         let path = directory.path().join("nested/config.toml");
         let created = Config::create_default(&path, true).unwrap();
         assert_eq!(created, Config::load(&path).unwrap());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(matches!(
             Config::create_default(&path, false),
             Err(ConfigError::Create { .. })
@@ -315,9 +408,133 @@ mod tests {
     }
 
     #[test]
+    fn atomically_replaces_an_unchanged_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "schema_version = \"old\"\n").unwrap();
+        let revision = match Config::load(&path).unwrap_err() {
+            ConfigError::UnsupportedApi {
+                revision: Some(revision),
+                ..
+            } => revision,
+            error => panic!("unexpected error: {error}"),
+        };
+
+        let replaced =
+            Config::backup_and_replace_default_if_unchanged(&path, &revision, true).unwrap();
+
+        let ReplaceConfigOutcome::Replaced {
+            config,
+            backup_path,
+        } = replaced
+        else {
+            panic!("configuration was not replaced");
+        };
+        assert!(config.record_prompt);
+        assert_eq!(
+            fs::read_to_string(&backup_path).unwrap(),
+            "schema_version = \"old\"\n"
+        );
+        assert_eq!(
+            fs::metadata(backup_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(Config::load(&path).unwrap().record_prompt);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn preserves_a_configuration_changed_after_it_was_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "schema_version = \"old\"\n").unwrap();
+        let revision = match Config::load(&path).unwrap_err() {
+            ConfigError::UnsupportedApi {
+                revision: Some(revision),
+                ..
+            } => revision,
+            error => panic!("unexpected error: {error}"),
+        };
+        let newer = toml::to_string_pretty(&Config::defaults(false)).unwrap();
+        fs::write(&path, &newer).unwrap();
+
+        let outcome =
+            Config::backup_and_replace_default_if_unchanged(&path, &revision, true).unwrap();
+
+        assert_eq!(outcome, ReplaceConfigOutcome::Changed);
+        assert_eq!(fs::read_to_string(path).unwrap(), newer);
+    }
+
+    #[test]
+    fn serializes_concurrent_configuration_replacements() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "schema_version = \"old\"\n").unwrap();
+        let revision = match Config::load(&path).unwrap_err() {
+            ConfigError::UnsupportedApi {
+                revision: Some(revision),
+                ..
+            } => revision,
+            error => panic!("unexpected error: {error}"),
+        };
+        let barrier = Arc::new(Barrier::new(3));
+        let mut replacements = Vec::new();
+        for record_prompt in [false, true] {
+            let path = path.clone();
+            let revision = revision.clone();
+            let barrier = barrier.clone();
+            replacements.push(thread::spawn(move || {
+                barrier.wait();
+                Config::backup_and_replace_default_if_unchanged(&path, &revision, record_prompt)
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+
+        let outcomes: Vec<_> = replacements
+            .into_iter()
+            .map(|replacement| replacement.join().unwrap())
+            .collect();
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ReplaceConfigOutcome::Replaced { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ReplaceConfigOutcome::Changed))
+                .count(),
+            1
+        );
+        let replaced = outcomes
+            .iter()
+            .find_map(|outcome| match outcome {
+                ReplaceConfigOutcome::Replaced { config, .. } => Some(config),
+                ReplaceConfigOutcome::Changed => None,
+            })
+            .unwrap();
+        assert_eq!(Config::load(&path).unwrap(), *replaced);
+        assert_eq!(
+            fs::metadata(config_lock_path(&path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
     fn rejects_unknown_schema() {
         let mut config = Config::defaults(false);
-        config.api_version = "agent-dock/config/v9".to_owned();
+        config.api_version = "other".to_owned();
         assert!(matches!(
             config.validate(),
             Err(ConfigError::UnsupportedApi { .. })
@@ -340,7 +557,9 @@ mod tests {
         let path = directory.path().join("config.toml");
         fs::write(
             &path,
-            "api_version = \"agent-dock/config/v1alpha2\"\nrecord_prompt = false\ntag_candidates = []\n[[profiles]]\nid = \"unknown\"\nname = \"Unknown\"\nadapter = \"other\"\n",
+            format!(
+                "api_version = {CONFIG_API_VERSION:?}\nrecord_prompt = false\ntag_candidates = []\n[[profiles]]\nid = \"unknown\"\nname = \"Unknown\"\nadapter = \"other\"\n"
+            ),
         )
         .unwrap();
 
@@ -351,30 +570,47 @@ mod tests {
     }
 
     #[test]
-    fn backs_up_and_atomically_replaces_an_unchanged_configuration() {
+    fn rejects_a_configuration_from_another_application_version() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
-        fs::write(&path, "schema_version = 1\n").unwrap();
-        let revision = match Config::load(&path).unwrap_err() {
-            ConfigError::UnsupportedApi {
-                revision: Some(revision),
-                ..
-            } => revision,
-            error => panic!("unexpected error: {error}"),
-        };
+        fs::write(&path, "schema_version = 1\n[[profiles]]\n").unwrap();
 
-        let ReplaceConfigOutcome::Replaced {
-            config,
-            backup_path,
-        } = Config::backup_and_replace_default_if_unchanged(&path, &revision).unwrap()
-        else {
-            panic!("configuration was not replaced");
-        };
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::UnsupportedApi { .. })
+        ));
+    }
 
-        assert_eq!(
-            fs::read_to_string(backup_path).unwrap(),
-            "schema_version = 1\n"
-        );
-        assert_eq!(Config::load(&path).unwrap(), config);
+    #[test]
+    fn redacts_configuration_contents_from_schema_error_debug_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "schema_version = \"old\"\nsecret = \"do-not-print\"\n",
+        )
+        .unwrap();
+
+        let error = Config::load(&path).unwrap_err();
+
+        assert!(!format!("{error:?}").contains("do-not-print"));
+    }
+
+    #[test]
+    fn requires_the_current_versions_recording_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "api_version = {CONFIG_API_VERSION:?}\n[[profiles]]\nid = \"codex\"\nname = \"Codex\"\nadapter = \"codex\"\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 }

@@ -3,15 +3,16 @@ pub mod config;
 pub mod execution;
 pub mod record;
 
-pub use adapter::{AdapterKind, CommandSpec, ExecutionProfile, PromptTransport};
+pub use adapter::{AdapterKind, CommandSpec, ExecutionProfile, PromptTransport, safe_test_profile};
 pub use config::{
-    CONFIG_API_VERSION, Config, ConfigError, ReplaceConfigOutcome, default_config_path,
+    CONFIG_API_VERSION, Config, ConfigError, ConfigRevision, ReplaceConfigOutcome,
+    default_config_path,
 };
 pub use execution::{
     ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionRequest, OutputSource, execute,
 };
 pub use record::{
-    EVENT_FORMAT_VERSION, Event, EventKind, EventLog, FailureKind, ProfileSnapshot, ReadEvents,
-    RecordError, RecordedExecutionOutcome, SkippedLine, SkippedLineReason, Verdict,
-    default_events_path,
+    BackupEventLogOutcome, EVENT_FORMAT_VERSION, Event, EventKind, EventLog, FailureKind,
+    ProfileSnapshot, ReadEvents, RecordError, RecordedExecutionOutcome, SkippedLine,
+    SkippedLineReason, Verdict, default_events_path,
 };
