@@ -403,7 +403,7 @@ mod tests {
         let projection = project(
             &events,
             std::slice::from_ref(&profile),
-            &segments_for_tags(&["rust".to_owned()]),
+            &segments_for_tags(&["rust".to_owned(), "docs".to_owned()]),
         );
         let overall = &projection.scorecards[0].scores[0];
         assert_eq!(overall.execution_count, 2);
@@ -424,6 +424,7 @@ mod tests {
         );
         assert_eq!(overall.excluded_count, 0);
         assert_eq!(projection.scorecards[0].scores[1].execution_count, 2);
+        assert_eq!(projection.scorecards[0].scores[2].execution_count, 2);
     }
 
     #[test]
