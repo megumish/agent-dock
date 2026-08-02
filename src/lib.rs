@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod config;
 pub mod execution;
+pub mod judgement;
 pub mod record;
 pub mod scorecard;
 
@@ -12,10 +13,11 @@ pub use config::{Config, ConfigError, ConfigRevision, ReplaceConfigOutcome, defa
 pub use execution::{
     ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionRequest, OutputSource, execute,
 };
+pub use judgement::{JudgementCandidate, judgement_candidates};
 pub use record::{
-    BackupEventLogOutcome, EVENT_SCHEMA_VERSION, Event, EventKind, EventLog, FailureKind,
-    ProfileSnapshot, ReadEvents, RecordError, RecordedExecutionOutcome, SkippedLine,
-    SkippedLineReason, Verdict, default_events_path,
+    AppendJudgementOutcome, BackupEventLogOutcome, EVENT_SCHEMA_VERSION, Event, EventKind,
+    EventLog, FailureKind, ProfileSnapshot, ReadEvents, RecordError, RecordedExecutionOutcome,
+    SkippedLine, SkippedLineReason, Verdict, default_events_path,
 };
 pub use scorecard::{
     AcceptanceAxis, AxisSummary, CostAxis, DurationAxis, ProfileScorecard, Projection, Segment,
