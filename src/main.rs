@@ -1,19 +1,24 @@
 use std::{
+    collections::HashSet,
     ffi::OsStr,
     fs,
     io::{self, Write},
     os::unix::fs::PermissionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitCode,
+    time::Instant,
 };
 
 use agent_dock::{
-    Config, ExecutionEvent, ExecutionOutcome, ExecutionProfile, ExecutionRequest, OutputSource,
-    default_config_path, execute,
+    Config, Event, EventKind, EventLog, ExecutionError, ExecutionEvent, ExecutionOutcome,
+    ExecutionProfile, ExecutionRequest, FailureKind, OutputSource, ProfileSnapshot,
+    RecordedExecutionOutcome, Verdict, default_config_path, default_events_path, execute,
 };
+use jiff::Timestamp;
 use rustyline::{DefaultEditor, error::ReadlineError};
 use thiserror::Error;
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -44,40 +49,75 @@ async fn run() -> Result<i32, AppError> {
             println!("No configuration was created.");
             return Ok(0);
         }
-        let config = Config::create_default(&config_path)?;
+        let record_prompt = confirm("Allow full task prompts to be recorded?", false)?;
+        let config = Config::create_default(&config_path, record_prompt)?;
         println!("Created {}", config_path.display());
         config
     };
 
-    let (available, unavailable): (Vec<_>, Vec<_>) = config
-        .profiles
-        .iter()
-        .partition(|profile| executable_is_available(profile));
-    for profile in unavailable {
-        eprintln!(
-            "Unavailable profile '{}': executable '{}' was not found",
-            profile.name,
-            profile.executable().display()
-        );
+    let mut available = Vec::new();
+    for profile in &config.profiles {
+        if let Some(executable) = resolve_executable(profile) {
+            let mut resolved = profile.clone();
+            resolved.executable = Some(executable);
+            available.push(resolved);
+        } else {
+            eprintln!(
+                "Unavailable profile '{}': executable '{}' was not found",
+                profile.name,
+                profile.executable().display()
+            );
+        }
     }
     if available.is_empty() {
         return Err(AppError::NoAvailableProfiles);
     }
 
     let working_directory = std::env::current_dir()?;
+    let event_log = EventLog::new(default_events_path()?);
+    let history = event_log.read_all()?;
+    for skipped in &history.skipped_lines {
+        eprintln!(
+            "Warning: skipped event log line {}: {}",
+            skipped.line_number, skipped.reason
+        );
+    }
+    let tag_candidates = collect_tag_candidates(&config.tag_candidates, &history.events);
     let prompt = read_non_empty_prompt()?;
+    let tags = read_tags(&tag_candidates)?;
+    let recorded_prompt = if config.record_prompt && confirm("Record this task prompt?", true)? {
+        Some(prompt.clone())
+    } else {
+        None
+    };
+    let task_id = Uuid::now_v7();
+    event_log.append(&Event::new(
+        task_id,
+        EventKind::TaskReceived {
+            tags,
+            prompt: recorded_prompt,
+            prompt_chars: prompt.chars().count(),
+        },
+    ))?;
+
     let profile = loop {
         let labels: Vec<_> = available
             .iter()
             .map(|profile| format!("{} [{}]", profile.name, profile.adapter))
             .collect();
         let selected = choose_profile(&labels)?;
-        let profile = available[selected];
+        let profile = &available[selected];
         print_execution_summary(profile, &prompt, &working_directory);
         if confirm("Run this task?", true)? {
             break profile;
         }
     };
+    event_log.append(&Event::new(
+        task_id,
+        EventKind::Assigned {
+            profile_id: profile.id.clone(),
+        },
+    ))?;
 
     let (cancellation_sender, cancellation_receiver) = oneshot::channel();
     let signal_task = tokio::spawn(async move {
@@ -85,17 +125,42 @@ async fn run() -> Result<i32, AppError> {
             let _ = cancellation_sender.send(());
         }
     });
-    let outcome = execute(
+    let started_at = Timestamp::now();
+    let attempt_started = Instant::now();
+    let execution = execute(
         profile,
         ExecutionRequest {
-            prompt,
-            working_directory,
+            prompt: prompt.clone(),
+            working_directory: working_directory.clone(),
         },
         cancellation_receiver,
         print_event,
     )
-    .await?;
+    .await;
     signal_task.abort();
+
+    let outcome = match execution {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let message = error.to_string();
+            eprintln!("Execution failed: {message}");
+            event_log.append(&Event::new(
+                task_id,
+                EventKind::Executed {
+                    profile: ProfileSnapshot::from(profile),
+                    working_directory,
+                    started_at,
+                    elapsed_ms: elapsed_millis(attempt_started.elapsed()),
+                    outcome: RecordedExecutionOutcome::Failed {
+                        failure_kind: failure_kind(&error),
+                        message,
+                    },
+                    cost: None,
+                },
+            ))?;
+            return Ok(1);
+        }
+    };
 
     match &outcome {
         ExecutionOutcome::Completed { exit_code, elapsed } => {
@@ -108,7 +173,55 @@ async fn run() -> Result<i32, AppError> {
             eprintln!("Cancelled after {:.2?}.", elapsed);
         }
     }
-    Ok(outcome.process_exit_code())
+    let process_exit_code = outcome.process_exit_code();
+    let recorded_outcome = match &outcome {
+        ExecutionOutcome::Completed { exit_code, .. } => RecordedExecutionOutcome::Completed {
+            exit_code: *exit_code,
+        },
+        ExecutionOutcome::Cancelled { .. } => RecordedExecutionOutcome::Cancelled,
+    };
+    let elapsed = match &outcome {
+        ExecutionOutcome::Completed { elapsed, .. } | ExecutionOutcome::Cancelled { elapsed } => {
+            *elapsed
+        }
+    };
+    let executed = Event::new(
+        task_id,
+        EventKind::Executed {
+            profile: ProfileSnapshot::from(profile),
+            working_directory,
+            started_at,
+            elapsed_ms: elapsed_millis(elapsed),
+            outcome: recorded_outcome,
+            cost: None,
+        },
+    );
+    let execution_event_id = executed.event_id;
+    event_log.append(&executed)?;
+
+    if matches!(outcome, ExecutionOutcome::Cancelled { .. }) {
+        return Ok(process_exit_code);
+    }
+
+    let accepted = match confirm_required("Accept this result?") {
+        Ok(accepted) => accepted,
+        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
+            return Ok(process_exit_code);
+        }
+        Err(source) => return Err(source.into()),
+    };
+    event_log.append(&Event::new(
+        task_id,
+        EventKind::Judged {
+            execution_event_id,
+            verdict: if accepted {
+                Verdict::Accepted
+            } else {
+                Verdict::Rejected
+            },
+        },
+    ))?;
+    Ok(process_exit_code)
 }
 
 fn read_non_empty_prompt() -> Result<String, ReadlineError> {
@@ -144,6 +257,17 @@ fn confirm(prompt: &str, default: bool) -> io::Result<bool> {
             return Ok(confirmed);
         }
         eprintln!("Please answer y or n.");
+    }
+}
+
+fn confirm_required(prompt: &str) -> io::Result<bool> {
+    loop {
+        let input = read_line(&format!("{prompt} [y/n]"))?;
+        match input.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("Please answer y or n."),
+        }
     }
 }
 
@@ -184,26 +308,101 @@ fn prompt_is_valid(prompt: &str) -> bool {
     !prompt.trim().is_empty()
 }
 
-fn executable_is_available(profile: &ExecutionProfile) -> bool {
+fn resolve_executable(profile: &ExecutionProfile) -> Option<PathBuf> {
     let executable = profile.executable();
     if executable.components().count() > 1 {
-        is_executable_file(&executable)
+        executable_path(&executable)
     } else {
         std::env::var_os("PATH")
             .as_deref()
-            .is_some_and(|path| executable_is_in_path(&executable, path))
+            .and_then(|path| executable_in_path(&executable, path))
     }
 }
 
-fn executable_is_in_path(executable: &Path, path: &OsStr) -> bool {
+fn executable_in_path(executable: &Path, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|directory| directory.join(executable))
-        .any(|candidate| is_executable_file(&candidate))
+        .find_map(|candidate| executable_path(&candidate))
+}
+
+fn executable_path(path: &Path) -> Option<PathBuf> {
+    is_executable_file(path)
+        .then(|| fs::canonicalize(path).ok())
+        .flatten()
 }
 
 fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+fn read_tags(candidates: &[String]) -> io::Result<Vec<String>> {
+    if !candidates.is_empty() {
+        println!("Tag candidates:");
+        for (index, candidate) in candidates.iter().enumerate() {
+            println!("  {}. {candidate}", index + 1);
+        }
+    }
+    let input = read_line("Tags (comma-separated, blank for unclassified):")?;
+    Ok(parse_tags(&input, candidates))
+}
+
+fn parse_tags(input: &str, candidates: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    input
+        .split(',')
+        .filter_map(|item| {
+            let item = item.trim();
+            if item.is_empty() {
+                return None;
+            }
+            let tag = item
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| number.checked_sub(1))
+                .and_then(|index| candidates.get(index))
+                .cloned()
+                .unwrap_or_else(|| item.to_owned());
+            seen.insert(tag.clone()).then_some(tag)
+        })
+        .collect()
+}
+
+fn collect_tag_candidates(configured: &[String], events: &[Event]) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for tag in configured
+        .iter()
+        .chain(events.iter().rev().flat_map(|event| {
+            if let EventKind::TaskReceived { tags, .. } = &event.kind {
+                tags.iter()
+            } else {
+                [].iter()
+            }
+        }))
+    {
+        let tag = tag.trim();
+        if !tag.is_empty() && seen.insert(tag.to_owned()) {
+            candidates.push(tag.to_owned());
+        }
+    }
+    candidates
+}
+
+fn elapsed_millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn failure_kind(error: &ExecutionError) -> FailureKind {
+    match error {
+        ExecutionError::Spawn { .. } => FailureKind::Spawn,
+        ExecutionError::MissingProcessId | ExecutionError::MissingPipe(_) => {
+            FailureKind::ProcessSetup
+        }
+        ExecutionError::Io(_) => FailureKind::Io,
+        ExecutionError::Signal { .. } => FailureKind::Signal,
+        ExecutionError::Task(_) => FailureKind::Runtime,
+    }
 }
 
 fn print_execution_summary(profile: &ExecutionProfile, prompt: &str, working_directory: &Path) {
@@ -246,6 +445,8 @@ enum AppError {
     Config(#[from] agent_dock::ConfigError),
     #[error(transparent)]
     Execution(#[from] agent_dock::ExecutionError),
+    #[error(transparent)]
+    Record(#[from] agent_dock::RecordError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -308,7 +509,7 @@ mod tests {
             args: Vec::new(),
         };
 
-        assert!(!executable_is_available(&profile));
+        assert!(resolve_executable(&profile).is_none());
     }
 
     #[test]
@@ -321,8 +522,11 @@ mod tests {
         fs::set_permissions(&executable, permissions).unwrap();
         let path = std::env::join_paths([directory.path()]).unwrap();
 
-        assert!(executable_is_in_path(Path::new("fake-agent"), &path));
-        assert!(!executable_is_in_path(Path::new("missing"), &path));
+        assert_eq!(
+            executable_in_path(Path::new("fake-agent"), &path),
+            Some(fs::canonicalize(executable).unwrap())
+        );
+        assert!(executable_in_path(Path::new("missing"), &path).is_none());
     }
 
     #[test]
@@ -335,6 +539,40 @@ mod tests {
         fs::set_permissions(&executable, permissions).unwrap();
         let path = std::env::join_paths([directory.path()]).unwrap();
 
-        assert!(!executable_is_in_path(Path::new("fake-agent"), &path));
+        assert!(executable_in_path(Path::new("fake-agent"), &path).is_none());
+    }
+
+    #[test]
+    fn parses_numbers_free_tags_and_duplicates() {
+        let candidates = vec!["rust".to_owned(), "docs".to_owned()];
+        assert_eq!(
+            parse_tags(" 1, custom,2,rust,custom,9, ", &candidates),
+            ["rust", "custom", "docs", "9"]
+        );
+    }
+
+    #[test]
+    fn merges_configured_and_recent_history_tags() {
+        let old = Event::new(
+            Uuid::now_v7(),
+            EventKind::TaskReceived {
+                tags: vec!["old".to_owned(), "shared".to_owned()],
+                prompt: None,
+                prompt_chars: 1,
+            },
+        );
+        let new = Event::new(
+            Uuid::now_v7(),
+            EventKind::TaskReceived {
+                tags: vec!["new".to_owned(), "shared".to_owned()],
+                prompt: None,
+                prompt_chars: 1,
+            },
+        );
+
+        assert_eq!(
+            collect_tag_candidates(&["configured".to_owned(), "shared".to_owned()], &[old, new]),
+            ["configured", "shared", "new", "old"]
+        );
     }
 }

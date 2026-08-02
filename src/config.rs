@@ -10,18 +10,22 @@ use thiserror::Error;
 
 use crate::{AdapterKind, ExecutionProfile, adapter::ProfileValidationError};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
-    pub schema_version: u32,
+    pub schema_version: String,
+    pub record_prompt: bool,
+    pub tag_candidates: Vec<String>,
     pub profiles: Vec<ExecutionProfile>,
 }
 
 impl Config {
-    pub fn defaults() -> Self {
+    pub fn defaults(record_prompt: bool) -> Self {
         Self {
-            schema_version: CONFIG_SCHEMA_VERSION,
+            schema_version: CONFIG_SCHEMA_VERSION.to_owned(),
+            record_prompt,
+            tag_candidates: Vec::new(),
             profiles: [
                 ("codex-default", "Codex (default)", AdapterKind::Codex),
                 ("claude-default", "Claude (default)", AdapterKind::Claude),
@@ -50,6 +54,23 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
+        let document: toml::Value =
+            toml::from_str(&source).map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let schema_version = document
+            .get("schema_version")
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "missing".to_owned());
+        if document.get("schema_version").and_then(toml::Value::as_str)
+            != Some(CONFIG_SCHEMA_VERSION)
+        {
+            return Err(ConfigError::UnsupportedSchema {
+                found: schema_version,
+                expected: CONFIG_SCHEMA_VERSION,
+            });
+        }
         let config: Self = toml::from_str(&source).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
@@ -58,8 +79,8 @@ impl Config {
         Ok(config)
     }
 
-    pub fn create_default(path: &Path) -> Result<Self, ConfigError> {
-        let config = Self::defaults();
+    pub fn create_default(path: &Path, record_prompt: bool) -> Result<Self, ConfigError> {
+        let config = Self::defaults(record_prompt);
         config.validate()?;
         let source = toml::to_string_pretty(&config).map_err(ConfigError::Serialize)?;
         let parent = path
@@ -88,7 +109,10 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
-            return Err(ConfigError::UnsupportedSchema(self.schema_version));
+            return Err(ConfigError::UnsupportedSchema {
+                found: self.schema_version.clone(),
+                expected: CONFIG_SCHEMA_VERSION,
+            });
         }
         if self.profiles.is_empty() {
             return Err(ConfigError::NoProfiles);
@@ -150,8 +174,13 @@ pub enum ConfigError {
     },
     #[error("could not serialize default configuration: {0}")]
     Serialize(toml::ser::Error),
-    #[error("unsupported configuration schema version {0}")]
-    UnsupportedSchema(u32),
+    #[error(
+        "unsupported configuration schema version {found}; expected {expected}. Move or remove the configuration file and run agent-dock again to recreate it"
+    )]
+    UnsupportedSchema {
+        found: String,
+        expected: &'static str,
+    },
     #[error("configuration must define at least one profile")]
     NoProfiles,
     #[error("duplicate profile id `{0}`")]
@@ -166,7 +195,7 @@ mod tests {
 
     #[test]
     fn uses_codex_as_the_default_profile() {
-        let config = Config::defaults();
+        let config = Config::defaults(false);
         assert_eq!(config.profiles[0].id, "codex-default");
     }
 
@@ -174,27 +203,27 @@ mod tests {
     fn creates_and_loads_default_without_overwriting() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/config.toml");
-        let created = Config::create_default(&path).unwrap();
+        let created = Config::create_default(&path, true).unwrap();
         assert_eq!(created, Config::load(&path).unwrap());
         assert!(matches!(
-            Config::create_default(&path),
+            Config::create_default(&path, false),
             Err(ConfigError::Create { .. })
         ));
     }
 
     #[test]
     fn rejects_unknown_schema() {
-        let mut config = Config::defaults();
-        config.schema_version = CONFIG_SCHEMA_VERSION + 1;
+        let mut config = Config::defaults(false);
+        config.schema_version = "other".to_owned();
         assert!(matches!(
             config.validate(),
-            Err(ConfigError::UnsupportedSchema(_))
+            Err(ConfigError::UnsupportedSchema { .. })
         ));
     }
 
     #[test]
     fn rejects_duplicate_profile_ids() {
-        let mut config = Config::defaults();
+        let mut config = Config::defaults(false);
         config.profiles.push(config.profiles[0].clone());
         assert!(matches!(
             config.validate(),
@@ -208,7 +237,39 @@ mod tests {
         let path = directory.path().join("config.toml");
         fs::write(
             &path,
-            "schema_version = 1\n[[profiles]]\nid = \"unknown\"\nname = \"Unknown\"\nadapter = \"other\"\n",
+            format!(
+                "schema_version = {CONFIG_SCHEMA_VERSION:?}\nrecord_prompt = false\ntag_candidates = []\n[[profiles]]\nid = \"unknown\"\nname = \"Unknown\"\nadapter = \"other\"\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_configuration_from_another_application_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "schema_version = 1\n[[profiles]]\n").unwrap();
+
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::UnsupportedSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn requires_the_current_versions_recording_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "schema_version = {CONFIG_SCHEMA_VERSION:?}\n[[profiles]]\nid = \"codex\"\nname = \"Codex\"\nadapter = \"codex\"\n"
+            ),
         )
         .unwrap();
 
