@@ -10,9 +10,10 @@ use std::{
 };
 
 use agent_dock::{
-    Config, Event, EventKind, EventLog, ExecutionError, ExecutionEvent, ExecutionOutcome,
-    ExecutionProfile, ExecutionRequest, FailureKind, OutputSource, ProfileSnapshot,
-    RecordedExecutionOutcome, Verdict, default_config_path, default_events_path, execute,
+    Config, ConfigError, EVENT_SCHEMA_VERSION, Event, EventKind, EventLog, ExecutionError,
+    ExecutionEvent, ExecutionOutcome, ExecutionProfile, ExecutionRequest, FailureKind,
+    OutputSource, ProfileSnapshot, ReadEvents, RecordedExecutionOutcome, SkippedLineReason,
+    Verdict, default_config_path, default_events_path, execute,
 };
 use jiff::Timestamp;
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -37,22 +38,8 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<i32, AppError> {
     let config_path = default_config_path()?;
-    let config = if config_path.exists() {
-        Config::load(&config_path)?
-    } else {
-        println!("Configuration does not exist: {}", config_path.display());
-        let create = confirm(
-            "Create default Claude, Codex, Gemini, and Antigravity profiles?",
-            true,
-        )?;
-        if !create {
-            println!("No configuration was created.");
-            return Ok(0);
-        }
-        let record_prompt = confirm("Allow full task prompts to be recorded?", false)?;
-        let config = Config::create_default(&config_path, record_prompt)?;
-        println!("Created {}", config_path.display());
-        config
+    let Some(config) = load_or_create_config(&config_path)? else {
+        return Ok(0);
     };
 
     let mut available = Vec::new();
@@ -75,7 +62,7 @@ async fn run() -> Result<i32, AppError> {
 
     let working_directory = std::env::current_dir()?;
     let event_log = EventLog::new(default_events_path()?);
-    let history = event_log.read_all()?;
+    let history = read_event_history(&event_log)?;
     for skipped in &history.skipped_lines {
         eprintln!(
             "Warning: skipped event log line {}: {}",
@@ -222,6 +209,94 @@ async fn run() -> Result<i32, AppError> {
         },
     ))?;
     Ok(process_exit_code)
+}
+
+fn load_or_create_config(path: &Path) -> Result<Option<Config>, AppError> {
+    let mut recreate = false;
+    loop {
+        if path.exists() {
+            match Config::load(path) {
+                Ok(config) => return Ok(Some(config)),
+                Err(ConfigError::UnsupportedSchema { found, expected }) => {
+                    eprintln!(
+                        "Configuration `{}` uses schema version {found}; expected {expected}.",
+                        path.display()
+                    );
+                    let delete = confirm(
+                        &format!(
+                            "Delete incompatible configuration `{}` and create a new one?",
+                            path.display()
+                        ),
+                        false,
+                    )?;
+                    if !delete {
+                        println!("Configuration was not deleted.");
+                        return Ok(None);
+                    }
+                    Config::delete(path)?;
+                    println!("Deleted {}", path.display());
+                    recreate = true;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        println!("Configuration does not exist: {}", path.display());
+        if !recreate
+            && !confirm(
+                "Create default Claude, Codex, Gemini, and Antigravity profiles?",
+                true,
+            )?
+        {
+            println!("No configuration was created.");
+            return Ok(None);
+        }
+        let record_prompt = confirm("Allow full task prompts to be recorded?", false)?;
+        let config = Config::create_default(path, record_prompt)?;
+        println!("Created {}", path.display());
+        return Ok(Some(config));
+    }
+}
+
+fn read_event_history(event_log: &EventLog) -> Result<ReadEvents, AppError> {
+    let mut history = event_log.read_all()?;
+    let mut incompatible_count = 0;
+    let mut incompatible_versions = Vec::new();
+    for skipped in &history.skipped_lines {
+        if let SkippedLineReason::UnsupportedSchema { found, .. } = &skipped.reason {
+            incompatible_count += 1;
+            if !incompatible_versions.contains(found) {
+                incompatible_versions.push(found.clone());
+            }
+        }
+    }
+    if incompatible_count == 0 {
+        return Ok(history);
+    }
+
+    eprintln!(
+        "Event log `{}` contains {} event(s) using schema version(s) {}; expected {}.",
+        event_log.path().display(),
+        incompatible_count,
+        incompatible_versions.join(", "),
+        EVENT_SCHEMA_VERSION
+    );
+    let delete = confirm(
+        &format!(
+            "Delete the entire incompatible event log `{}`?",
+            event_log.path().display()
+        ),
+        false,
+    )?;
+    if delete {
+        event_log.delete()?;
+        println!("Deleted {}", event_log.path().display());
+        history = ReadEvents::default();
+    } else {
+        println!("Event log was not deleted; incompatible events will be skipped.");
+    }
+    Ok(history)
 }
 
 fn read_non_empty_prompt() -> Result<String, ReadlineError> {

@@ -107,6 +107,17 @@ impl Config {
         Ok(config)
     }
 
+    pub fn delete(path: &Path) -> Result<(), ConfigError> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(ConfigError::Delete {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(ConfigError::UnsupportedSchema {
@@ -172,11 +183,14 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("could not delete configuration `{path}`: {source}")]
+    Delete {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("could not serialize default configuration: {0}")]
     Serialize(toml::ser::Error),
-    #[error(
-        "unsupported configuration schema version {found}; expected {expected}. Move or remove the configuration file and run agent-dock again to recreate it"
-    )]
+    #[error("unsupported configuration schema version {found}; expected {expected}")]
     UnsupportedSchema {
         found: String,
         expected: &'static str,
@@ -209,6 +223,17 @@ mod tests {
             Config::create_default(&path, false),
             Err(ConfigError::Create { .. })
         ));
+    }
+
+    #[test]
+    fn deletes_a_configuration_and_tolerates_a_missing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        Config::create_default(&path, false).unwrap();
+
+        Config::delete(&path).unwrap();
+        assert!(!path.exists());
+        Config::delete(&path).unwrap();
     }
 
     #[test]

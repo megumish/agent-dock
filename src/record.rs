@@ -120,7 +120,18 @@ pub enum Verdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedLine {
     pub line_number: usize,
-    pub reason: String,
+    pub reason: SkippedLineReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SkippedLineReason {
+    #[error("unsupported schema version {found}; expected {expected}")]
+    UnsupportedSchema {
+        found: String,
+        expected: &'static str,
+    },
+    #[error("{message}")]
+    InvalidEvent { message: String },
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -193,24 +204,64 @@ impl EventLog {
                 path: self.path.clone(),
                 source,
             })?;
-            match serde_json::from_str::<Event>(&line) {
-                Ok(event) if event.schema_version == EVENT_SCHEMA_VERSION => {
-                    result.events.push(event);
+            match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(document) => {
+                    let schema_version = document
+                        .get("schema_version")
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string())
+                        })
+                        .unwrap_or_else(|| "missing".to_owned());
+                    if schema_version != EVENT_SCHEMA_VERSION {
+                        result.skipped_lines.push(SkippedLine {
+                            line_number,
+                            reason: SkippedLineReason::UnsupportedSchema {
+                                found: schema_version,
+                                expected: EVENT_SCHEMA_VERSION,
+                            },
+                        });
+                        continue;
+                    }
+                    match serde_json::from_value::<Event>(document) {
+                        Ok(event) => result.events.push(event),
+                        Err(source) => result.skipped_lines.push(SkippedLine {
+                            line_number,
+                            reason: SkippedLineReason::InvalidEvent {
+                                message: source.to_string(),
+                            },
+                        }),
+                    }
                 }
-                Ok(event) => result.skipped_lines.push(SkippedLine {
-                    line_number,
-                    reason: format!(
-                        "unsupported schema version {}; expected {}",
-                        event.schema_version, EVENT_SCHEMA_VERSION
-                    ),
-                }),
                 Err(source) => result.skipped_lines.push(SkippedLine {
                     line_number,
-                    reason: source.to_string(),
+                    reason: SkippedLineReason::InvalidEvent {
+                        message: source.to_string(),
+                    },
                 }),
             }
         }
         Ok(result)
+    }
+
+    pub fn delete(&self) -> Result<(), RecordError> {
+        let file = match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(RecordError::Open {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        let _lock = FileLock::acquire(&file, libc::LOCK_EX, &self.path)?;
+        fs::remove_file(&self.path).map_err(|source| RecordError::Delete {
+            path: self.path.clone(),
+            source,
+        })
     }
 }
 
@@ -284,6 +335,11 @@ pub enum RecordError {
     },
     #[error("could not write event log `{path}`: {source}")]
     Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("could not delete event log `{path}`: {source}")]
+    Delete {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -396,6 +452,10 @@ mod tests {
         assert_eq!(read.events, vec![event]);
         assert_eq!(read.skipped_lines.len(), 1);
         assert_eq!(read.skipped_lines[0].line_number, 2);
+        assert!(matches!(
+            &read.skipped_lines[0].reason,
+            SkippedLineReason::InvalidEvent { .. }
+        ));
     }
 
     #[test]
@@ -414,7 +474,36 @@ mod tests {
 
         assert!(read.events.is_empty());
         assert_eq!(read.skipped_lines.len(), 1);
-        assert!(read.skipped_lines[0].reason.contains("0.0.0"));
+        assert!(matches!(
+            &read.skipped_lines[0].reason,
+            SkippedLineReason::UnsupportedSchema { found, .. } if found == "0.0.0"
+        ));
+    }
+
+    #[test]
+    fn recognizes_an_old_schema_before_deserializing_the_event_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        fs::write(&path, "{\"schema_version\":\"old\"}\n").unwrap();
+
+        let read = EventLog::new(path).read_all().unwrap();
+
+        assert!(matches!(
+            &read.skipped_lines[0].reason,
+            SkippedLineReason::UnsupportedSchema { found, .. } if found == "old"
+        ));
+    }
+
+    #[test]
+    fn deletes_an_event_log_and_tolerates_a_missing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        log.append(&task_event(Uuid::now_v7(), None)).unwrap();
+
+        log.delete().unwrap();
+        assert!(!path.exists());
+        log.delete().unwrap();
     }
 
     #[test]

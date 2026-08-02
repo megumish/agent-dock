@@ -10,5 +10,6 @@ pub use execution::{
 };
 pub use record::{
     EVENT_SCHEMA_VERSION, Event, EventKind, EventLog, FailureKind, ProfileSnapshot, ReadEvents,
-    RecordError, RecordedExecutionOutcome, SkippedLine, Verdict, default_events_path,
+    RecordError, RecordedExecutionOutcome, SkippedLine, SkippedLineReason, Verdict,
+    default_events_path,
 };
