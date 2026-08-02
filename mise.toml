@@ -1,2 +1,11 @@
 [tools]
 rust = "stable"
+
+[tasks.default]
+description = "Run agent-dock"
+run = "cargo run"
+raw = true
+
+[tasks.sample]
+description = "Replace the event log with a sample scenario"
+run = "cargo run --example sample_events --"

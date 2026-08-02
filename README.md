@@ -49,5 +49,5 @@ Rust ツールチェーンは mise で管理する。
 
 ```console
 mise install
-mise exec -- cargo run
+mise run
 ```
