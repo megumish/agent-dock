@@ -6,8 +6,8 @@ use std::{
 };
 
 use agent_dock::{
-    BackupEventLogOutcome, Event, EventKind, EventLog, ProfileSnapshot, RecordedExecutionOutcome,
-    Verdict, default_events_path, safe_test_profile,
+    BackupEventLogOutcome, Config, Event, EventKind, EventLog, ExecutionProfile, ProfileSnapshot,
+    RecordedExecutionOutcome, Verdict, default_events_path, safe_test_profile,
 };
 use jiff::Timestamp;
 use uuid::Uuid;
@@ -108,29 +108,39 @@ fn write_scenario(log: &EventLog, scenario: &str) -> Result<(), Box<dyn std::err
     }
 
     if scenario == "showcase" {
-        for scenario in [
+        let scenarios = [
             "few",
             "many-tags",
             "rejections",
             "rejudged",
             "mixed-outcomes",
-        ] {
-            write_current_scenario(log, scenario)?;
+        ];
+        for (scenario, profile) in scenarios.into_iter().zip(sample_profiles()) {
+            write_current_scenario(log, scenario, &profile)?;
         }
         return Ok(());
     }
 
-    write_current_scenario(log, scenario)
+    write_current_scenario(log, scenario, &safe_test_profile())
 }
 
 fn write_current_scenario(
     log: &EventLog,
     scenario: &str,
+    profile: &ExecutionProfile,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match scenario {
-        "few" => append_run(log, "2026-07-01T00:00:00Z", &[], 1_500, Outcome::Accepted)?,
+        "few" => append_run(
+            log,
+            profile,
+            "2026-07-01T00:00:00Z",
+            &[],
+            1_500,
+            Outcome::Accepted,
+        )?,
         "many-tags" => append_run(
             log,
+            profile,
             "2026-07-01T00:00:00Z",
             &["one", "two", "three", "four", "five", "six", "seven"],
             2_500,
@@ -139,6 +149,7 @@ fn write_current_scenario(
         "rejections" => {
             append_run(
                 log,
+                profile,
                 "2026-07-01T00:00:00Z",
                 &["review"],
                 500,
@@ -146,6 +157,7 @@ fn write_current_scenario(
             )?;
             append_run(
                 log,
+                profile,
                 "2026-07-01T00:01:00Z",
                 &["review"],
                 700,
@@ -154,17 +166,22 @@ fn write_current_scenario(
         }
         "rejudged" => append_run(
             log,
+            profile,
             "2026-07-01T00:00:00Z",
             &["review"],
             900,
             Outcome::RejudgedRejected,
         )?,
         "mixed-outcomes" => {
-            append_run(log, "2026-07-01T00:00:00Z", &[], 500, Outcome::Accepted)?;
-            append_run(log, "2026-07-01T00:01:00Z", &[], 500, Outcome::Rejected)?;
-            append_run(log, "2026-07-01T00:02:00Z", &[], 500, Outcome::Unjudged)?;
-            append_run(log, "2026-07-01T00:03:00Z", &[], 500, Outcome::Cancelled)?;
-            append_run(log, "2026-07-01T00:04:00Z", &[], 500, Outcome::Failed)?;
+            for (at, outcome) in [
+                ("2026-07-01T00:00:00Z", Outcome::Accepted),
+                ("2026-07-01T00:01:00Z", Outcome::Rejected),
+                ("2026-07-01T00:02:00Z", Outcome::Unjudged),
+                ("2026-07-01T00:03:00Z", Outcome::Cancelled),
+                ("2026-07-01T00:04:00Z", Outcome::Failed),
+            ] {
+                append_run(log, profile, at, &[], 500, outcome)?;
+            }
         }
         _ => return Err(format!("unknown scenario `{scenario}`").into()),
     }
@@ -183,6 +200,7 @@ enum Outcome {
 
 fn append_run(
     log: &EventLog,
+    profile: &ExecutionProfile,
     at: &str,
     tags: &[&str],
     elapsed_ms: u64,
@@ -191,7 +209,7 @@ fn append_run(
     let task = task(at, tags);
     let task_id = task.task_id;
     log.append(&task)?;
-    let execution = execution(task_id, at, elapsed_ms, outcome);
+    let execution = execution(task_id, profile, at, elapsed_ms, outcome);
     let execution_id = execution.event_id;
     log.append(&execution)?;
     match outcome {
@@ -236,11 +254,17 @@ fn task(at: &str, tags: &[&str]) -> Event {
     event
 }
 
-fn execution(task_id: Uuid, at: &str, elapsed_ms: u64, outcome: Outcome) -> Event {
+fn execution(
+    task_id: Uuid,
+    profile: &ExecutionProfile,
+    at: &str,
+    elapsed_ms: u64,
+    outcome: Outcome,
+) -> Event {
     Event::new(
         task_id,
         EventKind::Executed {
-            profile: ProfileSnapshot::from(&safe_test_profile()),
+            profile: ProfileSnapshot::from(profile),
             working_directory: PathBuf::from("/tmp/agent-dock-sample"),
             started_at: parse(at)
                 .checked_add(jiff::SignedDuration::from_secs(2))
@@ -259,6 +283,22 @@ fn execution(task_id: Uuid, at: &str, elapsed_ms: u64, outcome: Outcome) -> Even
     )
 }
 
+fn sample_profiles() -> Vec<ExecutionProfile> {
+    let mut profiles = vec![safe_test_profile()];
+    profiles.extend(
+        Config::defaults(false)
+            .profiles
+            .into_iter()
+            .map(|declaration| {
+                let resolved_executable = declaration.executable();
+                declaration
+                    .resolve(resolved_executable)
+                    .expect("default profiles are valid")
+            }),
+    );
+    profiles
+}
+
 fn parse(value: &str) -> Timestamp {
     value.parse().expect("fixed sample timestamp")
 }
@@ -266,6 +306,7 @@ fn parse(value: &str) -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_dock::{Segment, project};
 
     #[test]
     fn defaults_to_showcase_when_the_scenario_is_omitted() {
@@ -303,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn showcase_combines_representative_current_schema_scenarios() {
+    fn showcase_keeps_representative_scenarios_separate_by_profile() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("events.jsonl");
         replace_with_scenario(&target, "showcase").unwrap();
@@ -311,6 +352,33 @@ mod tests {
         let history = EventLog::new(target).read_all().unwrap();
         assert_eq!(history.events.len(), 28);
         assert!(history.skipped_lines.is_empty());
+
+        let profiles = sample_profiles();
+        let projection = project(&history.events, &profiles, &[Segment::Overall]);
+        let actual: Vec<_> = projection
+            .scorecards
+            .iter()
+            .map(|card| {
+                let score = &card.scores[0];
+                (
+                    card.profile_id.as_str(),
+                    score.execution_count,
+                    score.acceptance.accepted,
+                    score.acceptance.summary.count,
+                    score.duration.median_ms,
+                    score.excluded_count,
+                )
+            })
+            .collect();
+        let expected = [
+            (profiles[0].id.as_str(), 1, 1, 1, Some(1_500), 0),
+            (profiles[1].id.as_str(), 1, 1, 1, Some(2_500), 0),
+            (profiles[2].id.as_str(), 2, 0, 2, None, 0),
+            (profiles[3].id.as_str(), 1, 0, 1, None, 0),
+            (profiles[4].id.as_str(), 5, 1, 2, Some(500), 3),
+        ];
+        assert_eq!(actual, expected);
+        assert!(projection.warnings.is_empty());
     }
 
     #[test]

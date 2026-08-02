@@ -88,11 +88,10 @@ pub fn project(
 ) -> Projection {
     let mut projection = Projection::default();
     let mut task_tags: HashMap<Uuid, &[String]> = HashMap::new();
-    let execution_tasks: HashMap<Uuid, Uuid> = events
+    let execution_ids: HashSet<Uuid> = events
         .iter()
         .filter_map(|event| {
-            matches!(event.kind, EventKind::Executed { .. })
-                .then_some((event.event_id, event.task_id))
+            matches!(event.kind, EventKind::Executed { .. }).then_some(event.event_id)
         })
         .collect();
     let mut verdicts = HashMap::new();
@@ -104,17 +103,17 @@ pub fn project(
             EventKind::Judged {
                 execution_event_id,
                 verdict,
-            } if execution_tasks.get(execution_event_id) == Some(&event.task_id) => {
+            } if execution_ids.contains(execution_event_id) => {
                 verdicts.insert(*execution_event_id, *verdict);
             }
             _ => {}
         }
     }
 
-    let current: HashMap<_, _> = profiles
-        .iter()
-        .map(|profile| (profile.id.as_str(), profile))
-        .collect();
+    let mut current = HashMap::new();
+    for profile in profiles {
+        current.entry(profile.id.as_str()).or_insert(profile);
+    }
     let mut executions: HashMap<&str, Vec<Execution<'_>>> = HashMap::new();
     let empty_tags = Vec::new();
     for event in events {
@@ -413,11 +412,11 @@ mod tests {
                 overall.acceptance.accepted,
                 overall.acceptance.summary.count
             ),
-            (1, 2)
+            (0, 2)
         );
         assert_eq!(
             (overall.duration.median_ms, overall.duration.summary.count),
-            (Some(1_000), 1)
+            (None, 0)
         );
         assert_eq!(overall.excluded_count, 0);
         assert_eq!(projection.scorecards[0].scores[1].execution_count, 2);
@@ -462,6 +461,22 @@ mod tests {
         let projection = project(&[event], &[safe_test_profile()], &[Segment::Overall]);
         assert_eq!(projection.scorecards[0].scores[0].execution_count, 0);
         assert_eq!(projection.warnings.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_current_profile_ids_consistently_use_the_first_profile() {
+        let first = safe_test_profile();
+        let mut duplicate = first.clone();
+        duplicate.declaration.model = Some("different".to_owned());
+        let task_id = Uuid::now_v7();
+        let event_id = Uuid::now_v7();
+        let event = execution(task_id, event_id, "2026-01-01T00:00:00Z", 1, true);
+
+        let projection = project(&[event], &[first, duplicate], &[Segment::Overall]);
+
+        assert_eq!(projection.scorecards.len(), 1);
+        assert_eq!(projection.scorecards[0].scores[0].execution_count, 1);
+        assert!(projection.warnings.is_empty());
     }
 
     #[test]

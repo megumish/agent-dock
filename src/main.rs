@@ -74,7 +74,8 @@ async fn run() -> Result<i32, AppError> {
     for skipped in &history.skipped_lines {
         eprintln!(
             "Warning: skipped event log line {}: {}",
-            skipped.line_number, skipped.reason
+            skipped.line_number,
+            escape_terminal(&skipped.reason.to_string())
         );
     }
     let tag_candidates = collect_tag_candidates(&config.tag_candidates, &history.events);
@@ -104,7 +105,7 @@ async fn run() -> Result<i32, AppError> {
     };
     let projection = project(&fresh_history.events, &available, &score_segments);
     for warning in &projection.warnings {
-        eprintln!("Warning: {warning}");
+        eprintln!("Warning: {}", escape_terminal(warning));
     }
     let choices = render_profile_choices(
         &available,
