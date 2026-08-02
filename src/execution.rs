@@ -251,7 +251,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::AdapterKind;
+    use crate::{AdapterKind, safe_test_profile};
 
     fn write_script(directory: &Path, source: &str) -> PathBuf {
         let path = directory.join("fake-agent");
@@ -326,6 +326,32 @@ mod tests {
             Some(ExecutionEvent::Started { .. })
         ));
         assert_eq!(events.last(), Some(&ExecutionEvent::Finished));
+    }
+
+    #[tokio::test]
+    async fn safe_test_profile_completes_without_starting_an_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_cancellation_sender, cancellation) = oneshot::channel();
+
+        let outcome = execute(
+            &safe_test_profile(),
+            ExecutionRequest {
+                prompt: "this must not reach an agent".to_owned(),
+                working_directory: directory.path().to_path_buf(),
+            },
+            cancellation,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ExecutionOutcome::Completed {
+                exit_code: Some(0),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

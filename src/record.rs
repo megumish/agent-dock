@@ -2,8 +2,8 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     os::{
-        fd::{AsRawFd, RawFd},
-        unix::fs::OpenOptionsExt,
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
 };
@@ -134,10 +134,46 @@ pub enum SkippedLineReason {
     InvalidEvent { message: String },
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 pub struct ReadEvents {
     pub events: Vec<Event>,
     pub skipped_lines: Vec<SkippedLine>,
+    revision: Option<EventLogRevision>,
+}
+
+impl PartialEq for ReadEvents {
+    fn eq(&self, other: &Self) -> bool {
+        self.events == other.events && self.skipped_lines == other.skipped_lines
+    }
+}
+
+impl Eq for ReadEvents {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EventLogRevision {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+impl From<&fs::Metadata> for EventLogRevision {
+    fn from(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackupEventLogOutcome {
+    BackedUpAndDeleted { backup_path: PathBuf },
+    Changed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,15 +190,14 @@ impl EventLog {
         &self.path
     }
 
+    pub fn lock_path(&self) -> PathBuf {
+        let mut path = self.path.as_os_str().to_os_string();
+        path.push(".lock");
+        PathBuf::from(path)
+    }
+
     pub fn append(&self, event: &Event) -> Result<(), RecordError> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| RecordError::MissingParent(self.path.clone()))?;
-        fs::create_dir_all(parent).map_err(|source| RecordError::CreateDirectory {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        let _lock = FileLock::acquire(self.open_lock_file()?, libc::LOCK_EX, &self.lock_path())?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -172,7 +207,6 @@ impl EventLog {
                 path: self.path.clone(),
                 source,
             })?;
-        let _lock = FileLock::acquire(&file, libc::LOCK_EX, &self.path)?;
         let mut encoded = serde_json::to_vec(event).map_err(RecordError::Serialize)?;
         encoded.push(b'\n');
         file.write_all(&encoded)
@@ -184,6 +218,7 @@ impl EventLog {
     }
 
     pub fn read_all(&self) -> Result<ReadEvents, RecordError> {
+        let _lock = FileLock::acquire(self.open_lock_file()?, libc::LOCK_SH, &self.lock_path())?;
         let file = match File::open(&self.path) {
             Ok(file) => file,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -196,73 +231,147 @@ impl EventLog {
                 });
             }
         };
-        let _lock = FileLock::acquire(&file, libc::LOCK_SH, &self.path)?;
-        let mut result = ReadEvents::default();
+        let revision =
+            EventLogRevision::from(&file.metadata().map_err(|source| RecordError::Read {
+                path: self.path.clone(),
+                source,
+            })?);
+        let mut result = ReadEvents {
+            revision: Some(revision),
+            ..ReadEvents::default()
+        };
         for (index, line) in BufReader::new(&file).lines().enumerate() {
             let line_number = index + 1;
             let line = line.map_err(|source| RecordError::Read {
                 path: self.path.clone(),
                 source,
             })?;
-            match serde_json::from_str::<serde_json::Value>(&line) {
-                Ok(document) => {
-                    let schema_version = document
-                        .get("schema_version")
-                        .map(|value| {
-                            value
-                                .as_str()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| value.to_string())
-                        })
-                        .unwrap_or_else(|| "missing".to_owned());
-                    if schema_version != EVENT_SCHEMA_VERSION {
-                        result.skipped_lines.push(SkippedLine {
-                            line_number,
-                            reason: SkippedLineReason::UnsupportedSchema {
-                                found: schema_version,
-                                expected: EVENT_SCHEMA_VERSION,
-                            },
-                        });
-                        continue;
-                    }
-                    match serde_json::from_value::<Event>(document) {
-                        Ok(event) => result.events.push(event),
-                        Err(source) => result.skipped_lines.push(SkippedLine {
-                            line_number,
-                            reason: SkippedLineReason::InvalidEvent {
-                                message: source.to_string(),
-                            },
-                        }),
-                    }
-                }
-                Err(source) => result.skipped_lines.push(SkippedLine {
+            match decode_event_line(&line) {
+                Ok(event) => result.events.push(event),
+                Err(reason) => result.skipped_lines.push(SkippedLine {
                     line_number,
-                    reason: SkippedLineReason::InvalidEvent {
-                        message: source.to_string(),
-                    },
+                    reason,
                 }),
             }
         }
         Ok(result)
     }
 
-    pub fn delete(&self) -> Result<(), RecordError> {
-        let file = match OpenOptions::new().read(true).write(true).open(&self.path) {
-            Ok(file) => file,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    pub fn backup_and_delete_if_unchanged(
+        &self,
+        expected: &ReadEvents,
+    ) -> Result<BackupEventLogOutcome, RecordError> {
+        let _lock = FileLock::acquire(self.open_lock_file()?, libc::LOCK_EX, &self.lock_path())?;
+        let current_revision = match fs::metadata(&self.path) {
+            Ok(metadata) => Some(EventLogRevision::from(&metadata)),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
             Err(source) => {
-                return Err(RecordError::Open {
+                return Err(RecordError::Read {
                     path: self.path.clone(),
                     source,
                 });
             }
         };
-        let _lock = FileLock::acquire(&file, libc::LOCK_EX, &self.path)?;
+        if current_revision != expected.revision {
+            return Ok(BackupEventLogOutcome::Changed);
+        }
+        if current_revision.is_none() {
+            return Ok(BackupEventLogOutcome::Changed);
+        }
+        let backup_path = self.backup_path();
+        let mut source = File::open(&self.path).map_err(|source| RecordError::Open {
+            path: self.path.clone(),
+            source,
+        })?;
+        let mut backup = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backup_path)
+            .map_err(|source| RecordError::CreateBackup {
+                path: backup_path.clone(),
+                source,
+            })?;
+        if let Err(source) = std::io::copy(&mut source, &mut backup).and_then(|_| backup.sync_all())
+        {
+            let _ = fs::remove_file(&backup_path);
+            return Err(RecordError::Write {
+                path: backup_path,
+                source,
+            });
+        }
+        let revision_after_backup = match fs::metadata(&self.path) {
+            Ok(metadata) => Some(EventLogRevision::from(&metadata)),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                let _ = fs::remove_file(&backup_path);
+                return Err(RecordError::Read {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        if revision_after_backup != expected.revision {
+            let _ = fs::remove_file(&backup_path);
+            return Ok(BackupEventLogOutcome::Changed);
+        }
         fs::remove_file(&self.path).map_err(|source| RecordError::Delete {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        Ok(BackupEventLogOutcome::BackedUpAndDeleted { backup_path })
     }
+
+    fn open_lock_file(&self) -> Result<File, RecordError> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| RecordError::MissingParent(self.path.clone()))?;
+        fs::create_dir_all(parent).map_err(|source| RecordError::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let path = self.lock_path();
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|source| RecordError::OpenLock { path, source })
+    }
+
+    fn backup_path(&self) -> PathBuf {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("events.jsonl");
+        parent.join(format!("{file_name}.backup.{}", Uuid::now_v7()))
+    }
+}
+
+fn decode_event_line(line: &str) -> Result<Event, SkippedLineReason> {
+    let document = serde_json::from_str::<serde_json::Value>(line).map_err(|source| {
+        SkippedLineReason::InvalidEvent {
+            message: source.to_string(),
+        }
+    })?;
+    if let Some(found) = document
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .filter(|found| *found != EVENT_SCHEMA_VERSION)
+    {
+        return Err(SkippedLineReason::UnsupportedSchema {
+            found: found.to_owned(),
+            expected: EVENT_SCHEMA_VERSION,
+        });
+    }
+    serde_json::from_value(document).map_err(|source| SkippedLineReason::InvalidEvent {
+        message: source.to_string(),
+    })
 }
 
 pub fn default_events_path() -> Result<PathBuf, RecordError> {
@@ -279,16 +388,14 @@ pub fn default_events_path() -> Result<PathBuf, RecordError> {
 }
 
 struct FileLock {
-    file_descriptor: RawFd,
+    file: File,
 }
 
 impl FileLock {
-    fn acquire(file: &File, operation: libc::c_int, path: &Path) -> Result<Self, RecordError> {
+    fn acquire(file: File, operation: libc::c_int, path: &Path) -> Result<Self, RecordError> {
         // SAFETY: flock receives an open file descriptor and a supported operation.
         if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-            Ok(Self {
-                file_descriptor: file.as_raw_fd(),
-            })
+            Ok(Self { file })
         } else {
             Err(RecordError::Lock {
                 path: path.to_path_buf(),
@@ -300,9 +407,9 @@ impl FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        // SAFETY: callers keep the file open until after the guard is dropped.
+        // SAFETY: the guard owns the open file until after flock returns.
         unsafe {
-            libc::flock(self.file_descriptor, libc::LOCK_UN);
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }
@@ -320,6 +427,16 @@ pub enum RecordError {
     },
     #[error("could not open event log `{path}`: {source}")]
     Open {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("could not open event log lock `{path}`: {source}")]
+    OpenLock {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("could not create event log backup `{path}`: {source}")]
+    CreateBackup {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -349,7 +466,11 @@ pub enum RecordError {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, sync::Arc, thread};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use super::*;
 
@@ -373,6 +494,28 @@ mod tests {
         assert_eq!(value["kind"], "task_received");
         assert!(value["data"]["prompt"].is_null());
         assert_eq!(serde_json::from_value::<Event>(value).unwrap(), event);
+    }
+
+    #[test]
+    fn distinguishes_an_unrecorded_prompt_from_an_empty_prompt() {
+        let unrecorded = task_event(Uuid::now_v7(), None);
+        let empty = task_event(Uuid::now_v7(), Some(""));
+
+        let unrecorded: Event =
+            serde_json::from_str(&serde_json::to_string(&unrecorded).unwrap()).unwrap();
+        let empty: Event = serde_json::from_str(&serde_json::to_string(&empty).unwrap()).unwrap();
+
+        assert!(matches!(
+            unrecorded.kind,
+            EventKind::TaskReceived { prompt: None, .. }
+        ));
+        assert!(matches!(
+            empty.kind,
+            EventKind::TaskReceived {
+                prompt: Some(prompt),
+                ..
+            } if prompt.is_empty()
+        ));
     }
 
     #[test]
@@ -495,27 +638,119 @@ mod tests {
     }
 
     #[test]
-    fn deletes_an_event_log_and_tolerates_a_missing_file() {
+    fn treats_missing_or_non_string_schema_versions_as_invalid_events() {
+        for line in [
+            "{}",
+            "{\"schema_version\":null}",
+            "{\"schema_version\":1}",
+            "{\"schema_version\":[]}",
+            "{\"schema_version\":{}}",
+            "[]",
+            "null",
+        ] {
+            assert!(matches!(
+                decode_event_line(line),
+                Err(SkippedLineReason::InvalidEvent { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn backs_up_and_deletes_only_the_event_log_revision_that_was_read() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
         let log = EventLog::new(&path);
-        log.append(&task_event(Uuid::now_v7(), None)).unwrap();
+        let event = task_event(Uuid::now_v7(), None);
+        log.append(&event).unwrap();
+        let original = fs::read(&path).unwrap();
+        let read = log.read_all().unwrap();
 
-        log.delete().unwrap();
+        let BackupEventLogOutcome::BackedUpAndDeleted { backup_path } =
+            log.backup_and_delete_if_unchanged(&read).unwrap()
+        else {
+            panic!("event log was not backed up");
+        };
         assert!(!path.exists());
-        log.delete().unwrap();
+        assert_eq!(fs::read(&backup_path).unwrap(), original);
+        assert_eq!(
+            fs::metadata(backup_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn preserves_events_appended_after_the_log_was_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        let first = task_event(Uuid::now_v7(), None);
+        let second = task_event(Uuid::now_v7(), None);
+        log.append(&first).unwrap();
+        let stale = log.read_all().unwrap();
+        log.append(&second).unwrap();
+
+        assert_eq!(
+            log.backup_and_delete_if_unchanged(&stale).unwrap(),
+            BackupEventLogOutcome::Changed
+        );
+        assert_eq!(log.read_all().unwrap().events, [first, second]);
+    }
+
+    #[test]
+    fn does_not_lose_an_event_when_append_and_delete_start_concurrently() {
+        for _ in 0..32 {
+            let directory = tempfile::tempdir().unwrap();
+            let log = Arc::new(EventLog::new(directory.path().join("events.jsonl")));
+            let original = task_event(Uuid::now_v7(), None);
+            let appended = task_event(Uuid::now_v7(), None);
+            log.append(&original).unwrap();
+            let stale = log.read_all().unwrap();
+            let barrier = Arc::new(Barrier::new(3));
+
+            let deleting_log = log.clone();
+            let deleting_barrier = barrier.clone();
+            let deleting = thread::spawn(move || {
+                deleting_barrier.wait();
+                deleting_log.backup_and_delete_if_unchanged(&stale).unwrap()
+            });
+            let appending_log = log.clone();
+            let appending_barrier = barrier.clone();
+            let appended_for_thread = appended.clone();
+            let appending = thread::spawn(move || {
+                appending_barrier.wait();
+                appending_log.append(&appended_for_thread).unwrap();
+            });
+            barrier.wait();
+
+            let delete_outcome = deleting.join().unwrap();
+            appending.join().unwrap();
+            let events = log.read_all().unwrap().events;
+
+            assert!(events.contains(&appended));
+            match delete_outcome {
+                BackupEventLogOutcome::BackedUpAndDeleted { backup_path } => {
+                    assert_eq!(events, [appended]);
+                    assert!(backup_path.exists());
+                }
+                BackupEventLogOutcome::Changed => assert_eq!(events, [original, appended]),
+            }
+            assert!(log.lock_path().exists());
+        }
     }
 
     #[test]
     fn creates_a_private_event_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        EventLog::new(&path)
-            .append(&task_event(Uuid::now_v7(), None))
-            .unwrap();
+        let log = EventLog::new(&path);
+        log.append(&task_event(Uuid::now_v7(), None)).unwrap();
 
         assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(log.lock_path()).unwrap().permissions().mode() & 0o777,
             0o600
         );
     }

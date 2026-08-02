@@ -6,6 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AdapterKind {
+    Test,
     Claude,
     Codex,
     Gemini,
@@ -15,6 +16,7 @@ pub enum AdapterKind {
 impl AdapterKind {
     pub fn default_executable(self) -> &'static str {
         match self {
+            Self::Test => "/usr/bin/true",
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
@@ -25,7 +27,10 @@ impl AdapterKind {
 
 impl std::fmt::Display for AdapterKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.default_executable())
+        match self {
+            Self::Test => formatter.write_str("test"),
+            _ => formatter.write_str(self.default_executable()),
+        }
     }
 }
 
@@ -42,6 +47,17 @@ pub struct ExecutionProfile {
     pub args: Vec<String>,
 }
 
+pub fn safe_test_profile() -> ExecutionProfile {
+    ExecutionProfile {
+        id: "test-default".to_owned(),
+        name: "Safe test (no agent)".to_owned(),
+        adapter: AdapterKind::Test,
+        executable: None,
+        model: None,
+        args: Vec::new(),
+    }
+}
+
 impl ExecutionProfile {
     pub fn executable(&self) -> PathBuf {
         self.executable
@@ -53,6 +69,9 @@ impl ExecutionProfile {
         let mut args = Vec::new();
 
         match self.adapter {
+            AdapterKind::Test => {
+                args.extend(self.args.clone());
+            }
             AdapterKind::Claude => {
                 args.push("--print".to_owned());
                 if let Some(model) = &self.model {
@@ -90,9 +109,10 @@ impl ExecutionProfile {
             working_directory,
             prompt_transport: match self.adapter {
                 AdapterKind::Antigravity => PromptTransport::Argument,
-                AdapterKind::Claude | AdapterKind::Codex | AdapterKind::Gemini => {
-                    PromptTransport::Stdin
-                }
+                AdapterKind::Test
+                | AdapterKind::Claude
+                | AdapterKind::Codex
+                | AdapterKind::Gemini => PromptTransport::Stdin,
             },
         }
     }
@@ -133,6 +153,7 @@ impl ExecutionProfile {
 
 fn adapter_owned_arguments(adapter: AdapterKind) -> &'static [&'static str] {
     match adapter {
+        AdapterKind::Test => &[],
         AdapterKind::Claude => &["-p", "--print", "--model"],
         AdapterKind::Codex => &["exec", "-m", "--model", "-C", "--cd"],
         AdapterKind::Gemini => &["-p", "--prompt", "-m", "--model"],
@@ -189,6 +210,19 @@ mod tests {
             spec.args,
             ["--print", "--model", "test-model", "--safe-option"]
         );
+    }
+
+    #[test]
+    fn builds_a_safe_test_command_without_agent_arguments() {
+        let mut profile = profile(AdapterKind::Test);
+        profile.model = None;
+        profile.args.clear();
+
+        let spec = profile.command_spec(PathBuf::from("/work"));
+
+        assert_eq!(spec.program, PathBuf::from("/usr/bin/true"));
+        assert!(spec.args.is_empty());
+        assert_eq!(spec.prompt_transport, PromptTransport::Stdin);
     }
 
     #[test]

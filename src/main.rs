@@ -10,10 +10,11 @@ use std::{
 };
 
 use agent_dock::{
-    Config, ConfigError, EVENT_SCHEMA_VERSION, Event, EventKind, EventLog, ExecutionError,
-    ExecutionEvent, ExecutionOutcome, ExecutionProfile, ExecutionRequest, FailureKind,
-    OutputSource, ProfileSnapshot, ReadEvents, RecordedExecutionOutcome, SkippedLineReason,
-    Verdict, default_config_path, default_events_path, execute,
+    BackupEventLogOutcome, Config, ConfigError, EVENT_SCHEMA_VERSION, Event, EventKind, EventLog,
+    ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionProfile, ExecutionRequest,
+    FailureKind, OutputSource, ProfileSnapshot, ReadEvents, RecordedExecutionOutcome,
+    ReplaceConfigOutcome, SkippedLineReason, Verdict, default_config_path, default_events_path,
+    execute, safe_test_profile,
 };
 use jiff::Timestamp;
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -44,8 +45,9 @@ async fn run() -> Result<i32, AppError> {
         return Ok(0);
     };
 
+    let profiles = profiles_with_safe_test_default(&config.profiles);
     let mut available = Vec::new();
-    for profile in &config.profiles {
+    for profile in &profiles {
         if let Some(executable) = resolve_executable(profile) {
             let mut resolved = profile.clone();
             resolved.executable = Some(executable);
@@ -89,18 +91,17 @@ async fn run() -> Result<i32, AppError> {
         },
     ))?;
 
-    let profile = loop {
-        let labels: Vec<_> = available
-            .iter()
-            .map(|profile| format!("{} [{}]", profile.name, profile.adapter))
-            .collect();
-        let selected = choose_profile(&labels)?;
-        let profile = &available[selected];
-        print_execution_summary(profile, &prompt, &working_directory);
-        if confirm("Run this task?", true)? {
-            break profile;
-        }
-    };
+    let labels: Vec<_> = available
+        .iter()
+        .map(|profile| format!("{} [{}]", profile.name, profile.adapter))
+        .collect();
+    let selected = choose_profile(&labels)?;
+    let profile = &available[selected];
+    print_execution_summary(profile, &prompt, &working_directory);
+    if confirm_run()? == RunConfirmation::Exit {
+        println!("Task was not run.");
+        return Ok(0);
+    }
     event_log.append(&Event::new(
         task_id,
         EventKind::Assigned {
@@ -214,47 +215,64 @@ async fn run() -> Result<i32, AppError> {
 }
 
 fn load_or_create_config(path: &Path) -> Result<Option<Config>, AppError> {
-    let mut recreate = false;
+    load_or_create_config_with(path, &mut confirm)
+}
+
+fn load_or_create_config_with(
+    path: &Path,
+    ask: &mut impl FnMut(&str, bool) -> io::Result<bool>,
+) -> Result<Option<Config>, AppError> {
     loop {
         if path.exists() {
             match Config::load(path) {
                 Ok(config) => return Ok(Some(config)),
-                Err(ConfigError::UnsupportedSchema { found, expected }) => {
+                Err(ConfigError::UnsupportedSchema {
+                    found,
+                    expected,
+                    revision: Some(revision),
+                }) => {
                     eprintln!(
                         "Configuration `{}` uses schema version {found}; expected {expected}.",
                         path.display()
                     );
-                    let delete = confirm(
-                        &format!(
-                            "Delete incompatible configuration `{}` and create a new one?",
-                            path.display()
-                        ),
-                        false,
-                    )?;
-                    if !delete {
-                        println!("Configuration was not deleted.");
-                        return Ok(None);
+                    let record_prompt = ask("Allow full task prompts to be recorded?", false)?;
+                    match Config::backup_and_replace_default_if_unchanged(
+                        path,
+                        &revision,
+                        record_prompt,
+                    )? {
+                        ReplaceConfigOutcome::Replaced {
+                            config,
+                            backup_path,
+                        } => {
+                            eprintln!(
+                                "Warning: backed up incompatible configuration to `{}` and replaced `{}`.",
+                                backup_path.display(),
+                                path.display()
+                            );
+                            return Ok(Some(config));
+                        }
+                        ReplaceConfigOutcome::Changed => {
+                            eprintln!(
+                                "Configuration changed while waiting for confirmation; reloading it."
+                            );
+                            continue;
+                        }
                     }
-                    Config::delete(path)?;
-                    println!("Deleted {}", path.display());
-                    recreate = true;
-                    continue;
                 }
                 Err(error) => return Err(error.into()),
             }
         }
 
         println!("Configuration does not exist: {}", path.display());
-        if !recreate
-            && !confirm(
-                "Create default Claude, Codex, Gemini, and Antigravity profiles?",
-                true,
-            )?
-        {
+        if !ask(
+            "Create default safe test, Claude, Codex, Gemini, and Antigravity profiles?",
+            true,
+        )? {
             println!("No configuration was created.");
             return Ok(None);
         }
-        let record_prompt = confirm("Allow full task prompts to be recorded?", false)?;
+        let record_prompt = ask("Allow full task prompts to be recorded?", false)?;
         let config = Config::create_default(path, record_prompt)?;
         println!("Created {}", path.display());
         return Ok(Some(config));
@@ -262,43 +280,43 @@ fn load_or_create_config(path: &Path) -> Result<Option<Config>, AppError> {
 }
 
 fn read_event_history(event_log: &EventLog) -> Result<ReadEvents, AppError> {
-    let mut history = event_log.read_all()?;
-    let mut incompatible_count = 0;
-    let mut incompatible_versions = Vec::new();
-    for skipped in &history.skipped_lines {
-        if let SkippedLineReason::UnsupportedSchema { found, .. } = &skipped.reason {
-            incompatible_count += 1;
-            if !incompatible_versions.contains(found) {
-                incompatible_versions.push(found.clone());
+    loop {
+        let history = event_log.read_all()?;
+        let mut incompatible_count = 0;
+        let mut incompatible_versions = Vec::new();
+        for skipped in &history.skipped_lines {
+            if let SkippedLineReason::UnsupportedSchema { found, .. } = &skipped.reason {
+                incompatible_count += 1;
+                if !incompatible_versions.contains(found) {
+                    incompatible_versions.push(found.clone());
+                }
+            }
+        }
+        if incompatible_count == 0 {
+            return Ok(history);
+        }
+
+        eprintln!(
+            "Warning: event log `{}` contains {} event(s) using schema version(s) {}; expected {}.",
+            event_log.path().display(),
+            incompatible_count,
+            incompatible_versions.join(", "),
+            EVENT_SCHEMA_VERSION
+        );
+        match event_log.backup_and_delete_if_unchanged(&history)? {
+            BackupEventLogOutcome::BackedUpAndDeleted { backup_path } => {
+                eprintln!(
+                    "Warning: backed up incompatible event log to `{}` and deleted `{}`.",
+                    backup_path.display(),
+                    event_log.path().display()
+                );
+                return Ok(ReadEvents::default());
+            }
+            BackupEventLogOutcome::Changed => {
+                eprintln!("Event log changed before backup; reloading it.");
             }
         }
     }
-    if incompatible_count == 0 {
-        return Ok(history);
-    }
-
-    eprintln!(
-        "Event log `{}` contains {} event(s) using schema version(s) {}; expected {}.",
-        event_log.path().display(),
-        incompatible_count,
-        incompatible_versions.join(", "),
-        EVENT_SCHEMA_VERSION
-    );
-    let delete = confirm(
-        &format!(
-            "Delete the entire incompatible event log `{}`?",
-            event_log.path().display()
-        ),
-        false,
-    )?;
-    if delete {
-        event_log.delete()?;
-        println!("Deleted {}", event_log.path().display());
-        history = ReadEvents::default();
-    } else {
-        println!("Event log was not deleted; incompatible events will be skipped.");
-    }
-    Ok(history)
 }
 
 fn read_non_empty_prompt() -> Result<String, ReadlineError> {
@@ -335,6 +353,26 @@ fn confirm(prompt: &str, default: bool) -> io::Result<bool> {
         }
         eprintln!("Please answer y or n.");
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunConfirmation {
+    Run,
+    Exit,
+}
+
+fn confirm_run() -> io::Result<RunConfirmation> {
+    confirm_run_with(&mut confirm)
+}
+
+fn confirm_run_with(
+    ask: &mut impl FnMut(&str, bool) -> io::Result<bool>,
+) -> io::Result<RunConfirmation> {
+    Ok(if ask("Run this task?", true)? {
+        RunConfirmation::Run
+    } else {
+        RunConfirmation::Exit
+    })
 }
 
 fn parse_confirmation(input: &str, default: bool) -> Option<bool> {
@@ -385,6 +423,17 @@ fn resolve_executable(profile: &ExecutionProfile) -> Option<PathBuf> {
     }
 }
 
+fn profiles_with_safe_test_default(configured: &[ExecutionProfile]) -> Vec<ExecutionProfile> {
+    let safe_test = safe_test_profile();
+    let mut profiles: Vec<_> = configured
+        .iter()
+        .filter(|profile| profile.id != safe_test.id)
+        .cloned()
+        .collect();
+    profiles.insert(0, safe_test);
+    profiles
+}
+
 fn executable_in_path(executable: &Path, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path)
         .map(|directory| directory.join(executable))
@@ -422,13 +471,15 @@ fn parse_tags(input: &str, candidates: &[String]) -> Vec<String> {
             if item.is_empty() {
                 return None;
             }
-            let tag = item
-                .parse::<usize>()
-                .ok()
-                .and_then(|number| number.checked_sub(1))
-                .and_then(|index| candidates.get(index))
-                .cloned()
-                .unwrap_or_else(|| item.to_owned());
+            let tag = if item.bytes().all(|byte| byte.is_ascii_digit()) {
+                item.parse::<usize>()
+                    .ok()
+                    .and_then(|number| number.checked_sub(1))
+                    .and_then(|index| candidates.get(index))
+                    .cloned()
+            } else {
+                Some(item.to_owned())
+            }?;
             seen.insert(tag.clone()).then_some(tag)
         })
         .collect()
@@ -535,6 +586,19 @@ impl AppError {
 mod tests {
     use super::*;
 
+    fn old_event() -> Event {
+        let mut event = Event::new(
+            Uuid::now_v7(),
+            EventKind::TaskReceived {
+                tags: vec!["old".to_owned()],
+                prompt: None,
+                prompt_chars: 1,
+            },
+        );
+        event.schema_version = "old".to_owned();
+        event
+    }
+
     #[test]
     fn rejects_blank_prompts() {
         assert!(!prompt_is_valid(""));
@@ -556,6 +620,163 @@ mod tests {
     #[test]
     fn defaults_an_empty_acceptance_answer_to_accepted() {
         assert_eq!(parse_confirmation("", ACCEPT_RESULT_DEFAULT), Some(true));
+    }
+
+    #[test]
+    fn exits_when_running_the_selected_profile_is_declined() {
+        let mut ask = |prompt: &str, default: bool| {
+            assert_eq!(prompt, "Run this task?");
+            assert!(default);
+            Ok(false)
+        };
+
+        assert_eq!(confirm_run_with(&mut ask).unwrap(), RunConfirmation::Exit);
+    }
+
+    #[test]
+    fn prepends_the_safe_test_profile_to_existing_configurations() {
+        let configured: Vec<_> = Config::defaults(false)
+            .profiles
+            .into_iter()
+            .filter(|profile| profile.adapter != agent_dock::AdapterKind::Test)
+            .collect();
+
+        let profiles = profiles_with_safe_test_default(&configured);
+
+        assert_eq!(profiles[0].adapter, agent_dock::AdapterKind::Test);
+        assert_eq!(profiles[0].id, "test-default");
+        assert_eq!(profiles.len(), configured.len() + 1);
+    }
+
+    #[test]
+    fn configured_profiles_cannot_override_the_safe_test_default() {
+        let mut configured_test = safe_test_profile();
+        configured_test.name = "Unsafe override".to_owned();
+        configured_test.executable = Some(PathBuf::from("/usr/bin/false"));
+        configured_test.args = vec!["--unexpected".to_owned()];
+        let configured = vec![configured_test, Config::defaults(false).profiles[1].clone()];
+
+        let profiles = profiles_with_safe_test_default(&configured);
+
+        assert_eq!(profiles[0], safe_test_profile());
+        assert_eq!(profiles.len(), configured.len());
+        assert_eq!(
+            profiles
+                .iter()
+                .filter(|profile| profile.id == "test-default")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn replaces_an_incompatible_configuration_with_the_selected_prompt_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "schema_version = \"old\"\n").unwrap();
+        let mut ask = |prompt: &str, default: bool| {
+            assert_eq!(prompt, "Allow full task prompts to be recorded?");
+            assert!(!default);
+            Ok(true)
+        };
+
+        let config = load_or_create_config_with(&path, &mut ask)
+            .unwrap()
+            .unwrap();
+
+        assert!(config.record_prompt);
+        assert_eq!(Config::load(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn preserves_an_incompatible_configuration_if_prompt_policy_input_is_interrupted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = "schema_version = \"old\"\n";
+        fs::write(&path, original).unwrap();
+        let mut ask = |_: &str, _: bool| {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "test interruption",
+            ))
+        };
+
+        assert!(matches!(
+            load_or_create_config_with(&path, &mut ask),
+            Err(AppError::Io(source)) if source.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn reloads_a_configuration_changed_while_waiting_for_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "schema_version = \"old\"\n").unwrap();
+        let newer = toml::to_string_pretty(&Config::defaults(false)).unwrap();
+        let newer_for_prompt = newer.clone();
+        let path_for_prompt = path.clone();
+        let mut ask = move |_: &str, _: bool| {
+            fs::write(&path_for_prompt, &newer_for_prompt).unwrap();
+            Ok(true)
+        };
+
+        let config = load_or_create_config_with(&path, &mut ask)
+            .unwrap()
+            .unwrap();
+
+        assert!(!config.record_prompt);
+        assert_eq!(fs::read_to_string(path).unwrap(), newer);
+    }
+
+    #[test]
+    fn backs_up_a_mixed_incompatible_event_log_and_starts_with_empty_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let current = Event::new(
+            Uuid::now_v7(),
+            EventKind::TaskReceived {
+                tags: vec!["current".to_owned()],
+                prompt: None,
+                prompt_chars: 1,
+            },
+        );
+        let original = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&current).unwrap(),
+            serde_json::to_string(&old_event()).unwrap()
+        );
+        fs::write(&path, &original).unwrap();
+        let history = read_event_history(&EventLog::new(&path)).unwrap();
+
+        assert_eq!(history, ReadEvents::default());
+        assert!(!path.exists());
+        let backups: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("events.jsonl.backup.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read_to_string(backups[0].path()).unwrap(), original);
+    }
+
+    #[test]
+    fn keeps_a_log_containing_only_an_invalid_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        fs::write(&path, "{}\n").unwrap();
+        let history = read_event_history(&EventLog::new(&path)).unwrap();
+
+        assert!(matches!(
+            &history.skipped_lines[0].reason,
+            SkippedLineReason::InvalidEvent { .. }
+        ));
+        assert!(path.exists());
     }
 
     #[test]
@@ -617,8 +838,11 @@ mod tests {
     fn parses_numbers_free_tags_and_duplicates() {
         let candidates = vec!["rust".to_owned(), "docs".to_owned()];
         assert_eq!(
-            parse_tags(" 1, custom,2,rust,custom,9, ", &candidates),
-            ["rust", "custom", "docs", "9"]
+            parse_tags(
+                " 1, custom,2,rust,custom,0,9,999999999999999999999, ",
+                &candidates
+            ),
+            ["rust", "custom", "docs"]
         );
     }
 
