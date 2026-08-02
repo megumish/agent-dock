@@ -486,36 +486,21 @@ mod tests {
     }
 
     #[test]
-    fn serializes_the_versioned_adjacent_tag_shape() {
-        let event = task_event(Uuid::now_v7(), None);
-        let value = serde_json::to_value(&event).unwrap();
-
-        assert_eq!(value["schema_version"], EVENT_SCHEMA_VERSION);
-        assert_eq!(value["kind"], "task_received");
-        assert!(value["data"]["prompt"].is_null());
-        assert_eq!(serde_json::from_value::<Event>(value).unwrap(), event);
-    }
-
-    #[test]
-    fn distinguishes_an_unrecorded_prompt_from_an_empty_prompt() {
+    fn serializes_the_task_event_shape_and_prompt_states() {
         let unrecorded = task_event(Uuid::now_v7(), None);
         let empty = task_event(Uuid::now_v7(), Some(""));
+        let unrecorded_value = serde_json::to_value(&unrecorded).unwrap();
+        let empty_value = serde_json::to_value(&empty).unwrap();
 
-        let unrecorded: Event =
-            serde_json::from_str(&serde_json::to_string(&unrecorded).unwrap()).unwrap();
-        let empty: Event = serde_json::from_str(&serde_json::to_string(&empty).unwrap()).unwrap();
-
-        assert!(matches!(
-            unrecorded.kind,
-            EventKind::TaskReceived { prompt: None, .. }
-        ));
-        assert!(matches!(
-            empty.kind,
-            EventKind::TaskReceived {
-                prompt: Some(prompt),
-                ..
-            } if prompt.is_empty()
-        ));
+        assert_eq!(unrecorded_value["schema_version"], EVENT_SCHEMA_VERSION);
+        assert_eq!(unrecorded_value["kind"], "task_received");
+        assert!(unrecorded_value["data"]["prompt"].is_null());
+        assert_eq!(empty_value["data"]["prompt"], "");
+        assert_eq!(
+            serde_json::from_value::<Event>(unrecorded_value).unwrap(),
+            unrecorded
+        );
+        assert_eq!(serde_json::from_value::<Event>(empty_value).unwrap(), empty);
     }
 
     #[test]
@@ -599,46 +584,33 @@ mod tests {
             &read.skipped_lines[0].reason,
             SkippedLineReason::InvalidEvent { .. }
         ));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(log.lock_path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
-    fn skips_events_from_another_application_version() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("events.jsonl");
+    fn classifies_event_lines_by_schema() {
         let mut event = task_event(Uuid::now_v7(), None);
         event.schema_version = "0.0.0".to_owned();
-        fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string(&event).unwrap()),
-        )
-        .unwrap();
-
-        let read = EventLog::new(path).read_all().unwrap();
-
-        assert!(read.events.is_empty());
-        assert_eq!(read.skipped_lines.len(), 1);
-        assert!(matches!(
-            &read.skipped_lines[0].reason,
-            SkippedLineReason::UnsupportedSchema { found, .. } if found == "0.0.0"
-        ));
-    }
-
-    #[test]
-    fn recognizes_an_old_schema_before_deserializing_the_event_shape() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("events.jsonl");
-        fs::write(&path, "{\"schema_version\":\"old\"}\n").unwrap();
-
-        let read = EventLog::new(path).read_all().unwrap();
-
-        assert!(matches!(
-            &read.skipped_lines[0].reason,
-            SkippedLineReason::UnsupportedSchema { found, .. } if found == "old"
-        ));
-    }
-
-    #[test]
-    fn treats_missing_or_non_string_schema_versions_as_invalid_events() {
+        let old_event = serde_json::to_string(&event).unwrap();
+        for (line, expected) in [
+            (old_event.as_str(), "0.0.0"),
+            ("{\"schema_version\":\"old\"}", "old"),
+        ] {
+            assert!(
+                matches!(
+                    decode_event_line(line),
+                    Err(SkippedLineReason::UnsupportedSchema { found, .. }) if found == expected
+                ),
+                "line={line:?}"
+            );
+        }
         for line in [
             "{}",
             "{\"schema_version\":null}",
@@ -648,10 +620,13 @@ mod tests {
             "[]",
             "null",
         ] {
-            assert!(matches!(
-                decode_event_line(line),
-                Err(SkippedLineReason::InvalidEvent { .. })
-            ));
+            assert!(
+                matches!(
+                    decode_event_line(line),
+                    Err(SkippedLineReason::InvalidEvent { .. })
+                ),
+                "line={line:?}"
+            );
         }
     }
 
@@ -736,23 +711,6 @@ mod tests {
             }
             assert!(log.lock_path().exists());
         }
-    }
-
-    #[test]
-    fn creates_a_private_event_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("events.jsonl");
-        let log = EventLog::new(&path);
-        log.append(&task_event(Uuid::now_v7(), None)).unwrap();
-
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            fs::metadata(log.lock_path()).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
     }
 
     #[test]

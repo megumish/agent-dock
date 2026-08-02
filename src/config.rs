@@ -387,17 +387,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uses_the_safe_test_as_the_default_profile() {
-        let config = Config::defaults(false);
-        assert_eq!(config.profiles[0].id, "test-default");
-        assert_eq!(config.profiles[0].adapter, AdapterKind::Test);
-    }
-
-    #[test]
     fn creates_and_loads_default_without_overwriting() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/config.toml");
         let created = Config::create_default(&path, true).unwrap();
+        assert_eq!(created.profiles[0].id, "test-default");
+        assert_eq!(created.profiles[0].adapter, AdapterKind::Test);
         assert_eq!(created, Config::load(&path).unwrap());
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -534,16 +529,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_schema() {
-        let mut config = Config::defaults(false);
-        config.schema_version = "other".to_owned();
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::UnsupportedSchema { .. })
-        ));
-    }
-
-    #[test]
     fn rejects_duplicate_profile_ids() {
         let mut config = Config::defaults(false);
         config.profiles.push(config.profiles[0].clone());
@@ -554,65 +539,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_unknown_adapter_while_loading() {
+    fn rejects_invalid_current_schema_configurations() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
-        fs::write(
-            &path,
-            format!(
-                "schema_version = {CONFIG_SCHEMA_VERSION:?}\nrecord_prompt = false\ntag_candidates = []\n[[profiles]]\nid = \"unknown\"\nname = \"Unknown\"\nadapter = \"other\"\n"
+        let cases = [
+            (
+                "unknown adapter",
+                format!(
+                    "schema_version = {CONFIG_SCHEMA_VERSION:?}\nrecord_prompt = false\ntag_candidates = []\n[[profiles]]\nid = \"unknown\"\nname = \"Unknown\"\nadapter = \"other\"\n"
+                ),
             ),
-        )
-        .unwrap();
+            (
+                "missing recording fields",
+                format!(
+                    "schema_version = {CONFIG_SCHEMA_VERSION:?}\n[[profiles]]\nid = \"codex\"\nname = \"Codex\"\nadapter = \"codex\"\n"
+                ),
+            ),
+        ];
 
-        assert!(matches!(
-            Config::load(&path),
-            Err(ConfigError::Parse { .. })
-        ));
+        for (case, source) in cases {
+            fs::write(&path, source).unwrap();
+            assert!(
+                matches!(Config::load(&path), Err(ConfigError::Parse { .. })),
+                "case={case}"
+            );
+        }
     }
 
     #[test]
-    fn rejects_a_configuration_from_another_application_version() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(&path, "schema_version = 1\n[[profiles]]\n").unwrap();
-
+    fn rejects_and_redacts_configuration_from_another_application_version() {
+        let mut config = Config::defaults(false);
+        config.schema_version = "other".to_owned();
         assert!(matches!(
-            Config::load(&path),
+            config.validate(),
             Err(ConfigError::UnsupportedSchema { .. })
         ));
-    }
 
-    #[test]
-    fn redacts_configuration_contents_from_schema_error_debug_output() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
-        fs::write(
-            &path,
-            "schema_version = \"old\"\nsecret = \"do-not-print\"\n",
-        )
-        .unwrap();
+        fs::write(&path, "schema_version = 1\nsecret = \"do-not-print\"\n").unwrap();
 
         let error = Config::load(&path).unwrap_err();
 
+        assert!(matches!(error, ConfigError::UnsupportedSchema { .. }));
         assert!(!format!("{error:?}").contains("do-not-print"));
-    }
-
-    #[test]
-    fn requires_the_current_versions_recording_fields() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(
-            &path,
-            format!(
-                "schema_version = {CONFIG_SCHEMA_VERSION:?}\n[[profiles]]\nid = \"codex\"\nname = \"Codex\"\nadapter = \"codex\"\n"
-            ),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            Config::load(&path),
-            Err(ConfigError::Parse { .. })
-        ));
     }
 }

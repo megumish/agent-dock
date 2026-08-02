@@ -76,19 +76,18 @@ async fn run() -> Result<i32, AppError> {
     let tag_candidates = collect_tag_candidates(&config.tag_candidates, &history.events);
     let prompt = read_non_empty_prompt()?;
     let tags = read_tags(&tag_candidates)?;
-    let recorded_prompt = if config.record_prompt && confirm("Record this task prompt?", true)? {
-        Some(prompt.clone())
+    let prompt_approved = if config.record_prompt {
+        confirm("Record this task prompt?", true)?
     } else {
-        None
+        false
     };
     let task_id = Uuid::now_v7();
-    event_log.append(&Event::new(
+    event_log.append(&task_received_event(
         task_id,
-        EventKind::TaskReceived {
-            tags,
-            prompt: recorded_prompt,
-            prompt_chars: prompt.chars().count(),
-        },
+        tags,
+        &prompt,
+        config.record_prompt,
+        prompt_approved,
     ))?;
 
     let labels: Vec<_> = available
@@ -98,16 +97,10 @@ async fn run() -> Result<i32, AppError> {
     let selected = choose_profile(&labels)?;
     let profile = &available[selected];
     print_execution_summary(profile, &prompt, &working_directory);
-    if confirm_run()? == RunConfirmation::Exit {
+    if let Some(exit_code) = record_assignment(&event_log, task_id, &profile.id, confirm_run()?)? {
         println!("Task was not run.");
-        return Ok(0);
+        return Ok(exit_code);
     }
-    event_log.append(&Event::new(
-        task_id,
-        EventKind::Assigned {
-            profile_id: profile.id.clone(),
-        },
-    ))?;
 
     let (cancellation_sender, cancellation_receiver) = oneshot::channel();
     let signal_task = tokio::spawn(async move {
@@ -522,6 +515,41 @@ fn failure_kind(error: &ExecutionError) -> FailureKind {
     }
 }
 
+fn task_received_event(
+    task_id: Uuid,
+    tags: Vec<String>,
+    prompt: &str,
+    prompt_recording_enabled: bool,
+    prompt_approved: bool,
+) -> Event {
+    Event::new(
+        task_id,
+        EventKind::TaskReceived {
+            tags,
+            prompt: (prompt_recording_enabled && prompt_approved).then(|| prompt.to_owned()),
+            prompt_chars: prompt.chars().count(),
+        },
+    )
+}
+
+fn record_assignment(
+    event_log: &EventLog,
+    task_id: Uuid,
+    profile_id: &str,
+    confirmation: RunConfirmation,
+) -> Result<Option<i32>, AppError> {
+    if confirmation == RunConfirmation::Exit {
+        return Ok(Some(0));
+    }
+    event_log.append(&Event::new(
+        task_id,
+        EventKind::Assigned {
+            profile_id: profile_id.to_owned(),
+        },
+    ))?;
+    Ok(None)
+}
+
 fn print_execution_summary(profile: &ExecutionProfile, prompt: &str, working_directory: &Path) {
     println!("\nTask: {prompt}");
     println!("Profile: {} ({})", profile.name, profile.id);
@@ -607,8 +635,70 @@ mod tests {
     }
 
     #[test]
+    fn records_prompts_only_when_both_policies_allow_it() {
+        let cases = [
+            (false, false, None),
+            (false, true, None),
+            (true, false, None),
+            (true, true, Some("秘密")),
+        ];
+
+        for (enabled, approved, expected) in cases {
+            let event = task_received_event(
+                Uuid::now_v7(),
+                vec!["private".to_owned()],
+                "秘密",
+                enabled,
+                approved,
+            );
+            let EventKind::TaskReceived {
+                prompt,
+                prompt_chars,
+                ..
+            } = event.kind
+            else {
+                panic!("unexpected event kind");
+            };
+            assert_eq!(
+                prompt.as_deref(),
+                expected,
+                "enabled={enabled}, approved={approved}"
+            );
+            assert_eq!(prompt_chars, 2, "enabled={enabled}, approved={approved}");
+        }
+    }
+
+    #[test]
+    fn records_only_task_received_when_run_is_declined() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let task_id = Uuid::now_v7();
+        log.append(&task_received_event(
+            task_id,
+            Vec::new(),
+            "do not run",
+            false,
+            false,
+        ))
+        .unwrap();
+
+        let mut ask = |prompt: &str, default: bool| {
+            assert_eq!(prompt, "Run this task?");
+            assert!(default);
+            Ok(false)
+        };
+        let confirmation = confirm_run_with(&mut ask).unwrap();
+        let exit_code = record_assignment(&log, task_id, "test-default", confirmation).unwrap();
+        let events = log.read_all().unwrap().events;
+
+        assert_eq!(exit_code, Some(0));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].kind, EventKind::TaskReceived { .. }));
+    }
+
+    #[test]
     fn parses_confirmation_answers_and_defaults() {
-        assert_eq!(parse_confirmation("", true), Some(true));
+        assert_eq!(parse_confirmation("", ACCEPT_RESULT_DEFAULT), Some(true));
         assert_eq!(parse_confirmation("  ", false), Some(false));
         assert_eq!(parse_confirmation("Y", false), Some(true));
         assert_eq!(parse_confirmation("yes", false), Some(true));
@@ -618,23 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_an_empty_acceptance_answer_to_accepted() {
-        assert_eq!(parse_confirmation("", ACCEPT_RESULT_DEFAULT), Some(true));
-    }
-
-    #[test]
-    fn exits_when_running_the_selected_profile_is_declined() {
-        let mut ask = |prompt: &str, default: bool| {
-            assert_eq!(prompt, "Run this task?");
-            assert!(default);
-            Ok(false)
-        };
-
-        assert_eq!(confirm_run_with(&mut ask).unwrap(), RunConfirmation::Exit);
-    }
-
-    #[test]
-    fn prepends_the_safe_test_profile_to_existing_configurations() {
+    fn normalizes_the_safe_test_profile() {
         let configured: Vec<_> = Config::defaults(false)
             .profiles
             .into_iter()
@@ -646,10 +720,7 @@ mod tests {
         assert_eq!(profiles[0].adapter, agent_dock::AdapterKind::Test);
         assert_eq!(profiles[0].id, "test-default");
         assert_eq!(profiles.len(), configured.len() + 1);
-    }
 
-    #[test]
-    fn configured_profiles_cannot_override_the_safe_test_default() {
         let mut configured_test = safe_test_profile();
         configured_test.name = "Unsafe override".to_owned();
         configured_test.executable = Some(PathBuf::from("/usr/bin/false"));
@@ -791,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_an_explicit_missing_executable_as_unavailable() {
+    fn resolves_only_executable_files() {
         let profile = ExecutionProfile {
             id: "missing".to_owned(),
             name: "Missing".to_owned(),
@@ -802,10 +873,6 @@ mod tests {
         };
 
         assert!(resolve_executable(&profile).is_none());
-    }
-
-    #[test]
-    fn finds_an_executable_in_the_given_path() {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("fake-agent");
         fs::write(&executable, "#!/bin/sh\n").unwrap();
@@ -819,19 +886,13 @@ mod tests {
             Some(fs::canonicalize(executable).unwrap())
         );
         assert!(executable_in_path(Path::new("missing"), &path).is_none());
-    }
-
-    #[test]
-    fn rejects_a_non_executable_file_in_the_given_path() {
-        let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join("fake-agent");
-        fs::write(&executable, "not executable\n").unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        let non_executable = directory.path().join("not-executable");
+        fs::write(&non_executable, "not executable\n").unwrap();
+        let mut permissions = fs::metadata(&non_executable).unwrap().permissions();
         permissions.set_mode(0o644);
-        fs::set_permissions(&executable, permissions).unwrap();
-        let path = std::env::join_paths([directory.path()]).unwrap();
+        fs::set_permissions(&non_executable, permissions).unwrap();
 
-        assert!(executable_in_path(Path::new("fake-agent"), &path).is_none());
+        assert!(executable_in_path(Path::new("not-executable"), &path).is_none());
     }
 
     #[test]
