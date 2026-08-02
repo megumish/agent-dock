@@ -11,10 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{
-    AdapterKind, ExecutionProfile,
-    adapter::{ProfileValidationError, safe_test_profile},
-};
+use crate::{CliKind, ProfileDeclaration, adapter::ProfileValidationError};
 
 pub const CONFIG_SCHEMA_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -23,7 +20,7 @@ pub struct Config {
     pub schema_version: String,
     pub record_prompt: bool,
     pub tag_candidates: Vec<String>,
-    pub profiles: Vec<ExecutionProfile>,
+    pub profiles: Vec<ProfileDeclaration>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -50,29 +47,21 @@ impl Config {
             schema_version: CONFIG_SCHEMA_VERSION.to_owned(),
             record_prompt,
             tag_candidates: Vec::new(),
-            profiles: std::iter::once(safe_test_profile())
-                .chain(
-                    [
-                        ("codex-default", "Codex (default)", AdapterKind::Codex),
-                        ("claude-default", "Claude (default)", AdapterKind::Claude),
-                        ("gemini-default", "Gemini (default)", AdapterKind::Gemini),
-                        (
-                            "antigravity-default",
-                            "Antigravity (default)",
-                            AdapterKind::Antigravity,
-                        ),
-                    ]
-                    .into_iter()
-                    .map(|(id, name, adapter)| ExecutionProfile {
-                        id: id.to_owned(),
-                        name: name.to_owned(),
-                        adapter,
-                        executable: None,
-                        model: None,
-                        args: Vec::new(),
-                    }),
-                )
-                .collect(),
+            profiles: [
+                ("Codex (default)", CliKind::Codex),
+                ("Claude (default)", CliKind::Claude),
+                ("Gemini (default)", CliKind::Gemini),
+                ("Antigravity (default)", CliKind::Antigravity),
+            ]
+            .into_iter()
+            .map(|(name, cli)| ProfileDeclaration {
+                name: name.to_owned(),
+                cli,
+                executable: None,
+                model: None,
+                args: Vec::new(),
+            })
+            .collect(),
         }
     }
 
@@ -257,11 +246,19 @@ impl Config {
         if self.profiles.is_empty() {
             return Err(ConfigError::NoProfiles);
         }
-        let mut ids = HashSet::new();
+        let mut names = HashSet::new();
+        let mut identities = HashSet::new();
         for profile in &self.profiles {
-            profile.validate()?;
-            if !ids.insert(&profile.id) {
-                return Err(ConfigError::DuplicateProfile(profile.id.clone()));
+            profile.validate(false)?;
+            if profile.name == crate::safe_test_declaration().name {
+                return Err(ConfigError::ReservedSafeTestName(profile.name.clone()));
+            }
+            if !names.insert(&profile.name) {
+                return Err(ConfigError::DuplicateProfileName(profile.name.clone()));
+            }
+            let identity = profile.canonical_identity()?;
+            if !identities.insert(identity) {
+                return Err(ConfigError::DuplicateProfileIdentity(profile.id()?));
             }
         }
         Ok(())
@@ -370,8 +367,12 @@ pub enum ConfigError {
     },
     #[error("configuration must define at least one profile")]
     NoProfiles,
-    #[error("duplicate profile id `{0}`")]
-    DuplicateProfile(String),
+    #[error("duplicate profile name `{0}`")]
+    DuplicateProfileName(String),
+    #[error("profile name `{0}` is reserved for the system safe-test profile")]
+    ReservedSafeTestName(String),
+    #[error("duplicate declared profile identity `{0}`")]
+    DuplicateProfileIdentity(String),
     #[error(transparent)]
     InvalidProfile(#[from] ProfileValidationError),
 }
@@ -391,8 +392,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/config.toml");
         let created = Config::create_default(&path, true).unwrap();
-        assert_eq!(created.profiles[0].id, "test-default");
-        assert_eq!(created.profiles[0].adapter, AdapterKind::Test);
+        assert_eq!(created.profiles[0].cli, CliKind::Codex);
         assert_eq!(created, Config::load(&path).unwrap());
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -529,12 +529,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_profile_ids() {
+    fn rejects_duplicate_profile_names_and_identities() {
         let mut config = Config::defaults(false);
         config.profiles.push(config.profiles[0].clone());
         assert!(matches!(
             config.validate(),
-            Err(ConfigError::DuplicateProfile(_))
+            Err(ConfigError::DuplicateProfileName(_))
+        ));
+        let mut config = Config::defaults(false);
+        let mut duplicate = config.profiles[0].clone();
+        duplicate.name = "Renamed".to_owned();
+        config.profiles.push(duplicate);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::DuplicateProfileIdentity(_))
+        ));
+
+        let mut config = Config::defaults(false);
+        config.profiles[0].name = crate::safe_test_declaration().name;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::ReservedSafeTestName(_))
         ));
     }
 
@@ -546,13 +561,13 @@ mod tests {
             (
                 "unknown adapter",
                 format!(
-                    "schema_version = {CONFIG_SCHEMA_VERSION:?}\nrecord_prompt = false\ntag_candidates = []\n[[profiles]]\nid = \"unknown\"\nname = \"Unknown\"\nadapter = \"other\"\n"
+                    "schema_version = {CONFIG_SCHEMA_VERSION:?}\nrecord_prompt = false\ntag_candidates = []\n[[profiles]]\nname = \"Unknown\"\ncli = \"other\"\n"
                 ),
             ),
             (
                 "missing recording fields",
                 format!(
-                    "schema_version = {CONFIG_SCHEMA_VERSION:?}\n[[profiles]]\nid = \"codex\"\nname = \"Codex\"\nadapter = \"codex\"\n"
+                    "schema_version = {CONFIG_SCHEMA_VERSION:?}\n[[profiles]]\nname = \"Codex\"\ncli = \"codex\"\n"
                 ),
             ),
         ];

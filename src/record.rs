@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{AdapterKind, ExecutionProfile};
+use crate::{CliKind, ExecutionProfile, ProfileDeclaration};
 
 pub const EVENT_SCHEMA_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -68,21 +68,35 @@ pub enum EventKind {
 pub struct ProfileSnapshot {
     pub id: String,
     pub name: String,
-    pub adapter: AdapterKind,
-    pub executable: PathBuf,
+    pub cli: CliKind,
+    pub executable_override: Option<PathBuf>,
     pub model: Option<String>,
     pub args: Vec<String>,
+    pub resolved_executable: PathBuf,
 }
 
 impl From<&ExecutionProfile> for ProfileSnapshot {
     fn from(profile: &ExecutionProfile) -> Self {
         Self {
             id: profile.id.clone(),
-            name: profile.name.clone(),
-            adapter: profile.adapter,
-            executable: profile.executable(),
-            model: profile.model.clone(),
-            args: profile.args.clone(),
+            name: profile.name().to_owned(),
+            cli: profile.cli(),
+            executable_override: profile.declaration.executable.clone(),
+            model: profile.declaration.model.clone(),
+            args: profile.declaration.args.clone(),
+            resolved_executable: profile.resolved_executable.clone(),
+        }
+    }
+}
+
+impl ProfileSnapshot {
+    pub fn declaration(&self) -> ProfileDeclaration {
+        ProfileDeclaration {
+            name: self.name.clone(),
+            cli: self.cli,
+            executable: self.executable_override.clone(),
+            model: self.model.clone(),
+            args: self.args.clone(),
         }
     }
 }
@@ -509,10 +523,11 @@ mod tests {
         let profile = ProfileSnapshot {
             id: "codex-test".to_owned(),
             name: "Codex test".to_owned(),
-            adapter: AdapterKind::Codex,
-            executable: PathBuf::from("/usr/local/bin/codex"),
+            cli: CliKind::Codex,
+            executable_override: None,
             model: Some("test-model".to_owned()),
             args: vec!["--safe-option".to_owned()],
+            resolved_executable: PathBuf::from("/usr/local/bin/codex"),
         };
         let executed = [
             RecordedExecutionOutcome::Completed { exit_code: Some(7) },
