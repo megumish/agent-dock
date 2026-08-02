@@ -9,10 +9,9 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::timeout,
 };
-use tokio_util::sync::CancellationToken;
 
 use crate::ExecutionProfile;
 
@@ -66,7 +65,7 @@ impl ExecutionOutcome {
 pub async fn execute(
     profile: &ExecutionProfile,
     request: ExecutionRequest,
-    cancellation: CancellationToken,
+    cancellation: oneshot::Receiver<()>,
     mut on_event: impl FnMut(ExecutionEvent),
 ) -> Result<ExecutionOutcome, ExecutionError> {
     let spec = profile.command_spec(request.working_directory);
@@ -169,11 +168,13 @@ enum ManagedOutcome {
 async fn manage_child(
     mut child: Child,
     process_id: u32,
-    cancellation: CancellationToken,
+    cancellation: oneshot::Receiver<()>,
 ) -> Result<ManagedOutcome, ExecutionError> {
+    let cancellation = cancellation_requested(cancellation);
+    tokio::pin!(cancellation);
     tokio::select! {
         status = child.wait() => Ok(ManagedOutcome::Completed(status?)),
-        () = cancellation.cancelled() => {
+        () = &mut cancellation => {
             signal_process_group(process_id, libc::SIGINT)?;
             if timeout(TERMINATION_GRACE_PERIOD, child.wait()).await.is_err() {
                 signal_process_group(process_id, libc::SIGKILL)?;
@@ -181,6 +182,12 @@ async fn manage_child(
             }
             Ok(ManagedOutcome::Cancelled)
         }
+    }
+}
+
+async fn cancellation_requested(receiver: oneshot::Receiver<()>) {
+    if receiver.await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -260,6 +267,7 @@ mod tests {
         );
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = events.clone();
+        let (_, cancellation) = oneshot::channel();
 
         let outcome = execute(
             &profile(executable),
@@ -267,7 +275,7 @@ mod tests {
                 prompt: "hello from dock".to_owned(),
                 working_directory: directory.path().to_path_buf(),
             },
-            CancellationToken::new(),
+            cancellation,
             move |event| captured.lock().unwrap().push(event),
         )
         .await
@@ -305,11 +313,10 @@ mod tests {
             directory.path(),
             "#!/bin/sh\ntrap 'exit 0' INT\nprintf 'ready\\n'\nwhile :; do sleep 1; done\n",
         );
-        let cancellation = CancellationToken::new();
-        let trigger = cancellation.clone();
+        let (trigger, cancellation) = oneshot::channel();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            trigger.cancel();
+            let _ = trigger.send(());
         });
 
         let outcome = timeout(
@@ -335,13 +342,14 @@ mod tests {
     #[tokio::test]
     async fn reports_a_missing_executable_as_a_spawn_error() {
         let directory = tempfile::tempdir().unwrap();
+        let (_cancellation_sender, cancellation) = oneshot::channel();
         let result = execute(
             &profile(directory.path().join("does-not-exist")),
             ExecutionRequest {
                 prompt: "hello".to_owned(),
                 working_directory: directory.path().to_path_buf(),
             },
-            CancellationToken::new(),
+            cancellation,
             |_| {},
         )
         .await;

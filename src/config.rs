@@ -7,7 +7,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -220,8 +219,16 @@ fn create_unique_file(
 }
 
 pub fn default_config_path() -> Result<PathBuf, ConfigError> {
-    let base = BaseDirs::new().ok_or(ConfigError::NoConfigDirectory)?;
-    Ok(base.config_dir().join("agent-dock").join("config.toml"))
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .ok_or(ConfigError::NoConfigDirectory)?;
+    Ok(home
+        .join("Library")
+        .join("Application Support")
+        .join("agent-dock")
+        .join("config.toml"))
 }
 
 #[derive(Debug, Error)]
