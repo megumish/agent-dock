@@ -26,6 +26,11 @@ impl Config {
                 ("claude-default", "Claude (default)", AdapterKind::Claude),
                 ("codex-default", "Codex (default)", AdapterKind::Codex),
                 ("gemini-default", "Gemini (default)", AdapterKind::Gemini),
+                (
+                    "antigravity-default",
+                    "Antigravity (default)",
+                    AdapterKind::Antigravity,
+                ),
             ]
             .into_iter()
             .map(|(id, name, adapter)| ExecutionProfile {

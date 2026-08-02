@@ -9,6 +9,7 @@ pub enum AdapterKind {
     Claude,
     Codex,
     Gemini,
+    Antigravity,
 }
 
 impl AdapterKind {
@@ -17,6 +18,7 @@ impl AdapterKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Antigravity => "agy",
         }
     }
 }
@@ -73,12 +75,25 @@ impl ExecutionProfile {
                 args.extend(self.args.clone());
                 args.extend(["--prompt".to_owned(), String::new()]);
             }
+            AdapterKind::Antigravity => {
+                if let Some(model) = &self.model {
+                    args.extend(["--model".to_owned(), model.clone()]);
+                }
+                args.extend(self.args.clone());
+                args.push("-p".to_owned());
+            }
         }
 
         CommandSpec {
             program: self.executable(),
             args,
             working_directory,
+            prompt_transport: match self.adapter {
+                AdapterKind::Antigravity => PromptTransport::Argument,
+                AdapterKind::Claude | AdapterKind::Codex | AdapterKind::Gemini => {
+                    PromptTransport::Stdin
+                }
+            },
         }
     }
 
@@ -121,7 +136,14 @@ fn adapter_owned_arguments(adapter: AdapterKind) -> &'static [&'static str] {
         AdapterKind::Claude => &["-p", "--print", "--model"],
         AdapterKind::Codex => &["exec", "-m", "--model", "-C", "--cd"],
         AdapterKind::Gemini => &["-p", "--prompt", "-m", "--model"],
+        AdapterKind::Antigravity => &["-p", "--print", "--model"],
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptTransport {
+    Stdin,
+    Argument,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +151,7 @@ pub struct CommandSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub working_directory: PathBuf,
+    pub prompt_transport: PromptTransport,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -186,6 +209,15 @@ mod tests {
             spec.args,
             ["--model", "test-model", "--safe-option", "--prompt", ""]
         );
+        assert_eq!(spec.prompt_transport, PromptTransport::Stdin);
+    }
+
+    #[test]
+    fn builds_antigravity_command_with_prompt_argument_marker() {
+        let spec = profile(AdapterKind::Antigravity).command_spec(PathBuf::from("/work"));
+        assert_eq!(spec.program, PathBuf::from("agy"));
+        assert_eq!(spec.args, ["--model", "test-model", "--safe-option", "-p"]);
+        assert_eq!(spec.prompt_transport, PromptTransport::Argument);
     }
 
     #[test]

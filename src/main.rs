@@ -36,7 +36,10 @@ async fn run() -> Result<i32, AppError> {
         Config::load(&config_path)?
     } else {
         println!("Configuration does not exist: {}", config_path.display());
-        let create = confirm("Create default Claude, Codex, and Gemini profiles?", true)?;
+        let create = confirm(
+            "Create default Claude, Codex, Gemini, and Antigravity profiles?",
+            true,
+        )?;
         if !create {
             println!("No configuration was created.");
             return Ok(0);
