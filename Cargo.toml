@@ -1,0 +1,21 @@
+[package]
+name = "agent-dock"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.95"
+description = "A locally controlled multi-agent dock"
+license = "MIT"
+
+[dependencies]
+dialoguer = "0.12"
+directories = "6"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.9"
+which = "8"
+
+[dev-dependencies]
+tempfile = "3"
