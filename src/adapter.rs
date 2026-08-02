@@ -203,64 +203,70 @@ mod tests {
     }
 
     #[test]
-    fn builds_claude_command() {
-        let spec = profile(AdapterKind::Claude).command_spec(PathBuf::from("/work"));
-        assert_eq!(spec.program, PathBuf::from("claude"));
-        assert_eq!(
-            spec.args,
-            ["--print", "--model", "test-model", "--safe-option"]
-        );
-    }
+    fn builds_command_specs_for_every_adapter() {
+        let cases = [
+            (
+                "safe test",
+                safe_test_profile(),
+                "/usr/bin/true",
+                Vec::<&str>::new(),
+                PromptTransport::Stdin,
+            ),
+            (
+                "Claude",
+                profile(AdapterKind::Claude),
+                "claude",
+                vec!["--print", "--model", "test-model", "--safe-option"],
+                PromptTransport::Stdin,
+            ),
+            (
+                "Codex",
+                profile(AdapterKind::Codex),
+                "codex",
+                vec!["exec", "--model", "test-model", "--safe-option", "-"],
+                PromptTransport::Stdin,
+            ),
+            (
+                "Gemini",
+                profile(AdapterKind::Gemini),
+                "gemini",
+                vec!["--model", "test-model", "--safe-option", "--prompt", ""],
+                PromptTransport::Stdin,
+            ),
+            (
+                "Antigravity",
+                profile(AdapterKind::Antigravity),
+                "agy",
+                vec!["--model", "test-model", "--safe-option", "-p"],
+                PromptTransport::Argument,
+            ),
+        ];
 
-    #[test]
-    fn builds_a_safe_test_command_without_agent_arguments() {
-        let mut profile = profile(AdapterKind::Test);
-        profile.model = None;
-        profile.args.clear();
-
-        let spec = profile.command_spec(PathBuf::from("/work"));
-
-        assert_eq!(spec.program, PathBuf::from("/usr/bin/true"));
-        assert!(spec.args.is_empty());
-        assert_eq!(spec.prompt_transport, PromptTransport::Stdin);
-    }
-
-    #[test]
-    fn builds_codex_command_with_stdin_marker() {
-        let spec = profile(AdapterKind::Codex).command_spec(PathBuf::from("/work"));
-        assert_eq!(spec.program, PathBuf::from("codex"));
-        assert_eq!(
-            spec.args,
-            ["exec", "--model", "test-model", "--safe-option", "-"]
-        );
-    }
-
-    #[test]
-    fn builds_gemini_command_with_empty_prompt_argument() {
-        let spec = profile(AdapterKind::Gemini).command_spec(PathBuf::from("/work"));
-        assert_eq!(spec.program, PathBuf::from("gemini"));
-        assert_eq!(
-            spec.args,
-            ["--model", "test-model", "--safe-option", "--prompt", ""]
-        );
-        assert_eq!(spec.prompt_transport, PromptTransport::Stdin);
-    }
-
-    #[test]
-    fn builds_antigravity_command_with_prompt_argument_marker() {
-        let spec = profile(AdapterKind::Antigravity).command_spec(PathBuf::from("/work"));
-        assert_eq!(spec.program, PathBuf::from("agy"));
-        assert_eq!(spec.args, ["--model", "test-model", "--safe-option", "-p"]);
-        assert_eq!(spec.prompt_transport, PromptTransport::Argument);
+        for (case, profile, program, args, prompt_transport) in cases {
+            let spec = profile.command_spec(PathBuf::from("/work"));
+            assert_eq!(spec.program, PathBuf::from(program), "case={case}");
+            assert_eq!(spec.args, args, "case={case}");
+            assert_eq!(spec.prompt_transport, prompt_transport, "case={case}");
+        }
     }
 
     #[test]
     fn rejects_adapter_owned_arguments() {
-        let mut profile = profile(AdapterKind::Codex);
-        profile.args = vec!["--model=other".to_owned()];
-        assert!(matches!(
-            profile.validate(),
-            Err(ProfileValidationError::ReservedArgument { .. })
-        ));
+        for (adapter, argument) in [
+            (AdapterKind::Claude, "--print"),
+            (AdapterKind::Codex, "--model=other"),
+            (AdapterKind::Gemini, "--prompt"),
+            (AdapterKind::Antigravity, "-p"),
+        ] {
+            let mut profile = profile(adapter);
+            profile.args = vec![argument.to_owned()];
+            assert!(
+                matches!(
+                    profile.validate(),
+                    Err(ProfileValidationError::ReservedArgument { .. })
+                ),
+                "adapter={adapter}, argument={argument}"
+            );
+        }
     }
 }
