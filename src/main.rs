@@ -10,10 +10,10 @@ use std::{
 };
 
 use agent_dock::{
-    Config, ConfigError, Event, EventKind, EventLog, ExecutionError, ExecutionEvent,
-    ExecutionOutcome, ExecutionProfile, ExecutionRequest, FailureKind, OutputSource,
-    ProfileSnapshot, RecordedExecutionOutcome, ReplaceConfigOutcome, Verdict, default_config_path,
-    default_events_path, execute,
+    Config, ConfigError, EVENT_FORMAT_VERSION, Event, EventKind, EventLog, ExecutionError,
+    ExecutionEvent, ExecutionOutcome, ExecutionProfile, ExecutionRequest, FailureKind,
+    OutputSource, ProfileSnapshot, ReadEvents, RecordedExecutionOutcome, ReplaceConfigOutcome,
+    SkippedLineReason, Verdict, default_config_path, default_events_path, execute,
 };
 use jiff::Timestamp;
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -62,7 +62,9 @@ async fn run() -> Result<i32, AppError> {
 
     let working_directory = std::env::current_dir()?;
     let event_log = EventLog::new(default_events_path()?);
-    let history = event_log.read_all()?;
+    let Some(history) = read_event_history(&event_log)? else {
+        return Ok(0);
+    };
     for skipped in &history.skipped_lines {
         eprintln!(
             "Warning: skipped event log line {}: {}",
@@ -286,6 +288,48 @@ fn load_or_create_config_with(
     let config = Config::create_default(path, record_prompt)?;
     println!("Created {}", path.display());
     Ok(Some(config))
+}
+
+fn read_event_history(event_log: &EventLog) -> Result<Option<ReadEvents>, AppError> {
+    read_event_history_with(event_log, &mut confirm)
+}
+
+fn read_event_history_with(
+    event_log: &EventLog,
+    ask: &mut impl FnMut(&str, bool) -> io::Result<bool>,
+) -> Result<Option<ReadEvents>, AppError> {
+    let history = event_log.read_all()?;
+    let mut incompatible_count = 0;
+    let mut incompatible_formats = Vec::new();
+    for skipped in &history.skipped_lines {
+        if let SkippedLineReason::UnsupportedFormat { found, .. } = &skipped.reason {
+            incompatible_count += 1;
+            if !incompatible_formats.contains(found) {
+                incompatible_formats.push(found.clone());
+            }
+        }
+    }
+    if incompatible_count == 0 {
+        return Ok(Some(history));
+    }
+
+    eprintln!(
+        "Event log `{}` contains {incompatible_count} event(s) using format(s) {}; expected {EVENT_FORMAT_VERSION}.",
+        event_log.path().display(),
+        incompatible_formats.join(", ")
+    );
+    if !ask("Back up and clear the incompatible event log?", false)? {
+        eprintln!("Event log was not changed.");
+        return Ok(None);
+    }
+    if let Some(backup_path) = event_log.backup_and_clear()? {
+        eprintln!(
+            "Warning: backed up incompatible event log to `{}` and cleared `{}`.",
+            backup_path.display(),
+            event_log.path().display()
+        );
+    }
+    Ok(Some(ReadEvents::default()))
 }
 
 fn read_non_empty_prompt() -> Result<String, ReadlineError> {
@@ -639,7 +683,6 @@ mod tests {
             ["configured", "shared", "new", "old"]
         );
     }
-
     #[test]
     fn preserves_a_new_incompatible_configuration_without_asking_again() {
         let directory = tempfile::tempdir().unwrap();
@@ -664,5 +707,156 @@ mod tests {
         );
         assert_eq!(prompt_count, 1);
         assert_eq!(fs::read_to_string(path).unwrap(), newer);
+    }
+
+    #[test]
+    fn recreates_an_incompatible_configuration_only_after_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = "schema_version = 1\n";
+        fs::write(&path, original).unwrap();
+        let mut prompts = Vec::new();
+        let mut ask = |prompt: &str, default: bool| {
+            prompts.push((prompt.to_owned(), default));
+            Ok(true)
+        };
+
+        let config = load_or_create_config_with(&path, &mut ask)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(config.api_version, agent_dock::CONFIG_API_VERSION);
+        assert_eq!(
+            prompts,
+            [("Recreate the incompatible configuration?".to_owned(), false)]
+        );
+        let backups: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.backup.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read_to_string(backups[0].path()).unwrap(), original);
+    }
+
+    #[test]
+    fn preserves_an_incompatible_configuration_when_recreation_is_declined() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = "schema_version = 1\n";
+        fs::write(&path, original).unwrap();
+        let mut ask = |prompt: &str, default: bool| {
+            assert_eq!(prompt, "Recreate the incompatible configuration?");
+            assert!(!default);
+            Ok(false)
+        };
+
+        assert!(
+            load_or_create_config_with(&path, &mut ask)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn preserves_an_incompatible_configuration_when_confirmation_is_interrupted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = "schema_version = 1\n";
+        fs::write(&path, original).unwrap();
+        let mut ask = |_: &str, _: bool| {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "test interruption",
+            ))
+        };
+
+        assert!(matches!(
+            load_or_create_config_with(&path, &mut ask),
+            Err(AppError::Io(source)) if source.kind() == io::ErrorKind::Interrupted
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn backs_up_and_clears_an_incompatible_event_log_only_after_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let original = "{\"format_version\":\"old\"}\n";
+        fs::write(&path, original).unwrap();
+        let log = EventLog::new(&path);
+        let mut prompts = Vec::new();
+        let mut ask = |prompt: &str, default: bool| {
+            prompts.push((prompt.to_owned(), default));
+            Ok(true)
+        };
+
+        let history = read_event_history_with(&log, &mut ask).unwrap().unwrap();
+
+        assert_eq!(history, ReadEvents::default());
+        assert_eq!(
+            prompts,
+            [(
+                "Back up and clear the incompatible event log?".to_owned(),
+                false
+            )]
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        let backups: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("events.jsonl.backup.")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read_to_string(backups[0].path()).unwrap(), original);
+    }
+
+    #[test]
+    fn preserves_an_incompatible_event_log_when_recreation_is_declined() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let original = "{\"schema_version\":1}\n";
+        fs::write(&path, original).unwrap();
+        let log = EventLog::new(&path);
+        let mut ask = |prompt: &str, default: bool| {
+            assert_eq!(prompt, "Back up and clear the incompatible event log?");
+            assert!(!default);
+            Ok(false)
+        };
+
+        assert!(read_event_history_with(&log, &mut ask).unwrap().is_none());
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn preserves_an_incompatible_event_log_when_confirmation_is_interrupted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let original = "{\"format_version\":\"old\"}\n";
+        fs::write(&path, original).unwrap();
+        let log = EventLog::new(&path);
+        let mut ask = |_: &str, _: bool| {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "test interruption",
+            ))
+        };
+
+        assert!(matches!(
+            read_event_history_with(&log, &mut ask),
+            Err(AppError::Io(source)) if source.kind() == io::ErrorKind::Interrupted
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 }

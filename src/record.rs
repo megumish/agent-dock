@@ -1,11 +1,12 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     os::{
         fd::{AsRawFd, RawFd},
         unix::fs::OpenOptionsExt,
     },
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use jiff::Timestamp;
@@ -120,7 +121,18 @@ pub enum Verdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedLine {
     pub line_number: usize,
-    pub reason: String,
+    pub reason: SkippedLineReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SkippedLineReason {
+    #[error("unsupported event format {found}; expected {expected}")]
+    UnsupportedFormat {
+        found: String,
+        expected: &'static str,
+    },
+    #[error("{message}")]
+    InvalidEvent { message: String },
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -193,25 +205,128 @@ impl EventLog {
                 path: self.path.clone(),
                 source,
             })?;
-            match serde_json::from_str::<Event>(&line) {
-                Ok(event) if event.format_version == EVENT_FORMAT_VERSION => {
-                    result.events.push(event);
+            match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(document) => {
+                    let format_version = document
+                        .get("format_version")
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string())
+                        })
+                        .unwrap_or_else(|| "missing".to_owned());
+                    if format_version != EVENT_FORMAT_VERSION {
+                        result.skipped_lines.push(SkippedLine {
+                            line_number,
+                            reason: SkippedLineReason::UnsupportedFormat {
+                                found: format_version,
+                                expected: EVENT_FORMAT_VERSION,
+                            },
+                        });
+                        continue;
+                    }
+                    match serde_json::from_value::<Event>(document) {
+                        Ok(event) => result.events.push(event),
+                        Err(source) => result.skipped_lines.push(SkippedLine {
+                            line_number,
+                            reason: SkippedLineReason::InvalidEvent {
+                                message: source.to_string(),
+                            },
+                        }),
+                    }
                 }
-                Ok(event) => result.skipped_lines.push(SkippedLine {
-                    line_number,
-                    reason: format!(
-                        "unsupported schema version {}; expected {}",
-                        event.format_version, EVENT_FORMAT_VERSION
-                    ),
-                }),
                 Err(source) => result.skipped_lines.push(SkippedLine {
                     line_number,
-                    reason: source.to_string(),
+                    reason: SkippedLineReason::InvalidEvent {
+                        message: source.to_string(),
+                    },
                 }),
             }
         }
         Ok(result)
     }
+
+    pub fn backup_and_clear(&self) -> Result<Option<PathBuf>, RecordError> {
+        let mut file = match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(RecordError::Open {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        let _lock = FileLock::acquire(&file, libc::LOCK_EX, &self.path)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| RecordError::Read {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|source| RecordError::Read {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| RecordError::MissingParent(self.path.clone()))?;
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("events.jsonl");
+        let (backup_path, mut backup) = create_unique_file(parent, file_name, "backup")?;
+        backup
+            .write_all(&contents)
+            .and_then(|()| backup.sync_all())
+            .map_err(|source| RecordError::Write {
+                path: backup_path.clone(),
+                source,
+            })?;
+        file.set_len(0).map_err(|source| RecordError::Write {
+            path: self.path.clone(),
+            source,
+        })?;
+        file.sync_all().map_err(|source| RecordError::Write {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(Some(backup_path))
+    }
+}
+
+fn create_unique_file(
+    parent: &Path,
+    file_name: &str,
+    purpose: &str,
+) -> Result<(PathBuf, File), RecordError> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for sequence in 0..u32::MAX {
+        let path = parent.join(format!(
+            "{file_name}.{purpose}.{}.{}.{sequence}",
+            std::process::id(),
+            timestamp
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(RecordError::Open { path, source }),
+        }
+    }
+    unreachable!("u32 path suffixes were exhausted")
 }
 
 pub fn default_events_path() -> Result<PathBuf, RecordError> {
@@ -396,6 +511,10 @@ mod tests {
         assert_eq!(read.events, vec![event]);
         assert_eq!(read.skipped_lines.len(), 1);
         assert_eq!(read.skipped_lines[0].line_number, 2);
+        assert!(matches!(
+            &read.skipped_lines[0].reason,
+            SkippedLineReason::InvalidEvent { .. }
+        ));
     }
 
     #[test]
@@ -414,11 +533,40 @@ mod tests {
 
         assert!(read.events.is_empty());
         assert_eq!(read.skipped_lines.len(), 1);
-        assert!(
-            read.skipped_lines[0]
-                .reason
-                .contains("agent-dock/events/v0")
-        );
+        assert!(matches!(
+            &read.skipped_lines[0].reason,
+            SkippedLineReason::UnsupportedFormat { found, .. }
+                if found == "agent-dock/events/v0"
+        ));
+    }
+
+    #[test]
+    fn recognizes_an_old_schema_before_deserializing_the_event_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        fs::write(&path, "{\"format_version\":\"old\"}\n").unwrap();
+
+        let read = EventLog::new(path).read_all().unwrap();
+
+        assert!(matches!(
+            &read.skipped_lines[0].reason,
+            SkippedLineReason::UnsupportedFormat { found, .. } if found == "old"
+        ));
+    }
+
+    #[test]
+    fn backs_up_and_clears_an_event_log_and_tolerates_a_missing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        log.append(&task_event(Uuid::now_v7(), None)).unwrap();
+
+        let original = fs::read(&path).unwrap();
+        let backup = log.backup_and_clear().unwrap().unwrap();
+        assert_eq!(fs::read(backup).unwrap(), original);
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        fs::remove_file(&path).unwrap();
+        assert!(log.backup_and_clear().unwrap().is_none());
     }
 
     #[test]
