@@ -219,7 +219,7 @@ async fn run_task() -> Result<i32, AppError> {
     let execution_event_id = executed.event_id;
     event_log.append(&executed)?;
 
-    if matches!(outcome, ExecutionOutcome::Cancelled { .. }) {
+    if !should_ask_immediate_judgement(&outcome) {
         return Ok(process_exit_code);
     }
 
@@ -276,7 +276,7 @@ fn command_from_args(
 fn print_usage() {
     println!("Usage: agent-dock [judge]");
     println!("\nCommands:");
-    println!("  judge  Append a new judgement to a completed execution");
+    println!("  judge  Append a new judgement to a completed or cancelled execution");
 }
 
 fn judge() -> Result<i32, AppError> {
@@ -285,11 +285,11 @@ fn judge() -> Result<i32, AppError> {
     print_skipped_event_warnings(&history);
     let candidates = judgement_candidates(&history.events);
     if candidates.is_empty() {
-        println!("No completed executions are available to judge.");
+        println!("No completed or cancelled executions are available to judge.");
         return Ok(0);
     }
 
-    println!("Choose a completed execution:");
+    println!("Choose an execution:");
     for (index, candidate) in candidates.iter().enumerate() {
         println!("  {}. {}", index + 1, render_judgement_candidate(candidate));
     }
@@ -872,6 +872,10 @@ fn recorded_execution_outcome(outcome: &ExecutionOutcome) -> (RecordedExecutionO
     }
 }
 
+fn should_ask_immediate_judgement(outcome: &ExecutionOutcome) -> bool {
+    matches!(outcome, ExecutionOutcome::Completed { .. })
+}
+
 fn failure_kind(error: &ExecutionError) -> FailureKind {
     match error {
         ExecutionError::Spawn { .. } => FailureKind::Spawn,
@@ -1096,6 +1100,14 @@ mod tests {
         assert_eq!(
             render_judgement_candidate(&judgement_candidate()),
             "0198a8e2-9a80-7000-8000-000000000001 | 2026-08-01T01:02:03Z | Historical\\nProfile [test; model\\tname; profile-id] | completed with exit code 2 | tags: rust\\nreview | current: rejected"
+        );
+    }
+
+    #[test]
+    fn identifies_cancelled_executions_in_the_judgement_list() {
+        assert_eq!(
+            execution_outcome_label(&RecordedExecutionOutcome::Cancelled),
+            "cancelled"
         );
     }
 
@@ -1388,6 +1400,21 @@ mod tests {
                 (expected, expected_ms)
             );
         }
+    }
+
+    #[test]
+    fn cancelled_executions_skip_the_immediate_judgement() {
+        assert!(!should_ask_immediate_judgement(
+            &ExecutionOutcome::Cancelled {
+                elapsed: std::time::Duration::from_millis(1),
+            }
+        ));
+        assert!(should_ask_immediate_judgement(
+            &ExecutionOutcome::Completed {
+                exit_code: Some(0),
+                elapsed: std::time::Duration::from_millis(1),
+            }
+        ));
     }
 
     #[test]
