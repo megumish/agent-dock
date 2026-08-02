@@ -9,6 +9,7 @@ license = "MIT"
 # See DEPENDENCIES.md before adding or updating dependencies.
 [dependencies]
 libc = "0.2"
+rustyline = { version = "18", default-features = false }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
