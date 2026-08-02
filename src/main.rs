@@ -12,9 +12,10 @@ use std::{
 use agent_dock::{
     BackupEventLogOutcome, Config, ConfigError, EVENT_FORMAT_VERSION, Event, EventKind, EventLog,
     ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionProfile, ExecutionRequest,
-    FailureKind, OutputSource, ProfileSnapshot, ReadEvents, RecordedExecutionOutcome,
-    ReplaceConfigOutcome, SkippedLineReason, Verdict, default_config_path, default_events_path,
-    execute, safe_test_profile,
+    FailureKind, OutputSource, ProfileDeclaration, ProfileSnapshot, ReadEvents,
+    RecordedExecutionOutcome, ReplaceConfigOutcome, Segment, SegmentScore, SkippedLineReason,
+    Verdict, default_config_path, default_events_path, escape_terminal, execute, format_acceptance,
+    format_duration, format_recency, project, safe_test_profile, segments_for_tags,
 };
 use jiff::Timestamp;
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -45,18 +46,19 @@ async fn run() -> Result<i32, AppError> {
         return Ok(0);
     };
 
-    let profiles = profiles_with_safe_test_default(&config.profiles);
-    let mut available = Vec::new();
-    for profile in &profiles {
-        if let Some(executable) = resolve_executable(profile) {
-            let mut resolved = profile.clone();
-            resolved.executable = Some(executable);
-            available.push(resolved);
+    let mut available = vec![safe_test_profile()];
+    for declaration in &config.profiles {
+        if let Some(executable) = resolve_executable(declaration) {
+            available.push(
+                declaration
+                    .resolve(executable)
+                    .expect("validated configuration"),
+            );
         } else {
             eprintln!(
                 "Unavailable profile '{}': executable '{}' was not found",
-                profile.name,
-                profile.executable().display()
+                escape_terminal(&declaration.name),
+                escape_terminal(&declaration.executable().display().to_string())
             );
         }
     }
@@ -77,6 +79,7 @@ async fn run() -> Result<i32, AppError> {
     }
     let tag_candidates = collect_tag_candidates(&config.tag_candidates, &history.events);
     let prompt = read_non_empty_prompt()?;
+    let received_at = Timestamp::now();
     let tags = read_tags(&tag_candidates)?;
     let prompt_approved = if config.record_prompt {
         confirm("Record this task prompt?", true)?
@@ -84,19 +87,32 @@ async fn run() -> Result<i32, AppError> {
         false
     };
     let task_id = Uuid::now_v7();
+    let all_segments = segments_for_tags(&tags);
+    let score_segments = visible_segments(&all_segments);
+    let hidden_tags = all_segments.len() - score_segments.len();
     event_log.append(&task_received_event(
         task_id,
         tags,
         &prompt,
         config.record_prompt,
         prompt_approved,
+        received_at,
     ))?;
 
-    let labels: Vec<_> = available
-        .iter()
-        .map(|profile| format!("{} [{}]", profile.name, profile.adapter))
-        .collect();
-    let selected = choose_profile(&labels)?;
+    let Some(fresh_history) = read_event_history(&event_log)? else {
+        return Ok(0);
+    };
+    let projection = project(&fresh_history.events, &available, &score_segments);
+    for warning in &projection.warnings {
+        eprintln!("Warning: {warning}");
+    }
+    let choices = render_profile_choices(
+        &available,
+        &projection.scorecards,
+        hidden_tags,
+        Timestamp::now(),
+    );
+    let selected = choose_profile(&choices)?;
     let profile = &available[selected];
     print_execution_summary(profile, &prompt, &working_directory);
     if let Some(exit_code) = record_assignment(&event_log, task_id, &profile.id, confirm_run()?)? {
@@ -423,11 +439,88 @@ fn parse_selection(input: &str, count: usize) -> Option<usize> {
     selected.checked_sub(1).filter(|index| *index < count)
 }
 
+fn visible_segments(segments: &[Segment]) -> Vec<Segment> {
+    let mut tag_count = 0;
+    segments
+        .iter()
+        .filter(|segment| match segment {
+            Segment::Tag(_) if tag_count == 5 => false,
+            Segment::Tag(_) => {
+                tag_count += 1;
+                true
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect()
+}
+
+fn render_profile_choices(
+    profiles: &[ExecutionProfile],
+    scorecards: &[agent_dock::ProfileScorecard],
+    hidden_tags: usize,
+    now: Timestamp,
+) -> Vec<String> {
+    profiles
+        .iter()
+        .zip(scorecards)
+        .map(|(profile, card)| {
+            let model = profile
+                .model()
+                .map(escape_terminal)
+                .unwrap_or_else(|| "default".to_owned());
+            let mut lines = vec![format!(
+                "{} [{}, {}]",
+                escape_terminal(profile.name()),
+                profile.cli(),
+                model
+            )];
+            for score in &card.scores {
+                lines.push(format!("     {}", render_segment(score, now)));
+            }
+            if hidden_tags > 0 {
+                lines.push(format!("     ... {hidden_tags} more tags"));
+            }
+            lines.join("\n")
+        })
+        .collect()
+}
+
+fn render_segment(score: &SegmentScore, now: Timestamp) -> String {
+    let label = match &score.segment {
+        Segment::Overall => "Overall".to_owned(),
+        Segment::Untagged => "Untagged".to_owned(),
+        Segment::Tag(tag) => format!("Tag: {}", escape_terminal(tag)),
+    };
+    if score.execution_count == 0 {
+        return format!("{label}: No history");
+    }
+    let acceptance_recency = format_recency(now, score.acceptance.summary.latest_started_at)
+        .map(|value| format!(", {value}"))
+        .unwrap_or_default();
+    let duration_recency = format_recency(now, score.duration.summary.latest_started_at)
+        .map(|value| format!(", {value}"))
+        .unwrap_or_default();
+    let excluded = if score.excluded_count > 0 {
+        format!(" | Excluded {}", score.excluded_count)
+    } else {
+        String::new()
+    };
+    format!(
+        "{label}: Acceptance {}{} | Duration {}{} | Cost missing (0){}",
+        format_acceptance(&score.acceptance),
+        acceptance_recency,
+        format_duration(&score.duration),
+        duration_recency,
+        excluded,
+    )
+}
+
 fn prompt_is_valid(prompt: &str) -> bool {
     !prompt.trim().is_empty()
 }
 
-fn resolve_executable(profile: &ExecutionProfile) -> Option<PathBuf> {
+fn resolve_executable(profile: &ProfileDeclaration) -> Option<PathBuf> {
     let executable = profile.executable();
     if executable.components().count() > 1 {
         executable_path(&executable)
@@ -436,17 +529,6 @@ fn resolve_executable(profile: &ExecutionProfile) -> Option<PathBuf> {
             .as_deref()
             .and_then(|path| executable_in_path(&executable, path))
     }
-}
-
-fn profiles_with_safe_test_default(configured: &[ExecutionProfile]) -> Vec<ExecutionProfile> {
-    let safe_test = safe_test_profile();
-    let mut profiles: Vec<_> = configured
-        .iter()
-        .filter(|profile| profile.id != safe_test.id)
-        .cloned()
-        .collect();
-    profiles.insert(0, safe_test);
-    profiles
 }
 
 fn executable_in_path(executable: &Path, path: &OsStr) -> Option<PathBuf> {
@@ -470,7 +552,7 @@ fn read_tags(candidates: &[String]) -> io::Result<Vec<String>> {
     if !candidates.is_empty() {
         println!("Tag candidates:");
         for (index, candidate) in candidates.iter().enumerate() {
-            println!("  {}. {candidate}", index + 1);
+            println!("  {}. {}", index + 1, escape_terminal(candidate));
         }
     }
     let input = read_line("Tags (comma-separated, blank for unclassified):")?;
@@ -543,15 +625,18 @@ fn task_received_event(
     prompt: &str,
     prompt_recording_enabled: bool,
     prompt_approved: bool,
+    occurred_at: Timestamp,
 ) -> Event {
-    Event::new(
+    let mut event = Event::new(
         task_id,
         EventKind::TaskReceived {
             tags,
             prompt: (prompt_recording_enabled && prompt_approved).then(|| prompt.to_owned()),
             prompt_chars: prompt.chars().count(),
         },
-    )
+    );
+    event.occurred_at = occurred_at;
+    event
 }
 
 fn record_assignment(
@@ -573,17 +658,35 @@ fn record_assignment(
 }
 
 fn print_execution_summary(profile: &ExecutionProfile, prompt: &str, working_directory: &Path) {
-    println!("\nTask: {prompt}");
-    println!("Profile: {} ({})", profile.name, profile.id);
-    println!("Adapter: {}", profile.adapter);
+    println!("\nTask: {}", escape_terminal(prompt));
+    println!(
+        "Profile: {} ({})",
+        escape_terminal(profile.name()),
+        profile.id
+    );
+    println!("CLI: {}", profile.cli());
     println!(
         "Model: {}",
-        profile.model.as_deref().unwrap_or("CLI default")
+        profile
+            .model()
+            .map(escape_terminal)
+            .as_deref()
+            .unwrap_or("CLI default")
     );
-    println!("Working directory: {}", working_directory.display());
+    println!(
+        "Working directory: {}",
+        escape_terminal(&working_directory.display().to_string())
+    );
     println!("Permissions: inherited from the agent CLI");
-    if !profile.args.is_empty() {
-        println!("Additional arguments: {:?}", profile.args);
+    if !profile.args().is_empty() {
+        println!(
+            "Additional arguments: {:?}",
+            profile
+                .args()
+                .iter()
+                .map(|arg| escape_terminal(arg))
+                .collect::<Vec<_>>()
+        );
     }
 }
 
@@ -672,6 +775,7 @@ mod tests {
                 "秘密",
                 enabled,
                 approved,
+                Timestamp::now(),
             );
             let EventKind::TaskReceived {
                 prompt,
@@ -701,6 +805,7 @@ mod tests {
             "do not run",
             false,
             false,
+            Timestamp::now(),
         ))
         .unwrap();
 
@@ -730,36 +835,11 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_the_safe_test_profile() {
-        let configured: Vec<_> = Config::defaults(false)
-            .profiles
-            .into_iter()
-            .filter(|profile| profile.adapter != agent_dock::AdapterKind::Test)
-            .collect();
-
-        let profiles = profiles_with_safe_test_default(&configured);
-
-        assert_eq!(profiles[0].adapter, agent_dock::AdapterKind::Test);
-        assert_eq!(profiles[0].id, "test-default");
-        assert_eq!(profiles.len(), configured.len() + 1);
-
-        let mut configured_test = safe_test_profile();
-        configured_test.name = "Unsafe override".to_owned();
-        configured_test.executable = Some(PathBuf::from("/usr/bin/false"));
-        configured_test.args = vec!["--unexpected".to_owned()];
-        let configured = vec![configured_test, Config::defaults(false).profiles[1].clone()];
-
-        let profiles = profiles_with_safe_test_default(&configured);
-
-        assert_eq!(profiles[0], safe_test_profile());
-        assert_eq!(profiles.len(), configured.len());
-        assert_eq!(
-            profiles
-                .iter()
-                .filter(|profile| profile.id == "test-default")
-                .count(),
-            1
-        );
+    fn safe_test_is_a_fixed_system_profile() {
+        let profile = safe_test_profile();
+        assert_eq!(profile.cli(), agent_dock::CliKind::Test);
+        assert_eq!(profile.id, "42d38cde-50a8-5024-9f12-d164e82adea6");
+        assert_eq!(profile.resolved_executable, PathBuf::from("/usr/bin/true"));
     }
 
     #[test]
@@ -958,11 +1038,21 @@ mod tests {
     }
 
     #[test]
+    fn limits_scorecard_tags_and_reports_the_hidden_count() {
+        let tags: Vec<_> = (0..7).map(|index| format!("tag-{index}")).collect();
+        let all = segments_for_tags(&tags);
+        let visible = visible_segments(&all);
+        assert_eq!(visible.len(), 6);
+        assert_eq!(all.len() - visible.len(), 2);
+        assert!(matches!(visible[0], Segment::Overall));
+        assert!(matches!(&visible[5], Segment::Tag(tag) if tag == "tag-4"));
+    }
+
+    #[test]
     fn resolves_only_executable_files() {
-        let profile = ExecutionProfile {
-            id: "missing".to_owned(),
+        let profile = ProfileDeclaration {
             name: "Missing".to_owned(),
-            adapter: agent_dock::AdapterKind::Claude,
+            cli: agent_dock::CliKind::Claude,
             executable: Some(std::path::PathBuf::from("/definitely/not/installed")),
             model: None,
             args: Vec::new(),

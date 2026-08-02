@@ -251,7 +251,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{AdapterKind, safe_test_profile};
+    use crate::{CliKind, ProfileDeclaration, safe_test_profile};
 
     fn write_script(directory: &Path, source: &str) -> PathBuf {
         let path = directory.join("fake-agent");
@@ -263,21 +263,27 @@ mod tests {
     }
 
     fn profile(executable: PathBuf) -> ExecutionProfile {
-        ExecutionProfile {
-            id: "fake-agent".to_owned(),
+        ProfileDeclaration {
             name: "Fake agent".to_owned(),
-            adapter: AdapterKind::Claude,
-            executable: Some(executable),
+            cli: CliKind::Claude,
+            executable: Some(executable.clone()),
             model: None,
             args: Vec::new(),
         }
+        .resolve(executable)
+        .unwrap()
     }
 
     fn antigravity_profile(executable: PathBuf) -> ExecutionProfile {
-        ExecutionProfile {
-            adapter: AdapterKind::Antigravity,
-            ..profile(executable)
+        ProfileDeclaration {
+            name: "Fake agent".to_owned(),
+            cli: CliKind::Antigravity,
+            executable: Some(executable.clone()),
+            model: None,
+            args: Vec::new(),
         }
+        .resolve(executable)
+        .unwrap()
     }
 
     #[tokio::test]
