@@ -36,6 +36,7 @@ alpha の期間は ADR を作らず、実装しながら技術を探索する。
 1. [VISION.md](./VISION.md)
 2. [DESIGN.md](./DESIGN.md)
 3. [DEPENDENCIES.md](./DEPENDENCIES.md)
+4. [現在のリリース文書](./docs/releases/0.1.0-alpha.1.md)
 
 ## 0.1.0-alpha.1
 
@@ -54,3 +55,4 @@ mise exec -- cargo run
 実行する CLI のモデル、権限、サンドボックスは各 CLI の通常設定を継承する。
 
 0.1.0-alpha.1 は実行基盤までを対象とし、評価イベント、受け入れ判定、スコアカード、助言はまだ実装しない。
+現在の実装範囲と挙動は [0.1.0-alpha.1 のリリース文書](./docs/releases/0.1.0-alpha.1.md) に記録する。

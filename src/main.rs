@@ -106,59 +106,72 @@ fn load_or_create_config_with(
     path: &Path,
     ask: &mut impl FnMut(&str, bool) -> io::Result<bool>,
 ) -> Result<Option<Config>, AppError> {
-    loop {
-        if path.exists() {
-            match Config::load(path) {
-                Ok(config) => return Ok(Some(config)),
-                Err(ConfigError::UnsupportedApi {
-                    found,
-                    expected,
-                    revision: Some(revision),
-                }) => {
-                    eprintln!(
-                        "Configuration `{}` uses API version {found}; expected {expected}.",
-                        path.display()
-                    );
-                    if !ask("Recreate the incompatible configuration?", false)? {
-                        eprintln!("Configuration was not changed.");
-                        return Ok(None);
+    if path.exists() {
+        match Config::load(path) {
+            Ok(config) => return Ok(Some(config)),
+            Err(ConfigError::UnsupportedApi {
+                found,
+                expected,
+                revision: Some(revision),
+            }) => {
+                eprintln!(
+                    "Configuration `{}` uses API version {found}; expected {expected}.",
+                    path.display()
+                );
+                if !ask("Recreate the incompatible configuration?", false)? {
+                    eprintln!("Configuration was not changed.");
+                    return Ok(None);
+                }
+                match Config::backup_and_replace_default_if_unchanged(path, &revision)? {
+                    ReplaceConfigOutcome::Replaced {
+                        config,
+                        backup_path,
+                    } => {
+                        eprintln!(
+                            "Warning: backed up incompatible configuration to `{}` and replaced `{}`.",
+                            backup_path.display(),
+                            path.display()
+                        );
+                        return Ok(Some(config));
                     }
-                    match Config::backup_and_replace_default_if_unchanged(path, &revision)? {
-                        ReplaceConfigOutcome::Replaced {
-                            config,
-                            backup_path,
-                        } => {
-                            eprintln!(
-                                "Warning: backed up incompatible configuration to `{}` and replaced `{}`.",
-                                backup_path.display(),
-                                path.display()
-                            );
-                            return Ok(Some(config));
-                        }
-                        ReplaceConfigOutcome::Changed => {
-                            eprintln!(
-                                "Configuration changed while waiting for confirmation; reloading it."
-                            );
-                            continue;
-                        }
+                    ReplaceConfigOutcome::Changed => {
+                        eprintln!(
+                            "Configuration changed while waiting for confirmation; reloading it."
+                        );
+                        return match Config::load(path) {
+                            Ok(config) => Ok(Some(config)),
+                            Err(ConfigError::UnsupportedApi { .. }) => {
+                                eprintln!(
+                                    "The changed configuration is still incompatible; it was not changed."
+                                );
+                                Ok(None)
+                            }
+                            Err(ConfigError::Read { source, .. })
+                                if source.kind() == io::ErrorKind::NotFound =>
+                            {
+                                eprintln!("The configuration was removed; it was not recreated.");
+                                Ok(None)
+                            }
+                            Err(error) => Err(error.into()),
+                        };
                     }
                 }
-                Err(error) => return Err(error.into()),
             }
+            Err(error) => return Err(error.into()),
         }
-
-        println!("Configuration does not exist: {}", path.display());
-        if !ask(
-            "Create default Claude, Codex, Gemini, and Antigravity profiles?",
-            true,
-        )? {
-            println!("No configuration was created.");
-            return Ok(None);
-        }
-        let config = Config::create_default(path)?;
-        println!("Created {}", path.display());
-        return Ok(Some(config));
     }
+
+    println!("Configuration does not exist: {}", path.display());
+    if !ask(
+        "Create default Claude, Codex, Gemini, and Antigravity profiles?",
+        true,
+    )? {
+        println!("No configuration was created.");
+        return Ok(None);
+    }
+    let config = Config::create_default(path)?;
+    println!("Created {}", path.display());
+    Ok(Some(config))
 }
 
 fn read_non_empty_prompt() -> Result<String, ReadlineError> {
@@ -461,5 +474,31 @@ mod tests {
             Err(AppError::Io(source)) if source.kind() == io::ErrorKind::Interrupted
         ));
         assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn preserves_a_new_incompatible_configuration_without_asking_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "schema_version = 1\n").unwrap();
+        let newer = "schema_version = 2\n";
+        let path_for_prompt = path.clone();
+        let mut prompt_count = 0;
+        let mut ask = |prompt: &str, default: bool| {
+            prompt_count += 1;
+            assert_eq!(prompt_count, 1);
+            assert_eq!(prompt, "Recreate the incompatible configuration?");
+            assert!(!default);
+            fs::write(&path_for_prompt, newer).unwrap();
+            Ok(true)
+        };
+
+        assert!(
+            load_or_create_config_with(&path, &mut ask)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(prompt_count, 1);
+        assert_eq!(fs::read_to_string(path).unwrap(), newer);
     }
 }
