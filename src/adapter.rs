@@ -331,13 +331,28 @@ mod tests {
 
     #[test]
     fn identity_ignores_name_but_not_declared_execution_fields() {
-        let base = declaration(CliKind::Codex);
+        let mut base = declaration(CliKind::Codex);
+        base.args.push("second".to_owned());
         let mut renamed = base.clone();
         renamed.name = "Renamed".to_owned();
         assert_eq!(base.id().unwrap(), renamed.id().unwrap());
-        let mut changed = base.clone();
-        changed.args.push("x".to_owned());
-        assert_ne!(base.id().unwrap(), changed.id().unwrap());
+
+        let mut changed_cli = base.clone();
+        changed_cli.cli = CliKind::Claude;
+        let mut changed_executable = base.clone();
+        changed_executable.executable = Some("/custom/codex".into());
+        let mut changed_model = base.clone();
+        changed_model.model = Some("other-model".to_owned());
+        let mut reordered_args = base.clone();
+        reordered_args.args.reverse();
+        for changed in [
+            changed_cli,
+            changed_executable,
+            changed_model,
+            reordered_args,
+        ] {
+            assert_ne!(base.id().unwrap(), changed.id().unwrap());
+        }
     }
 
     #[test]
@@ -389,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cli_owned_arguments() {
+    fn rejects_invalid_profile_declarations() {
         for (cli, argument) in [
             (CliKind::Claude, "--print"),
             (CliKind::Codex, "--model=other"),
@@ -403,6 +418,21 @@ mod tests {
                 Err(ProfileValidationError::ReservedArgument { .. })
             ));
         }
+
+        for name in [" Padded", "Padded "] {
+            let mut padded = declaration(CliKind::Codex);
+            padded.name = name.to_owned();
+            assert!(matches!(
+                padded.validate(false),
+                Err(ProfileValidationError::PaddedName(_))
+            ));
+        }
+
+        let test = declaration(CliKind::Test);
+        assert!(matches!(
+            test.validate(false),
+            Err(ProfileValidationError::ReservedTestCli(_))
+        ));
     }
 
     fn hex(bytes: &[u8]) -> String {

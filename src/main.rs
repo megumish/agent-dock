@@ -176,24 +176,14 @@ async fn run() -> Result<i32, AppError> {
         }
     }
     let process_exit_code = outcome.process_exit_code();
-    let recorded_outcome = match &outcome {
-        ExecutionOutcome::Completed { exit_code, .. } => RecordedExecutionOutcome::Completed {
-            exit_code: *exit_code,
-        },
-        ExecutionOutcome::Cancelled { .. } => RecordedExecutionOutcome::Cancelled,
-    };
-    let elapsed = match &outcome {
-        ExecutionOutcome::Completed { elapsed, .. } | ExecutionOutcome::Cancelled { elapsed } => {
-            *elapsed
-        }
-    };
+    let (recorded_outcome, elapsed_ms) = recorded_execution_outcome(&outcome);
     let executed = Event::new(
         task_id,
         EventKind::Executed {
             profile: ProfileSnapshot::from(profile),
             working_directory,
             started_at,
-            elapsed_ms: elapsed_millis(elapsed),
+            elapsed_ms,
             outcome: recorded_outcome,
             cost: None,
         },
@@ -608,6 +598,21 @@ fn elapsed_millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn recorded_execution_outcome(outcome: &ExecutionOutcome) -> (RecordedExecutionOutcome, u64) {
+    match outcome {
+        ExecutionOutcome::Completed { exit_code, elapsed } => (
+            RecordedExecutionOutcome::Completed {
+                exit_code: *exit_code,
+            },
+            elapsed_millis(*elapsed),
+        ),
+        ExecutionOutcome::Cancelled { elapsed } => (
+            RecordedExecutionOutcome::Cancelled,
+            elapsed_millis(*elapsed),
+        ),
+    }
+}
+
 fn failure_kind(error: &ExecutionError) -> FailureKind {
     match error {
         ExecutionError::Spawn { .. } => FailureKind::Spawn,
@@ -836,11 +841,29 @@ mod tests {
     }
 
     #[test]
-    fn safe_test_is_a_fixed_system_profile() {
-        let profile = safe_test_profile();
-        assert_eq!(profile.cli(), agent_dock::CliKind::Test);
-        assert_eq!(profile.id, "42d38cde-50a8-5024-9f12-d164e82adea6");
-        assert_eq!(profile.resolved_executable, PathBuf::from("/usr/bin/true"));
+    fn records_elapsed_reported_by_the_crew_member_execution() {
+        for (outcome, expected, expected_ms) in [
+            (
+                ExecutionOutcome::Completed {
+                    exit_code: Some(0),
+                    elapsed: std::time::Duration::from_millis(7),
+                },
+                RecordedExecutionOutcome::Completed { exit_code: Some(0) },
+                7,
+            ),
+            (
+                ExecutionOutcome::Cancelled {
+                    elapsed: std::time::Duration::from_millis(11),
+                },
+                RecordedExecutionOutcome::Cancelled,
+                11,
+            ),
+        ] {
+            assert_eq!(
+                recorded_execution_outcome(&outcome),
+                (expected, expected_ms)
+            );
+        }
     }
 
     #[test]
@@ -1050,10 +1073,10 @@ mod tests {
     }
 
     #[test]
-    fn quotes_tag_names_in_scorecard_labels() {
+    fn renders_quoted_tag_names_and_missing_cost() {
         let score = SegmentScore {
             segment: Segment::Tag("review: \"strict\"".to_owned()),
-            execution_count: 0,
+            execution_count: 1,
             excluded_count: 0,
             acceptance: agent_dock::AcceptanceAxis::default(),
             duration: agent_dock::DurationAxis::default(),
@@ -1062,7 +1085,7 @@ mod tests {
 
         assert_eq!(
             render_segment(&score, Timestamp::now()),
-            "Tag \"review: \\\"strict\\\"\": No history"
+            "Tag \"review: \\\"strict\\\"\": Acceptance - (0/0) | Duration - (0) | Cost missing (0)"
         );
     }
 
