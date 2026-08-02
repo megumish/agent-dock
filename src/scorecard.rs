@@ -415,6 +415,10 @@ mod tests {
             (0, 2)
         );
         assert_eq!(
+            overall.acceptance.summary.latest_started_at,
+            Some(timestamp("2026-01-01T00:00:03Z"))
+        );
+        assert_eq!(
             (overall.duration.median_ms, overall.duration.summary.count),
             (None, 0)
         );
@@ -427,56 +431,76 @@ mod tests {
         let task_id = Uuid::now_v7();
         let cancelled = Uuid::now_v7();
         let missing_task_id = Uuid::now_v7();
+        let accepted_earlier = Uuid::now_v7();
         let accepted_without_task = Uuid::now_v7();
+        let later_rejected = Uuid::now_v7();
         let events = vec![
             task(task_id, "2026-01-01T00:00:00Z", &[]),
             execution(task_id, cancelled, "2026-01-01T00:00:01Z", 10, false),
             execution(
                 missing_task_id,
+                accepted_earlier,
+                "2026-01-01T00:00:00Z",
+                6,
+                true,
+            ),
+            judged(missing_task_id, accepted_earlier, Verdict::Accepted),
+            execution(
+                missing_task_id,
                 accepted_without_task,
                 "2026-01-01T00:00:02Z",
-                10,
+                14,
                 true,
             ),
             judged(missing_task_id, accepted_without_task, Verdict::Accepted),
+            execution(
+                missing_task_id,
+                later_rejected,
+                "2026-01-01T00:00:03Z",
+                100,
+                true,
+            ),
+            judged(missing_task_id, later_rejected, Verdict::Rejected),
         ];
         let projection = project(&events, &[safe_test_profile()], &[Segment::Overall]);
         let score = &projection.scorecards[0].scores[0];
-        assert_eq!(score.acceptance.summary.count, 1);
+        assert_eq!(score.acceptance.summary.count, 3);
+        assert_eq!(
+            score.acceptance.summary.latest_started_at,
+            Some(timestamp("2026-01-01T00:00:03Z"))
+        );
         assert_eq!(score.duration.median_ms, Some(10));
-        assert_eq!(score.duration.summary.count, 1);
+        assert_eq!(score.duration.summary.count, 2);
+        assert_eq!(
+            score.duration.summary.latest_started_at,
+            Some(timestamp("2026-01-01T00:00:02Z"))
+        );
         assert_eq!(score.excluded_count, 1);
         assert_eq!(score.cost.summary.count, 0);
+        assert_eq!(score.cost.summary.latest_started_at, None);
     }
 
     #[test]
-    fn rejects_snapshots_whose_declared_identity_does_not_match_id() {
-        let task_id = Uuid::now_v7();
-        let event_id = Uuid::now_v7();
-        let mut event = execution(task_id, event_id, "2026-01-01T00:00:00Z", 1, true);
-        let EventKind::Executed { profile, .. } = &mut event.kind else {
-            unreachable!()
-        };
-        profile.model = Some("changed".to_owned());
-        let projection = project(&[event], &[safe_test_profile()], &[Segment::Overall]);
-        assert_eq!(projection.scorecards[0].scores[0].execution_count, 0);
-        assert_eq!(projection.warnings.len(), 1);
-    }
-
-    #[test]
-    fn duplicate_current_profile_ids_consistently_use_the_first_profile() {
-        let first = safe_test_profile();
-        let mut duplicate = first.clone();
-        duplicate.declaration.model = Some("different".to_owned());
+    fn rejects_inconsistent_snapshot_or_current_profile_identity() {
         let task_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
         let event = execution(task_id, event_id, "2026-01-01T00:00:00Z", 1, true);
+        let mut inconsistent_snapshot = event.clone();
+        let EventKind::Executed { profile, .. } = &mut inconsistent_snapshot.kind else {
+            unreachable!()
+        };
+        profile.model = Some("changed".to_owned());
+        let mut inconsistent_current = safe_test_profile();
+        inconsistent_current.declaration.model = Some("changed".to_owned());
 
-        let projection = project(&[event], &[first, duplicate], &[Segment::Overall]);
-
-        assert_eq!(projection.scorecards.len(), 1);
-        assert_eq!(projection.scorecards[0].scores[0].execution_count, 1);
-        assert!(projection.warnings.is_empty());
+        for (event, current) in [
+            (inconsistent_snapshot, safe_test_profile()),
+            (event, inconsistent_current),
+        ] {
+            let projection = project(&[event], &[current], &[Segment::Overall]);
+            assert_eq!(projection.scorecards[0].scores[0].execution_count, 0);
+            assert_eq!(projection.warnings.len(), 1);
+        }
     }
 
     #[test]
@@ -511,13 +535,50 @@ mod tests {
     }
 
     #[test]
-    fn escapes_terminal_controls_and_limits_visible_tags() {
+    fn escapes_terminal_controls() {
         assert_eq!(
             escape_terminal("a\\\n\r\t\u{1b}雪"),
             "a\\\\\\n\\r\\t\\u{1b}雪"
         );
-        let tags: Vec<_> = (0..7).map(|index| format!("t{index}")).collect();
-        assert_eq!(segments_for_tags(&tags).len(), 8);
+    }
+
+    #[test]
+    fn builds_and_projects_tag_segments() {
+        for (tags, expected) in [
+            (
+                Vec::<String>::new(),
+                vec![Segment::Overall, Segment::Untagged],
+            ),
+            (
+                vec!["rust".to_owned(), "docs".to_owned(), "rust".to_owned()],
+                vec![
+                    Segment::Overall,
+                    Segment::Tag("rust".to_owned()),
+                    Segment::Tag("docs".to_owned()),
+                ],
+            ),
+        ] {
+            assert_eq!(segments_for_tags(&tags), expected);
+        }
+
+        let task_id = Uuid::now_v7();
+        let event_id = Uuid::now_v7();
+        let events = [
+            task(task_id, "2026-01-01T00:00:00Z", &[]),
+            execution(task_id, event_id, "2026-01-01T00:00:01Z", 1, true),
+        ];
+        let segments = [
+            Segment::Overall,
+            Segment::Untagged,
+            Segment::Tag("rust".to_owned()),
+        ];
+        let projection = project(&events, &[safe_test_profile()], &segments);
+        let counts: Vec<_> = projection.scorecards[0]
+            .scores
+            .iter()
+            .map(|score| score.execution_count)
+            .collect();
+        assert_eq!(counts, [1, 1, 0]);
     }
 
     #[test]

@@ -334,6 +334,23 @@ mod tests {
     }
 
     #[test]
+    fn installs_an_old_schema_log_for_migration_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("events.jsonl");
+        replace_with_scenario(&target, "old-schema").unwrap();
+
+        let history = EventLog::new(target).read_all().unwrap();
+        assert!(history.events.is_empty());
+        assert!(matches!(
+            &history.skipped_lines[..],
+            [agent_dock::SkippedLine {
+                reason: agent_dock::SkippedLineReason::UnsupportedSchema { found, .. },
+                ..
+            }] if found == "0.0.1"
+        ));
+    }
+
+    #[test]
     fn backs_up_existing_log_before_installing() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("events.jsonl");
