@@ -61,7 +61,8 @@ fn collect_evidence(previous_revision: &str, target_revision: &str) -> Result<()
             &target_commit,
             "--",
             "DESIGN.md",
-            &release_document,
+            "README.md",
+            "docs/releases",
         ],
     )?);
 
