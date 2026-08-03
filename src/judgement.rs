@@ -36,16 +36,18 @@ pub fn judgement_candidates(events: &[Event]) -> Vec<JudgementCandidate> {
             else {
                 return None;
             };
-            matches!(outcome, RecordedExecutionOutcome::Completed { .. }).then(|| {
-                JudgementCandidate {
-                    execution_event_id: event.event_id,
-                    task_id: event.task_id,
-                    started_at: *started_at,
-                    profile: profile.clone(),
-                    outcome: outcome.clone(),
-                    tags: task_tags.get(&event.task_id).cloned().unwrap_or_default(),
-                    current_verdict: verdicts.get(&event.event_id).copied(),
-                }
+            matches!(
+                outcome,
+                RecordedExecutionOutcome::Completed { .. } | RecordedExecutionOutcome::Cancelled
+            )
+            .then(|| JudgementCandidate {
+                execution_event_id: event.event_id,
+                task_id: event.task_id,
+                started_at: *started_at,
+                profile: profile.clone(),
+                outcome: outcome.clone(),
+                tags: task_tags.get(&event.task_id).cloned().unwrap_or_default(),
+                current_verdict: verdicts.get(&event.event_id).copied(),
             })
         })
         .collect();
@@ -108,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_only_completed_executions_newest_first_with_current_verdict() {
+    fn lists_completed_and_cancelled_executions_newest_first_with_current_verdict() {
         let older_task = Uuid::now_v7();
         let newer_task = Uuid::now_v7();
         let mut older = executed(
@@ -122,6 +124,7 @@ mod tests {
         older.event_id = Uuid::now_v7();
         newer.event_id = Uuid::now_v7();
         let cancelled = executed(older_task, RecordedExecutionOutcome::Cancelled);
+        let cancelled_id = cancelled.event_id;
         let failed = executed(
             older_task,
             RecordedExecutionOutcome::Failed {
@@ -160,12 +163,15 @@ mod tests {
 
         let candidates = judgement_candidates(&events);
 
-        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates.len(), 3);
         assert_eq!(candidates[0].execution_event_id, newer.event_id);
         assert_eq!(candidates[0].current_verdict, None);
-        assert_eq!(candidates[1].execution_event_id, older.event_id);
-        assert_eq!(candidates[1].tags, ["rust"]);
-        assert_eq!(candidates[1].current_verdict, Some(Verdict::Accepted));
+        assert_eq!(candidates[1].execution_event_id, cancelled_id);
+        assert_eq!(candidates[1].outcome, RecordedExecutionOutcome::Cancelled);
+        assert_eq!(candidates[1].current_verdict, None);
+        assert_eq!(candidates[2].execution_event_id, older.event_id);
+        assert_eq!(candidates[2].tags, ["rust"]);
+        assert_eq!(candidates[2].current_verdict, Some(Verdict::Accepted));
     }
 
     #[test]
