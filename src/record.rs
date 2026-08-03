@@ -190,6 +190,13 @@ pub enum BackupEventLogOutcome {
     Changed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendJudgementOutcome {
+    Appended,
+    CurrentVerdictChanged { current: Option<Verdict> },
+    ExecutionMissing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventLog {
     path: PathBuf,
@@ -212,6 +219,50 @@ impl EventLog {
 
     pub fn append(&self, event: &Event) -> Result<(), RecordError> {
         let _lock = FileLock::acquire(self.open_lock_file()?, libc::LOCK_EX, &self.lock_path())?;
+        self.append_unlocked(event)
+    }
+
+    pub fn append_judgement_if_current(
+        &self,
+        execution_event_id: Uuid,
+        expected_current: Option<Verdict>,
+        verdict: Verdict,
+    ) -> Result<AppendJudgementOutcome, RecordError> {
+        let _lock = FileLock::acquire(self.open_lock_file()?, libc::LOCK_EX, &self.lock_path())?;
+        let history = self.read_all_unlocked()?;
+        let Some(task_id) = history.events.iter().find_map(|event| {
+            (event.event_id == execution_event_id
+                && matches!(event.kind, EventKind::Executed { .. }))
+            .then_some(event.task_id)
+        }) else {
+            return Ok(AppendJudgementOutcome::ExecutionMissing);
+        };
+        let current = history.events.iter().fold(None, |current, event| {
+            if let EventKind::Judged {
+                execution_event_id: target,
+                verdict,
+            } = event.kind
+                && target == execution_event_id
+            {
+                Some(verdict)
+            } else {
+                current
+            }
+        });
+        if current != expected_current {
+            return Ok(AppendJudgementOutcome::CurrentVerdictChanged { current });
+        }
+        self.append_unlocked(&Event::new(
+            task_id,
+            EventKind::Judged {
+                execution_event_id,
+                verdict,
+            },
+        ))?;
+        Ok(AppendJudgementOutcome::Appended)
+    }
+
+    fn append_unlocked(&self, event: &Event) -> Result<(), RecordError> {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -233,6 +284,10 @@ impl EventLog {
 
     pub fn read_all(&self) -> Result<ReadEvents, RecordError> {
         let _lock = FileLock::acquire(self.open_lock_file()?, libc::LOCK_SH, &self.lock_path())?;
+        self.read_all_unlocked()
+    }
+
+    fn read_all_unlocked(&self) -> Result<ReadEvents, RecordError> {
         let file = match File::open(&self.path) {
             Ok(file) => file,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -497,6 +552,146 @@ mod tests {
                 prompt_chars: prompt.map_or(0, |value| value.chars().count()),
             },
         )
+    }
+
+    fn completed_execution(task_id: Uuid) -> Event {
+        Event::new(
+            task_id,
+            EventKind::Executed {
+                profile: ProfileSnapshot {
+                    id: "test-default".to_owned(),
+                    name: "Safe test".to_owned(),
+                    cli: CliKind::Test,
+                    executable_override: None,
+                    model: None,
+                    args: Vec::new(),
+                    resolved_executable: PathBuf::from("/usr/bin/true"),
+                },
+                working_directory: PathBuf::from("/tmp/project"),
+                started_at: Timestamp::now(),
+                elapsed_ms: 10,
+                outcome: RecordedExecutionOutcome::Completed { exit_code: Some(0) },
+                cost: None,
+            },
+        )
+    }
+
+    #[test]
+    fn conditionally_appends_a_judgement_while_preserving_the_log_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        let execution = completed_execution(Uuid::now_v7());
+        let prior = Event::new(
+            execution.task_id,
+            EventKind::Judged {
+                execution_event_id: execution.event_id,
+                verdict: Verdict::Rejected,
+            },
+        );
+        log.append(&execution).unwrap();
+        log.append(&prior).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        assert_eq!(
+            log.append_judgement_if_current(
+                execution.event_id,
+                Some(Verdict::Rejected),
+                Verdict::Accepted,
+            )
+            .unwrap(),
+            AppendJudgementOutcome::Appended
+        );
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&original));
+        let events = log.read_all().unwrap().events;
+        assert_eq!(&events[..2], &[execution.clone(), prior]);
+        assert!(matches!(
+            events[2].kind,
+            EventKind::Judged {
+                execution_event_id,
+                verdict: Verdict::Accepted,
+            } if execution_event_id == execution.event_id
+        ));
+    }
+
+    #[test]
+    fn conditional_judgement_reports_stale_or_missing_targets_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        assert_eq!(
+            log.append_judgement_if_current(Uuid::now_v7(), None, Verdict::Accepted)
+                .unwrap(),
+            AppendJudgementOutcome::ExecutionMissing
+        );
+        let execution = completed_execution(Uuid::now_v7());
+        log.append(&execution).unwrap();
+        log.append(&Event::new(
+            execution.task_id,
+            EventKind::Judged {
+                execution_event_id: execution.event_id,
+                verdict: Verdict::Accepted,
+            },
+        ))
+        .unwrap();
+        let original = fs::read(&path).unwrap();
+
+        assert_eq!(
+            log.append_judgement_if_current(execution.event_id, None, Verdict::Rejected)
+                .unwrap(),
+            AppendJudgementOutcome::CurrentVerdictChanged {
+                current: Some(Verdict::Accepted)
+            }
+        );
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn only_one_concurrent_judgement_can_match_the_same_expected_verdict() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = Arc::new(EventLog::new(directory.path().join("events.jsonl")));
+        let execution = completed_execution(Uuid::now_v7());
+        log.append(&execution).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for verdict in [Verdict::Accepted, Verdict::Rejected] {
+            let log = log.clone();
+            let barrier = barrier.clone();
+            let execution_event_id = execution.event_id;
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                log.append_judgement_if_current(execution_event_id, None, verdict)
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == AppendJudgementOutcome::Appended)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| {
+                    matches!(
+                        outcome,
+                        AppendJudgementOutcome::CurrentVerdictChanged { current: Some(_) }
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(log.read_all().unwrap().events.len(), 2);
     }
 
     #[test]
