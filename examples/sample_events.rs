@@ -15,7 +15,7 @@ use uuid::Uuid;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scenario = scenario_argument(std::env::args().skip(1))?;
     let target = default_events_path()?;
-    eprintln!("WARNING: this replaces the active 0.1.0-alpha.3 event log with synthetic data.");
+    eprintln!("WARNING: this replaces the active 0.1.0-alpha.4 event log with synthetic data.");
     eprintln!("Stop every agent-dock process before continuing.");
     let backup = replace_with_scenario(&target, &scenario)?;
     println!("Installed `{scenario}` at `{}`.", target.display());

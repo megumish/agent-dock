@@ -128,8 +128,9 @@ async fn run_task() -> Result<i32, AppError> {
             let profile = &available[selected];
             print_execution_summary(profile, prompt, &working_directory);
             let confirmation = confirm_run()?;
-            if let Some(notice) = run_confirmation_notice(confirmation) {
-                println!("{notice}");
+            if let Some((warning, transition)) = run_confirmation_notice(confirmation) {
+                eprintln!("Warning: {warning}");
+                println!("{transition}");
             }
             resolve_run_confirmation(
                 prompt,
@@ -676,9 +677,9 @@ fn resolve_task_with_editable_tags<T>(
     }
 }
 
-fn run_confirmation_notice(confirmation: RunConfirmation) -> Option<&'static str> {
+fn run_confirmation_notice(confirmation: RunConfirmation) -> Option<(&'static str, &'static str)> {
     (confirmation == RunConfirmation::Edit)
-        .then_some("Task was not run. Returning to task definition.")
+        .then_some(("Task was not run.", "Returning to task definition..."))
 }
 
 fn resolve_run_confirmation<T>(
@@ -1352,7 +1353,7 @@ mod tests {
     fn declined_run_announces_return_to_task_definition() {
         assert_eq!(
             run_confirmation_notice(RunConfirmation::Edit),
-            Some("Task was not run. Returning to task definition.")
+            Some(("Task was not run.", "Returning to task definition..."))
         );
         assert_eq!(run_confirmation_notice(RunConfirmation::Run), None);
     }
