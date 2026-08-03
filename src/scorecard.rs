@@ -470,6 +470,38 @@ mod tests {
     }
 
     #[test]
+    fn judged_cancelled_executions_affect_acceptance_but_not_duration() {
+        let task_id = Uuid::now_v7();
+        let completed = Uuid::now_v7();
+        let cancelled = Uuid::now_v7();
+        let events = vec![
+            task(task_id, "2026-01-01T00:00:00Z", &[]),
+            execution(task_id, completed, "2026-01-01T00:00:01Z", 20, true),
+            judged(task_id, completed, Verdict::Accepted),
+            execution(task_id, cancelled, "2026-01-01T00:00:02Z", 30, false),
+            judged(task_id, cancelled, Verdict::Accepted),
+        ];
+
+        let projection = project(&events, &[safe_test_profile()], &[Segment::Overall]);
+        let score = &projection.scorecards[0].scores[0];
+
+        assert_eq!(score.execution_count, 2);
+        assert_eq!(score.acceptance.summary.count, 2);
+        assert_eq!(score.acceptance.accepted, 2);
+        assert_eq!(
+            score.acceptance.summary.latest_started_at,
+            Some(timestamp("2026-01-01T00:00:02Z"))
+        );
+        assert_eq!(score.duration.summary.count, 1);
+        assert_eq!(score.duration.median_ms, Some(20));
+        assert_eq!(
+            score.duration.summary.latest_started_at,
+            Some(timestamp("2026-01-01T00:00:01Z"))
+        );
+        assert_eq!(score.excluded_count, 0);
+    }
+
+    #[test]
     fn rejects_inconsistent_snapshot_or_current_profile_identity() {
         let task_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
