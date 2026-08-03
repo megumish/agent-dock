@@ -93,11 +93,16 @@ async fn run_task() -> Result<i32, AppError> {
         );
     }
     let tag_candidates = collect_tag_candidates(&config.tag_candidates, &history.events);
-    let mut editor = DefaultEditor::new()?;
-    let prompt = read_non_empty_prompt(&mut editor, None)?;
-    let (prompt, (task_id, selected)) = resolve_task_with_preserved_tags(
+    let mut prompt_editor = DefaultEditor::new()?;
+    let mut tag_editor = DefaultEditor::new()?;
+    let prompt = read_non_empty_prompt(&mut prompt_editor, None)?;
+    let tags = read_tags(&mut tag_editor, &tag_candidates, None)?;
+    let (prompt, (task_id, selected)) = resolve_task_with_editable_tags(
         prompt,
-        || read_tags(&tag_candidates).map_err(AppError::from),
+        tags,
+        |initial| {
+            read_tags(&mut tag_editor, &tag_candidates, Some(initial)).map_err(AppError::from)
+        },
         |prompt, tags| {
             let prompt_approved = if config.record_prompt {
                 confirm("Record this task prompt?", true)?
@@ -122,11 +127,14 @@ async fn run_task() -> Result<i32, AppError> {
             let profile = &available[selected];
             print_execution_summary(profile, prompt, &working_directory);
             let confirmation = confirm_run()?;
+            if let Some(notice) = run_confirmation_notice(confirmation) {
+                println!("{notice}");
+            }
             resolve_run_confirmation(
                 prompt,
                 confirmation,
                 &mut |initial| {
-                    read_non_empty_prompt(&mut editor, Some(initial)).map_err(AppError::from)
+                    read_non_empty_prompt(&mut prompt_editor, Some(initial)).map_err(AppError::from)
                 },
                 || {
                     let task_id = Uuid::now_v7();
@@ -630,18 +638,26 @@ enum RunResolution<T> {
     Run(T),
 }
 
-fn resolve_task_with_preserved_tags<T>(
+fn resolve_task_with_editable_tags<T>(
     mut prompt: String,
-    read_tags: impl FnOnce() -> Result<Vec<String>, AppError>,
+    mut tags: Vec<String>,
+    mut edit_tags: impl FnMut(&[String]) -> Result<Vec<String>, AppError>,
     mut attempt: impl FnMut(&str, &[String]) -> Result<RunResolution<T>, AppError>,
 ) -> Result<(String, T), AppError> {
-    let tags = read_tags()?;
     loop {
         match attempt(&prompt, &tags)? {
-            RunResolution::Edit(edited) => prompt = edited,
+            RunResolution::Edit(edited) => {
+                prompt = edited;
+                tags = edit_tags(&tags)?;
+            }
             RunResolution::Run(approved) => return Ok((prompt, approved)),
         }
     }
+}
+
+fn run_confirmation_notice(confirmation: RunConfirmation) -> Option<&'static str> {
+    (confirmation == RunConfirmation::Edit)
+        .then_some("Task was not run. Returning to task definition.")
 }
 
 fn resolve_run_confirmation<T>(
@@ -798,14 +814,26 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-fn read_tags(candidates: &[String]) -> io::Result<Vec<String>> {
+fn read_tags(
+    editor: &mut DefaultEditor,
+    candidates: &[String],
+    initial: Option<&[String]>,
+) -> Result<Vec<String>, ReadlineError> {
     if !candidates.is_empty() {
         println!("Tag candidates:");
         for (index, candidate) in candidates.iter().enumerate() {
             println!("  {}. {}", index + 1, escape_terminal(candidate));
         }
     }
-    let input = read_line("Tags (comma-separated, blank for unclassified):")?;
+    let input = if let Some(initial) = initial {
+        let initial = initial.join(", ");
+        editor.readline_with_initial(
+            "Tags (comma-separated, blank for unclassified): ",
+            (&initial, ""),
+        )?
+    } else {
+        editor.readline("Tags (comma-separated, blank for unclassified): ")?
+    };
     Ok(parse_tags(&input, candidates))
 }
 
@@ -1259,29 +1287,42 @@ mod tests {
     }
 
     #[test]
-    fn task_retries_read_tags_once_and_preserve_them() {
-        let mut tag_reads = 0;
+    fn task_retries_offer_previous_tags_for_editing() {
+        let mut tag_edits = 0;
         let mut attempts = 0;
-        let (prompt, approved) = resolve_task_with_preserved_tags(
+        let (prompt, approved) = resolve_task_with_editable_tags(
             "first task".to_owned(),
-            || {
-                tag_reads += 1;
-                Ok(vec!["rust".to_owned(), "review".to_owned()])
+            vec!["rust".to_owned(), "review".to_owned()],
+            |initial| {
+                tag_edits += 1;
+                Ok(match tag_edits {
+                    1 => {
+                        assert_eq!(initial, ["rust", "review"]);
+                        vec!["docs".to_owned()]
+                    }
+                    2 => {
+                        assert_eq!(initial, ["docs"]);
+                        vec!["docs".to_owned(), "review".to_owned()]
+                    }
+                    _ => panic!("tags must only be edited after a declined run"),
+                })
             },
             |prompt, tags| {
                 attempts += 1;
-                assert_eq!(tags, ["rust", "review"]);
                 Ok(match attempts {
                     1 => {
                         assert_eq!(prompt, "first task");
+                        assert_eq!(tags, ["rust", "review"]);
                         RunResolution::Edit("second task".to_owned())
                     }
                     2 => {
                         assert_eq!(prompt, "second task");
+                        assert_eq!(tags, ["docs"]);
                         RunResolution::Edit("approved task".to_owned())
                     }
                     3 => {
                         assert_eq!(prompt, "approved task");
+                        assert_eq!(tags, ["docs", "review"]);
                         RunResolution::Run("approved")
                     }
                     _ => panic!("task must finish after the third attempt"),
@@ -1292,8 +1333,17 @@ mod tests {
 
         assert_eq!(prompt, "approved task");
         assert_eq!(approved, "approved");
-        assert_eq!(tag_reads, 1);
+        assert_eq!(tag_edits, 2);
         assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn declined_run_announces_return_to_task_definition() {
+        assert_eq!(
+            run_confirmation_notice(RunConfirmation::Edit),
+            Some("Task was not run. Returning to task definition.")
+        );
+        assert_eq!(run_confirmation_notice(RunConfirmation::Run), None);
     }
 
     #[test]
