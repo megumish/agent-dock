@@ -10,7 +10,7 @@ use std::{
 };
 
 use agent_dock::{
-    AppendJudgementOutcome, BackupEventLogOutcome, Config, ConfigError, EVENT_FORMAT_VERSION,
+    AppendJudgementOutcome, BackupEventLogOutcome, Config, ConfigError, EVENT_SCHEMA_VERSION,
     Event, EventKind, EventLog, ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionProfile,
     ExecutionRequest, FailureKind, JudgementCandidate, OutputSource, ProfileDeclaration,
     ProfileSnapshot, ReadEvents, RecordedExecutionOutcome, ReplaceConfigOutcome, Segment,
@@ -30,7 +30,6 @@ const ACCEPT_RESULT_DEFAULT: bool = true;
 async fn main() -> ExitCode {
     match run().await {
         Ok(code) => ExitCode::from(normalize_exit_code(code)),
-        Err(AppError::IncompatibleEventLogDeclined) => ExitCode::SUCCESS,
         Err(error) if error.is_interrupted() => {
             eprintln!("agent-dock: cancelled");
             ExitCode::from(130)
@@ -229,7 +228,7 @@ async fn run_task() -> Result<i32, AppError> {
     let execution_event_id = executed.event_id;
     event_log.append(&executed)?;
 
-    if matches!(outcome, ExecutionOutcome::Cancelled { .. }) {
+    if !should_ask_immediate_judgement(&outcome) {
         return Ok(process_exit_code);
     }
 
@@ -286,71 +285,119 @@ fn command_from_args(
 fn print_usage() {
     println!("Usage: agent-dock [judge]");
     println!("\nCommands:");
-    println!("  judge  Append a new judgement to a completed execution");
+    println!("  judge  Append a new judgement to a completed or cancelled execution");
 }
 
 fn judge() -> Result<i32, AppError> {
     let event_log = EventLog::new(default_events_path()?);
     let history = read_event_history(&event_log)?;
     print_skipped_event_warnings(&history);
+    let resolution = resolve_judgement_with(
+        &event_log,
+        |candidates| {
+            println!("Choose an execution:");
+            for (index, candidate) in candidates.iter().enumerate() {
+                println!("  {}. {}", index + 1, render_judgement_candidate(candidate));
+            }
+            choose_judgement_candidate(candidates.len()).map_err(AppError::from)
+        },
+        || read_verdict().map_err(AppError::from),
+        |candidate, verdict| {
+            println!("Selected: {}", render_judgement_candidate(candidate));
+            confirm(
+                &format!(
+                    "Append {} judgement to execution {}?",
+                    verdict_label(verdict),
+                    candidate.execution_event_id
+                ),
+                false,
+            )
+            .map_err(AppError::from)
+        },
+        |previous, current| {
+            eprintln!(
+                "The current judgement changed from {} to {}; please confirm again.",
+                optional_verdict_label(previous),
+                optional_verdict_label(current)
+            );
+        },
+    )?;
+    match resolution {
+        JudgementResolution::NoCandidates => {
+            println!("No completed or cancelled executions are available to judge.");
+        }
+        JudgementResolution::Quit => {}
+        JudgementResolution::Declined => println!("No judgement was recorded."),
+        JudgementResolution::Appended {
+            execution_event_id,
+            verdict,
+        } => println!(
+            "Recorded {} for execution {}.",
+            verdict_label(verdict),
+            execution_event_id
+        ),
+    }
+    Ok(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JudgementResolution {
+    NoCandidates,
+    Quit,
+    Declined,
+    Appended {
+        execution_event_id: Uuid,
+        verdict: Verdict,
+    },
+}
+
+fn resolve_judgement_with(
+    event_log: &EventLog,
+    mut choose: impl FnMut(&[JudgementCandidate]) -> Result<Option<usize>, AppError>,
+    mut read_new_verdict: impl FnMut() -> Result<Option<Verdict>, AppError>,
+    mut confirm_append: impl FnMut(&JudgementCandidate, Verdict) -> Result<bool, AppError>,
+    mut judgement_changed: impl FnMut(Option<Verdict>, Option<Verdict>),
+) -> Result<JudgementResolution, AppError> {
+    let history = read_event_history(event_log)?;
     let candidates = judgement_candidates(&history.events);
     if candidates.is_empty() {
-        println!("No completed executions are available to judge.");
-        return Ok(0);
+        return Ok(JudgementResolution::NoCandidates);
     }
-
-    println!("Choose a completed execution:");
-    for (index, candidate) in candidates.iter().enumerate() {
-        println!("  {}. {}", index + 1, render_judgement_candidate(candidate));
-    }
-    let Some(selected) = choose_judgement_candidate(candidates.len())? else {
-        return Ok(0);
+    let Some(selected) = choose(&candidates)? else {
+        return Ok(JudgementResolution::Quit);
     };
-    let execution_event_id = candidates[selected].execution_event_id;
-    let Some(verdict) = read_verdict()? else {
-        return Ok(0);
+    let execution_event_id = candidates
+        .get(selected)
+        .ok_or_else(|| AppError::Usage("selected execution is out of range".to_owned()))?
+        .execution_event_id;
+    let Some(verdict) = read_new_verdict()? else {
+        return Ok(JudgementResolution::Quit);
     };
 
     loop {
-        let latest = read_event_history(&event_log)?;
+        let latest = read_event_history(event_log)?;
         let Some(candidate) = judgement_candidates(&latest.events)
             .into_iter()
             .find(|candidate| candidate.execution_event_id == execution_event_id)
         else {
             return Err(AppError::ExecutionNoLongerAvailable(execution_event_id));
         };
-        println!("Selected: {}", render_judgement_candidate(&candidate));
-        if !confirm(
-            &format!(
-                "Append {} judgement to execution {}?",
-                verdict_label(verdict),
-                execution_event_id
-            ),
-            false,
-        )? {
-            println!("No judgement was recorded.");
-            return Ok(0);
+        if !confirm_append(&candidate, verdict)? {
+            return Ok(JudgementResolution::Declined);
         }
-
         match event_log.append_judgement_if_current(
             execution_event_id,
             candidate.current_verdict,
             verdict,
         )? {
             AppendJudgementOutcome::Appended => {
-                println!(
-                    "Recorded {} for execution {}.",
-                    verdict_label(verdict),
-                    execution_event_id
-                );
-                return Ok(0);
+                return Ok(JudgementResolution::Appended {
+                    execution_event_id,
+                    verdict,
+                });
             }
             AppendJudgementOutcome::CurrentVerdictChanged { current } => {
-                eprintln!(
-                    "The current judgement changed from {} to {}; please confirm again.",
-                    optional_verdict_label(candidate.current_verdict),
-                    optional_verdict_label(current)
-                );
+                judgement_changed(candidate.current_verdict, current);
             }
             AppendJudgementOutcome::ExecutionMissing => {
                 return Err(AppError::ExecutionNoLongerAvailable(execution_event_id));
@@ -545,49 +592,41 @@ fn load_or_create_config_with(
 }
 
 fn read_event_history(event_log: &EventLog) -> Result<ReadEvents, AppError> {
-    read_event_history_with(event_log, &mut confirm)
-}
-
-fn read_event_history_with(
-    event_log: &EventLog,
-    ask: &mut impl FnMut(&str, bool) -> io::Result<bool>,
-) -> Result<ReadEvents, AppError> {
-    let history = event_log.read_all()?;
-    let mut incompatible_count = 0;
-    let mut incompatible_formats = Vec::new();
-    for skipped in &history.skipped_lines {
-        if let SkippedLineReason::UnsupportedFormat { found, .. } = &skipped.reason {
-            incompatible_count += 1;
-            if !incompatible_formats.contains(found) {
-                incompatible_formats.push(found.clone());
+    loop {
+        let history = event_log.read_all()?;
+        let mut incompatible_count = 0;
+        let mut incompatible_versions = Vec::new();
+        for skipped in &history.skipped_lines {
+            if let SkippedLineReason::UnsupportedSchema { found, .. } = &skipped.reason {
+                incompatible_count += 1;
+                if !incompatible_versions.contains(found) {
+                    incompatible_versions.push(found.clone());
+                }
             }
         }
-    }
-    if incompatible_count == 0 {
-        return Ok(history);
-    }
-
-    eprintln!(
-        "Event log `{}` contains {incompatible_count} event(s) using format(s) {}; expected {EVENT_FORMAT_VERSION}.",
-        event_log.path().display(),
-        incompatible_formats.join(", ")
-    );
-    if !ask("Back up and clear the incompatible event log?", false)? {
-        eprintln!("Event log was not changed.");
-        return Err(AppError::IncompatibleEventLogDeclined);
-    }
-    match event_log.backup_and_delete_if_unchanged(&history)? {
-        BackupEventLogOutcome::BackedUpAndDeleted { backup_path } => {
-            eprintln!(
-                "Warning: backed up incompatible event log to `{}` and cleared `{}`.",
-                backup_path.display(),
-                event_log.path().display()
-            );
-            Ok(ReadEvents::default())
+        if incompatible_count == 0 {
+            return Ok(history);
         }
-        BackupEventLogOutcome::Changed => {
-            eprintln!("Event log changed while waiting for confirmation; it was not changed.");
-            Err(AppError::IncompatibleEventLogDeclined)
+
+        eprintln!(
+            "Warning: event log `{}` contains {} event(s) using schema version(s) {}; expected {}.",
+            event_log.path().display(),
+            incompatible_count,
+            incompatible_versions.join(", "),
+            EVENT_SCHEMA_VERSION
+        );
+        match event_log.backup_and_delete_if_unchanged(&history)? {
+            BackupEventLogOutcome::BackedUpAndDeleted { backup_path } => {
+                eprintln!(
+                    "Warning: backed up incompatible event log to `{}` and deleted `{}`.",
+                    backup_path.display(),
+                    event_log.path().display()
+                );
+                return Ok(ReadEvents::default());
+            }
+            BackupEventLogOutcome::Changed => {
+                eprintln!("Event log changed before backup; reloading it.");
+            }
         }
     }
 }
@@ -922,6 +961,10 @@ fn recorded_execution_outcome(outcome: &ExecutionOutcome) -> (RecordedExecutionO
     }
 }
 
+fn should_ask_immediate_judgement(outcome: &ExecutionOutcome) -> bool {
+    matches!(outcome, ExecutionOutcome::Completed { .. })
+}
+
 fn failure_kind(error: &ExecutionError) -> FailureKind {
     match error {
         ExecutionError::Spawn { .. } => FailureKind::Spawn,
@@ -1044,8 +1087,6 @@ enum AppError {
     Readline(#[from] ReadlineError),
     #[error("no configured agent CLI is available")]
     NoAvailableProfiles,
-    #[error("incompatible event log was not changed")]
-    IncompatibleEventLogDeclined,
     #[error("{0}")]
     Usage(String),
     #[error("execution {0} is no longer available")]
@@ -1086,6 +1127,23 @@ mod tests {
         }
     }
 
+    fn judgement_execution() -> Event {
+        let candidate = judgement_candidate();
+        let mut execution = Event::new(
+            candidate.task_id,
+            EventKind::Executed {
+                profile: candidate.profile,
+                working_directory: PathBuf::from("/tmp/project"),
+                started_at: candidate.started_at,
+                elapsed_ms: 100,
+                outcome: candidate.outcome,
+                cost: None,
+            },
+        );
+        execution.event_id = candidate.execution_event_id;
+        execution
+    }
+
     fn old_event() -> Event {
         let mut event = Event::new(
             Uuid::now_v7(),
@@ -1095,7 +1153,7 @@ mod tests {
                 prompt_chars: 1,
             },
         );
-        event.format_version = "old".to_owned();
+        event.schema_version = "old".to_owned();
         event
     }
 
@@ -1144,10 +1202,133 @@ mod tests {
     }
 
     #[test]
+    fn judgement_flow_cancels_without_recording_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        assert_eq!(
+            resolve_judgement_with(
+                &log,
+                |_| panic!("an empty history must not ask for a selection"),
+                || panic!("an empty history must not ask for a verdict"),
+                |_, _| panic!("an empty history must not ask for confirmation"),
+                |_, _| panic!("an empty history cannot have a stale judgement"),
+            )
+            .unwrap(),
+            JudgementResolution::NoCandidates
+        );
+
+        log.append(&judgement_execution()).unwrap();
+        assert_eq!(
+            resolve_judgement_with(
+                &log,
+                |_| Ok(None),
+                || panic!("quitting selection must not ask for a verdict"),
+                |_, _| panic!("quitting selection must not ask for confirmation"),
+                |_, _| panic!("quitting selection cannot have a stale judgement"),
+            )
+            .unwrap(),
+            JudgementResolution::Quit
+        );
+        assert_eq!(
+            resolve_judgement_with(
+                &log,
+                |_| Ok(Some(0)),
+                || Ok(None),
+                |_, _| panic!("quitting verdict input must not ask for confirmation"),
+                |_, _| panic!("quitting verdict input cannot have a stale judgement"),
+            )
+            .unwrap(),
+            JudgementResolution::Quit
+        );
+        assert_eq!(
+            resolve_judgement_with(
+                &log,
+                |_| Ok(Some(0)),
+                || Ok(Some(Verdict::Accepted)),
+                |_, _| Ok(false),
+                |_, _| panic!("declining confirmation cannot have a stale judgement"),
+            )
+            .unwrap(),
+            JudgementResolution::Declined
+        );
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::UnexpectedEof] {
+            let error = resolve_judgement_with(
+                &log,
+                |_| Ok(Some(0)),
+                || Ok(Some(Verdict::Accepted)),
+                |_, _| Err(AppError::Io(io::Error::new(kind, "stopped"))),
+                |_, _| panic!("interrupted confirmation cannot have a stale judgement"),
+            )
+            .unwrap_err();
+            assert!(matches!(error, AppError::Io(source) if source.kind() == kind));
+        }
+        assert_eq!(log.read_all().unwrap().events.len(), 1);
+    }
+
+    #[test]
+    fn judgement_flow_reconfirms_a_concurrently_changed_verdict() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let execution = judgement_execution();
+        let execution_event_id = execution.event_id;
+        log.append(&execution).unwrap();
+        let mut confirmed = Vec::new();
+        let mut changes = Vec::new();
+
+        let resolution = resolve_judgement_with(
+            &log,
+            |_| Ok(Some(0)),
+            || Ok(Some(Verdict::Rejected)),
+            |candidate, _| {
+                confirmed.push(candidate.current_verdict);
+                if confirmed.len() == 1 {
+                    log.append(&Event::new(
+                        candidate.task_id,
+                        EventKind::Judged {
+                            execution_event_id,
+                            verdict: Verdict::Accepted,
+                        },
+                    ))?;
+                }
+                Ok(true)
+            },
+            |previous, current| changes.push((previous, current)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution,
+            JudgementResolution::Appended {
+                execution_event_id,
+                verdict: Verdict::Rejected
+            }
+        );
+        assert_eq!(confirmed, [None, Some(Verdict::Accepted)]);
+        assert_eq!(changes, [(None, Some(Verdict::Accepted))]);
+        let events = log.read_all().unwrap().events;
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[2].kind,
+            EventKind::Judged {
+                execution_event_id: target,
+                verdict: Verdict::Rejected,
+            } if target == execution_event_id
+        ));
+    }
+
+    #[test]
     fn renders_identifying_execution_fields_without_terminal_controls() {
         assert_eq!(
             render_judgement_candidate(&judgement_candidate()),
             "0198a8e2-9a80-7000-8000-000000000001 | 2026-08-01T01:02:03Z | Historical\\nProfile [test; model\\tname; profile-id] | completed with exit code 2 | tags: rust\\nreview | current: rejected"
+        );
+    }
+
+    #[test]
+    fn identifies_cancelled_executions_in_the_judgement_list() {
+        assert_eq!(
+            execution_outcome_label(&RecordedExecutionOutcome::Cancelled),
+            "cancelled"
         );
     }
 
@@ -1187,10 +1368,9 @@ mod tests {
     }
 
     #[test]
-    fn declining_run_preserves_tags_without_recording_events() {
+    fn declining_run_records_no_events() {
         let directory = tempfile::tempdir().unwrap();
         let log = EventLog::new(directory.path().join("events.jsonl"));
-        let tags = vec!["rust".to_owned(), "review".to_owned()];
         let mut ask = |prompt: &str, default: bool| {
             assert_eq!(prompt, "Run this task?");
             assert!(default);
@@ -1207,7 +1387,7 @@ mod tests {
                     &log,
                     task_received_event(
                         Uuid::now_v7(),
-                        tags.clone(),
+                        Vec::new(),
                         "do not run",
                         false,
                         false,
@@ -1233,7 +1413,7 @@ mod tests {
                     &log,
                     task_received_event(
                         Uuid::now_v7(),
-                        tags.clone(),
+                        Vec::new(),
                         "try another task",
                         false,
                         false,
@@ -1249,39 +1429,6 @@ mod tests {
 
         assert_eq!(edited, "run this instead");
         assert!(log.read_all().unwrap().events.is_empty());
-
-        let mut no_edit = |_: &str| -> Result<String, AppError> {
-            panic!("an approved task must not return to editing")
-        };
-        let task_id = Uuid::now_v7();
-        let approved =
-            resolve_run_confirmation(&edited, RunConfirmation::Run, &mut no_edit, || {
-                record_approved_task(
-                    &log,
-                    task_received_event(
-                        task_id,
-                        tags.clone(),
-                        &edited,
-                        false,
-                        false,
-                        Timestamp::now(),
-                    ),
-                    "test-default",
-                )?;
-                Ok(task_id)
-            })
-            .unwrap();
-
-        assert_eq!(approved, RunResolution::Run(task_id));
-        let events = log.read_all().unwrap().events;
-        let EventKind::TaskReceived {
-            tags: recorded_tags,
-            ..
-        } = &events[0].kind
-        else {
-            panic!("first event must be task_received")
-        };
-        assert_eq!(recorded_tags, &tags);
     }
 
     #[test]
@@ -1347,6 +1494,29 @@ mod tests {
         assert_eq!(approved, "approved");
         assert_eq!(tag_edits, 2);
         assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn tag_editing_propagates_interrupts_and_end_of_input() {
+        for interrupted in [true, false] {
+            let result = resolve_task_with_editable_tags(
+                "edit this".to_owned(),
+                vec!["rust".to_owned()],
+                |_| {
+                    Err(AppError::Readline(if interrupted {
+                        ReadlineError::Interrupted
+                    } else {
+                        ReadlineError::Eof
+                    }))
+                },
+                |_, _| Ok(RunResolution::<()>::Edit("edited".to_owned())),
+            );
+            assert!(matches!(
+                (result, interrupted),
+                (Err(AppError::Readline(ReadlineError::Interrupted)), true)
+                    | (Err(AppError::Readline(ReadlineError::Eof)), false)
+            ));
+        }
     }
 
     #[test]
@@ -1465,12 +1635,27 @@ mod tests {
     }
 
     #[test]
-    fn recreates_an_incompatible_configuration_only_after_confirmation() {
+    fn cancelled_executions_skip_the_immediate_judgement() {
+        assert!(!should_ask_immediate_judgement(
+            &ExecutionOutcome::Cancelled {
+                elapsed: std::time::Duration::from_millis(1),
+            }
+        ));
+        assert!(should_ask_immediate_judgement(
+            &ExecutionOutcome::Completed {
+                exit_code: Some(0),
+                elapsed: std::time::Duration::from_millis(1),
+            }
+        ));
+    }
+
+    #[test]
+    fn replaces_an_incompatible_configuration_with_the_selected_prompt_policy() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         fs::write(&path, "schema_version = \"old\"\n").unwrap();
         let mut ask = |prompt: &str, default: bool| {
-            assert_eq!(prompt, "Recreate the incompatible configuration?");
+            assert_eq!(prompt, "Allow full task prompts to be recorded?");
             assert!(!default);
             Ok(true)
         };
@@ -1479,47 +1664,27 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(!config.record_prompt);
+        assert!(config.record_prompt);
         assert_eq!(Config::load(&path).unwrap(), config);
     }
 
     #[test]
-    fn preserves_an_incompatible_configuration_if_confirmation_is_interrupted() {
+    fn preserves_an_incompatible_configuration_if_prompt_policy_input_is_interrupted() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         let original = "schema_version = \"old\"\n";
         fs::write(&path, original).unwrap();
         let mut ask = |_: &str, _: bool| {
             Err(io::Error::new(
-                io::ErrorKind::Interrupted,
+                io::ErrorKind::UnexpectedEof,
                 "test interruption",
             ))
         };
 
         assert!(matches!(
             load_or_create_config_with(&path, &mut ask),
-            Err(AppError::Io(source)) if source.kind() == io::ErrorKind::Interrupted
+            Err(AppError::Io(source)) if source.kind() == io::ErrorKind::UnexpectedEof
         ));
-        assert_eq!(fs::read_to_string(path).unwrap(), original);
-    }
-
-    #[test]
-    fn preserves_an_incompatible_configuration_if_recreation_is_declined() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        let original = "schema_version = \"old\"\n";
-        fs::write(&path, original).unwrap();
-        let mut ask = |prompt: &str, default: bool| {
-            assert_eq!(prompt, "Recreate the incompatible configuration?");
-            assert!(!default);
-            Ok(false)
-        };
-
-        assert!(
-            load_or_create_config_with(&path, &mut ask)
-                .unwrap()
-                .is_none()
-        );
         assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
@@ -1562,12 +1727,7 @@ mod tests {
             serde_json::to_string(&old_event()).unwrap()
         );
         fs::write(&path, &original).unwrap();
-        let mut ask = |prompt: &str, default: bool| {
-            assert_eq!(prompt, "Back up and clear the incompatible event log?");
-            assert!(!default);
-            Ok(true)
-        };
-        let history = read_event_history_with(&EventLog::new(&path), &mut ask).unwrap();
+        let history = read_event_history(&EventLog::new(&path)).unwrap();
 
         assert_eq!(history, ReadEvents::default());
         assert!(!path.exists());
@@ -1586,55 +1746,11 @@ mod tests {
     }
 
     #[test]
-    fn preserves_an_incompatible_event_log_if_recreation_is_declined() {
+    fn keeps_a_log_containing_only_an_invalid_event() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        let original = serde_json::to_string(&old_event()).unwrap() + "\n";
-        fs::write(&path, &original).unwrap();
-        let mut ask = |prompt: &str, default: bool| {
-            assert_eq!(prompt, "Back up and clear the incompatible event log?");
-            assert!(!default);
-            Ok(false)
-        };
-
-        assert!(matches!(
-            read_event_history_with(&EventLog::new(&path), &mut ask),
-            Err(AppError::IncompatibleEventLogDeclined)
-        ));
-        assert_eq!(fs::read_to_string(path).unwrap(), original);
-    }
-
-    #[test]
-    fn preserves_an_incompatible_event_log_if_confirmation_is_interrupted() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("events.jsonl");
-        let original = serde_json::to_string(&old_event()).unwrap() + "\n";
-        fs::write(&path, &original).unwrap();
-        let mut ask = |_: &str, _: bool| {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "test interruption",
-            ))
-        };
-
-        assert!(matches!(
-            read_event_history_with(&EventLog::new(&path), &mut ask),
-            Err(AppError::Io(source)) if source.kind() == io::ErrorKind::Interrupted
-        ));
-        assert_eq!(fs::read_to_string(path).unwrap(), original);
-    }
-
-    #[test]
-    fn keeps_a_log_containing_only_an_invalid_current_format_event() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("events.jsonl");
-        fs::write(
-            &path,
-            format!("{{\"format_version\":{EVENT_FORMAT_VERSION:?}}}\n"),
-        )
-        .unwrap();
-        let mut ask = |_: &str, _: bool| panic!("invalid events do not require confirmation");
-        let history = read_event_history_with(&EventLog::new(&path), &mut ask).unwrap();
+        fs::write(&path, "{}\n").unwrap();
+        let history = read_event_history(&EventLog::new(&path)).unwrap();
 
         assert!(matches!(
             &history.skipped_lines[0].reason,

@@ -617,6 +617,7 @@ mod tests {
         assert!(bytes.starts_with(&original));
         let events = log.read_all().unwrap().events;
         assert_eq!(&events[..2], &[execution.clone(), prior]);
+        assert_eq!(events[2].task_id, execution.task_id);
         assert!(matches!(
             events[2].kind,
             EventKind::Judged {
