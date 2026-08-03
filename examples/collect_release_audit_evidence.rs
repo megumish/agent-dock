@@ -128,8 +128,10 @@ fn collect_tests(repo_root: &Path, revision: &str) -> Result<BTreeSet<String>, S
             Some(repo_root),
             &["file", "show", "-r", revision, source_file],
         )?;
-        for test_name in extract_test_names(&source) {
-            tests.insert(format!("{source_file}::{test_name}"));
+        for test_name in extract_test_names(&source)
+            .map_err(|error| format!("failed to parse {source_file}: {error}"))?
+        {
+            insert_test_identifier(&mut tests, source_file, &test_name)?;
         }
     }
     Ok(tests)
@@ -142,33 +144,58 @@ fn is_test_source(path: &str) -> bool {
             .any(|prefix| path.starts_with(prefix))
 }
 
-fn extract_test_names(source: &str) -> Vec<String> {
-    let mut pending_test = false;
+fn insert_test_identifier(
+    tests: &mut BTreeSet<String>,
+    source_file: &str,
+    test_name: &str,
+) -> Result<(), String> {
+    let identifier = format!("{source_file}::{test_name}");
+    if !tests.insert(identifier.clone()) {
+        return Err(format!(
+            "duplicate test identifier cannot be compared safely: {identifier}"
+        ));
+    }
+    Ok(())
+}
+
+fn extract_test_names(source: &str) -> Result<Vec<String>, syn::Error> {
+    let file = syn::parse_file(source)?;
     let mut names = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("#[test]") || trimmed.starts_with("#[tokio::test]") {
-            pending_test = true;
-            continue;
-        }
-        if !pending_test {
-            continue;
-        }
-        let Some(function) = line.find("fn ") else {
-            continue;
-        };
-        let rest = &line[function + 3..];
-        let name_length = rest
-            .bytes()
-            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-            .count();
-        let name = &rest[..name_length];
-        if !name.is_empty() && rest[name_length..].trim_start().starts_with('(') {
-            names.push(name.to_owned());
-            pending_test = false;
+    collect_item_tests(&file.items, &mut Vec::new(), &mut names);
+    Ok(names)
+}
+
+fn collect_item_tests(items: &[syn::Item], modules: &mut Vec<String>, names: &mut Vec<String>) {
+    for item in items {
+        match item {
+            syn::Item::Fn(function) if function.attrs.iter().any(is_test_attribute) => {
+                let function_name = function.sig.ident.to_string();
+                names.push(if modules.is_empty() {
+                    function_name
+                } else {
+                    format!("{}::{function_name}", modules.join("::"))
+                });
+            }
+            syn::Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    modules.push(module.ident.to_string());
+                    collect_item_tests(items, modules, names);
+                    modules.pop();
+                }
+            }
+            _ => {}
         }
     }
-    names
+}
+
+fn is_test_attribute(attribute: &syn::Attribute) -> bool {
+    let segments: Vec<_> = attribute
+        .path()
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    segments == ["test"] || segments == ["tokio", "test"]
 }
 
 fn run_jj(current_dir: Option<&Path>, arguments: &[&str]) -> Result<String, String> {
@@ -209,23 +236,47 @@ mod tests {
         assert!(is_test_source("benches/score.rs"));
         assert!(!is_test_source("build.rs"));
         assert!(!is_test_source("src/data.json"));
+        assert!(is_test_source("examples/collect_release_audit_evidence.rs"));
         assert!(!is_test_source(".agents/skills/example.rs"));
     }
 
     #[test]
-    fn extracts_standard_and_tokio_test_names() {
-        let source = r#"
-            #[test]
-            fn standard_test() {}
+    fn extracts_module_qualified_tests_without_reading_string_contents() {
+        let source = r##"
+            const EXAMPLE: &str = "#[test]\nfn text_is_not_a_test() {}";
 
-            #[tokio::test]
-            async fn async_test() {}
+            mod first {
+                #[test]
+                fn same_name() {}
+            }
+
+            mod second {
+                #[test]
+                fn same_name() {}
+
+                #[tokio::test]
+                async fn async_test() {}
+            }
 
             fn helper() {}
-        "#;
+        "##;
         assert_eq!(
-            extract_test_names(source),
-            ["standard_test".to_owned(), "async_test".to_owned()]
+            extract_test_names(source).unwrap(),
+            [
+                "first::same_name".to_owned(),
+                "second::same_name".to_owned(),
+                "second::async_test".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_duplicate_test_identifiers() {
+        let mut tests = BTreeSet::new();
+        insert_test_identifier(&mut tests, "src/main.rs", "same_name").unwrap();
+        assert_eq!(
+            insert_test_identifier(&mut tests, "src/main.rs", "same_name").unwrap_err(),
+            "duplicate test identifier cannot be compared safely: src/main.rs::same_name"
         );
     }
 }

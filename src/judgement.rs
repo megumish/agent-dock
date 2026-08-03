@@ -119,7 +119,7 @@ mod tests {
         );
         let mut newer = executed(
             newer_task,
-            RecordedExecutionOutcome::Completed { exit_code: Some(2) },
+            RecordedExecutionOutcome::Completed { exit_code: None },
         );
         older.event_id = Uuid::now_v7();
         newer.event_id = Uuid::now_v7();
@@ -165,6 +165,10 @@ mod tests {
 
         assert_eq!(candidates.len(), 3);
         assert_eq!(candidates[0].execution_event_id, newer.event_id);
+        assert_eq!(
+            candidates[0].outcome,
+            RecordedExecutionOutcome::Completed { exit_code: None }
+        );
         assert_eq!(candidates[0].current_verdict, None);
         assert_eq!(candidates[1].execution_event_id, cancelled_id);
         assert_eq!(candidates[1].outcome, RecordedExecutionOutcome::Cancelled);

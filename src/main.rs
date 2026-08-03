@@ -1313,11 +1313,16 @@ mod tests {
     }
 
     #[test]
-    fn identifies_cancelled_executions_in_the_judgement_list() {
-        assert_eq!(
-            execution_outcome_label(&RecordedExecutionOutcome::Cancelled),
-            "cancelled"
-        );
+    fn identifies_cancelled_and_unknown_exit_executions_in_the_judgement_list() {
+        for (outcome, expected) in [
+            (RecordedExecutionOutcome::Cancelled, "cancelled"),
+            (
+                RecordedExecutionOutcome::Completed { exit_code: None },
+                "completed with unknown exit code",
+            ),
+        ] {
+            assert_eq!(execution_outcome_label(&outcome), expected);
+        }
     }
 
     #[test]
