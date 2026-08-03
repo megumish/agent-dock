@@ -78,61 +78,59 @@ async fn run() -> Result<i32, AppError> {
     }
     let tag_candidates = collect_tag_candidates(&config.tag_candidates, &history.events);
     let mut editor = DefaultEditor::new()?;
-    let mut prompt = read_non_empty_prompt(&mut editor, None)?;
-    let (task_id, selected) = loop {
-        let tags = read_tags(&tag_candidates)?;
-        let prompt_approved = if config.record_prompt {
-            confirm("Record this task prompt?", true)?
-        } else {
-            false
-        };
-        let all_segments = segments_for_tags(&tags);
-        let score_segments = visible_segments(&all_segments);
-        let hidden_tags = all_segments.len() - score_segments.len();
-        let fresh_history = read_event_history(&event_log)?;
-        let projection = project(&fresh_history.events, &available, &score_segments);
-        for warning in &projection.warnings {
-            eprintln!("Warning: {}", escape_terminal(warning));
-        }
-        let choices = render_profile_choices(
-            &available,
-            &projection.scorecards,
-            hidden_tags,
-            Timestamp::now(),
-        );
-        let selected = choose_profile(&choices)?;
-        let profile = &available[selected];
-        print_execution_summary(profile, &prompt, &working_directory);
-        let confirmation = confirm_run()?;
-        match resolve_run_confirmation(
-            &prompt,
-            confirmation,
-            &mut |initial| {
-                read_non_empty_prompt(&mut editor, Some(initial)).map_err(AppError::from)
-            },
-            || {
-                let task_id = Uuid::now_v7();
-                record_approved_task(
-                    &event_log,
-                    task_received_event(
-                        task_id,
-                        tags,
-                        &prompt,
-                        config.record_prompt,
-                        prompt_approved,
-                        Timestamp::now(),
-                    ),
-                    &profile.id,
-                )?;
-                Ok((task_id, selected))
-            },
-        )? {
-            RunResolution::Edit(edited) => {
-                prompt = edited;
+    let prompt = read_non_empty_prompt(&mut editor, None)?;
+    let (prompt, (task_id, selected)) = resolve_task_with_preserved_tags(
+        prompt,
+        || read_tags(&tag_candidates).map_err(AppError::from),
+        |prompt, tags| {
+            let prompt_approved = if config.record_prompt {
+                confirm("Record this task prompt?", true)?
+            } else {
+                false
+            };
+            let all_segments = segments_for_tags(tags);
+            let score_segments = visible_segments(&all_segments);
+            let hidden_tags = all_segments.len() - score_segments.len();
+            let fresh_history = read_event_history(&event_log)?;
+            let projection = project(&fresh_history.events, &available, &score_segments);
+            for warning in &projection.warnings {
+                eprintln!("Warning: {}", escape_terminal(warning));
             }
-            RunResolution::Run(approved) => break approved,
-        }
-    };
+            let choices = render_profile_choices(
+                &available,
+                &projection.scorecards,
+                hidden_tags,
+                Timestamp::now(),
+            );
+            let selected = choose_profile(&choices)?;
+            let profile = &available[selected];
+            print_execution_summary(profile, prompt, &working_directory);
+            let confirmation = confirm_run()?;
+            resolve_run_confirmation(
+                prompt,
+                confirmation,
+                &mut |initial| {
+                    read_non_empty_prompt(&mut editor, Some(initial)).map_err(AppError::from)
+                },
+                || {
+                    let task_id = Uuid::now_v7();
+                    record_approved_task(
+                        &event_log,
+                        task_received_event(
+                            task_id,
+                            tags.to_vec(),
+                            prompt,
+                            config.record_prompt,
+                            prompt_approved,
+                            Timestamp::now(),
+                        ),
+                        &profile.id,
+                    )?;
+                    Ok((task_id, selected))
+                },
+            )
+        },
+    )?;
     let profile = &available[selected];
 
     let (cancellation_sender, cancellation_receiver) = oneshot::channel();
@@ -401,6 +399,20 @@ fn confirm_run_with(
 enum RunResolution<T> {
     Edit(String),
     Run(T),
+}
+
+fn resolve_task_with_preserved_tags<T>(
+    mut prompt: String,
+    read_tags: impl FnOnce() -> Result<Vec<String>, AppError>,
+    mut attempt: impl FnMut(&str, &[String]) -> Result<RunResolution<T>, AppError>,
+) -> Result<(String, T), AppError> {
+    let tags = read_tags()?;
+    loop {
+        match attempt(&prompt, &tags)? {
+            RunResolution::Edit(edited) => prompt = edited,
+            RunResolution::Run(approved) => return Ok((prompt, approved)),
+        }
+    }
 }
 
 fn resolve_run_confirmation<T>(
@@ -825,9 +837,10 @@ mod tests {
     }
 
     #[test]
-    fn declining_run_returns_to_editing_without_recording_events() {
+    fn declining_run_preserves_tags_without_recording_events() {
         let directory = tempfile::tempdir().unwrap();
         let log = EventLog::new(directory.path().join("events.jsonl"));
+        let tags = vec!["rust".to_owned(), "review".to_owned()];
         let mut ask = |prompt: &str, default: bool| {
             assert_eq!(prompt, "Run this task?");
             assert!(default);
@@ -844,7 +857,7 @@ mod tests {
                     &log,
                     task_received_event(
                         Uuid::now_v7(),
-                        Vec::new(),
+                        tags.clone(),
                         "do not run",
                         false,
                         false,
@@ -870,7 +883,7 @@ mod tests {
                     &log,
                     task_received_event(
                         Uuid::now_v7(),
-                        Vec::new(),
+                        tags.clone(),
                         "try another task",
                         false,
                         false,
@@ -886,6 +899,39 @@ mod tests {
 
         assert_eq!(edited, "run this instead");
         assert!(log.read_all().unwrap().events.is_empty());
+
+        let mut no_edit = |_: &str| -> Result<String, AppError> {
+            panic!("an approved task must not return to editing")
+        };
+        let task_id = Uuid::now_v7();
+        let approved =
+            resolve_run_confirmation(&edited, RunConfirmation::Run, &mut no_edit, || {
+                record_approved_task(
+                    &log,
+                    task_received_event(
+                        task_id,
+                        tags.clone(),
+                        &edited,
+                        false,
+                        false,
+                        Timestamp::now(),
+                    ),
+                    "test-default",
+                )?;
+                Ok(task_id)
+            })
+            .unwrap();
+
+        assert_eq!(approved, RunResolution::Run(task_id));
+        let events = log.read_all().unwrap().events;
+        let EventKind::TaskReceived {
+            tags: recorded_tags,
+            ..
+        } = &events[0].kind
+        else {
+            panic!("first event must be task_received")
+        };
+        assert_eq!(recorded_tags, &tags);
     }
 
     #[test]
@@ -900,6 +946,44 @@ mod tests {
             })
             .unwrap();
         assert_eq!(resolution, RunResolution::Run("approved"));
+    }
+
+    #[test]
+    fn task_retries_read_tags_once_and_preserve_them() {
+        let mut tag_reads = 0;
+        let mut attempts = 0;
+        let (prompt, approved) = resolve_task_with_preserved_tags(
+            "first task".to_owned(),
+            || {
+                tag_reads += 1;
+                Ok(vec!["rust".to_owned(), "review".to_owned()])
+            },
+            |prompt, tags| {
+                attempts += 1;
+                assert_eq!(tags, ["rust", "review"]);
+                Ok(match attempts {
+                    1 => {
+                        assert_eq!(prompt, "first task");
+                        RunResolution::Edit("second task".to_owned())
+                    }
+                    2 => {
+                        assert_eq!(prompt, "second task");
+                        RunResolution::Edit("approved task".to_owned())
+                    }
+                    3 => {
+                        assert_eq!(prompt, "approved task");
+                        RunResolution::Run("approved")
+                    }
+                    _ => panic!("task must finish after the third attempt"),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prompt, "approved task");
+        assert_eq!(approved, "approved");
+        assert_eq!(tag_reads, 1);
+        assert_eq!(attempts, 3);
     }
 
     #[test]
