@@ -10,7 +10,7 @@ use std::{
 };
 
 use agent_dock::{
-    AppendJudgementOutcome, BackupEventLogOutcome, Config, ConfigError, EVENT_SCHEMA_VERSION,
+    AppendJudgementOutcome, BackupEventLogOutcome, Config, ConfigError, EVENT_FORMAT_VERSION,
     Event, EventKind, EventLog, ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionProfile,
     ExecutionRequest, FailureKind, JudgementCandidate, OutputSource, ProfileDeclaration,
     ProfileSnapshot, ReadEvents, RecordedExecutionOutcome, ReplaceConfigOutcome, Segment,
@@ -30,6 +30,7 @@ const ACCEPT_RESULT_DEFAULT: bool = true;
 async fn main() -> ExitCode {
     match run().await {
         Ok(code) => ExitCode::from(normalize_exit_code(code)),
+        Err(AppError::IncompatibleEventLogDeclined) => ExitCode::SUCCESS,
         Err(error) if error.is_interrupted() => {
             eprintln!("agent-dock: cancelled");
             ExitCode::from(130)
@@ -592,41 +593,49 @@ fn load_or_create_config_with(
 }
 
 fn read_event_history(event_log: &EventLog) -> Result<ReadEvents, AppError> {
-    loop {
-        let history = event_log.read_all()?;
-        let mut incompatible_count = 0;
-        let mut incompatible_versions = Vec::new();
-        for skipped in &history.skipped_lines {
-            if let SkippedLineReason::UnsupportedSchema { found, .. } = &skipped.reason {
-                incompatible_count += 1;
-                if !incompatible_versions.contains(found) {
-                    incompatible_versions.push(found.clone());
-                }
-            }
-        }
-        if incompatible_count == 0 {
-            return Ok(history);
-        }
+    read_event_history_with(event_log, &mut confirm)
+}
 
-        eprintln!(
-            "Warning: event log `{}` contains {} event(s) using schema version(s) {}; expected {}.",
-            event_log.path().display(),
-            incompatible_count,
-            incompatible_versions.join(", "),
-            EVENT_SCHEMA_VERSION
-        );
-        match event_log.backup_and_delete_if_unchanged(&history)? {
-            BackupEventLogOutcome::BackedUpAndDeleted { backup_path } => {
-                eprintln!(
-                    "Warning: backed up incompatible event log to `{}` and deleted `{}`.",
-                    backup_path.display(),
-                    event_log.path().display()
-                );
-                return Ok(ReadEvents::default());
+fn read_event_history_with(
+    event_log: &EventLog,
+    ask: &mut impl FnMut(&str, bool) -> io::Result<bool>,
+) -> Result<ReadEvents, AppError> {
+    let history = event_log.read_all()?;
+    let mut incompatible_count = 0;
+    let mut incompatible_formats = Vec::new();
+    for skipped in &history.skipped_lines {
+        if let SkippedLineReason::UnsupportedFormat { found, .. } = &skipped.reason {
+            incompatible_count += 1;
+            if !incompatible_formats.contains(found) {
+                incompatible_formats.push(found.clone());
             }
-            BackupEventLogOutcome::Changed => {
-                eprintln!("Event log changed before backup; reloading it.");
-            }
+        }
+    }
+    if incompatible_count == 0 {
+        return Ok(history);
+    }
+
+    eprintln!(
+        "Event log `{}` contains {incompatible_count} event(s) using format(s) {}; expected {EVENT_FORMAT_VERSION}.",
+        event_log.path().display(),
+        incompatible_formats.join(", ")
+    );
+    if !ask("Back up and clear the incompatible event log?", false)? {
+        eprintln!("Event log was not changed.");
+        return Err(AppError::IncompatibleEventLogDeclined);
+    }
+    match event_log.backup_and_delete_if_unchanged(&history)? {
+        BackupEventLogOutcome::BackedUpAndDeleted { backup_path } => {
+            eprintln!(
+                "Warning: backed up incompatible event log to `{}` and cleared `{}`.",
+                backup_path.display(),
+                event_log.path().display()
+            );
+            Ok(ReadEvents::default())
+        }
+        BackupEventLogOutcome::Changed => {
+            eprintln!("Event log changed while waiting for confirmation; it was not changed.");
+            Err(AppError::IncompatibleEventLogDeclined)
         }
     }
 }
@@ -1087,6 +1096,8 @@ enum AppError {
     Readline(#[from] ReadlineError),
     #[error("no configured agent CLI is available")]
     NoAvailableProfiles,
+    #[error("incompatible event log was not changed")]
+    IncompatibleEventLogDeclined,
     #[error("{0}")]
     Usage(String),
     #[error("execution {0} is no longer available")]
@@ -1153,7 +1164,7 @@ mod tests {
                 prompt_chars: 1,
             },
         );
-        event.schema_version = "old".to_owned();
+        event.format_version = "old".to_owned();
         event
     }
 
@@ -1317,6 +1328,34 @@ mod tests {
     }
 
     #[test]
+    fn judgement_flow_reports_a_selected_execution_removed_before_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        let execution = judgement_execution();
+        let execution_event_id = execution.event_id;
+        log.append(&execution).unwrap();
+
+        let error = resolve_judgement_with(
+            &log,
+            |_| {
+                fs::remove_file(&path).unwrap();
+                Ok(Some(0))
+            },
+            || Ok(Some(Verdict::Accepted)),
+            |_, _| panic!("a removed execution must not ask for confirmation"),
+            |_, _| panic!("a removed execution has no changed verdict"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::ExecutionNoLongerAvailable(target) if target == execution_event_id
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn renders_identifying_execution_fields_without_terminal_controls() {
         assert_eq!(
             render_judgement_candidate(&judgement_candidate()),
@@ -1325,11 +1364,16 @@ mod tests {
     }
 
     #[test]
-    fn identifies_cancelled_executions_in_the_judgement_list() {
-        assert_eq!(
-            execution_outcome_label(&RecordedExecutionOutcome::Cancelled),
-            "cancelled"
-        );
+    fn identifies_cancelled_and_unknown_exit_executions_in_the_judgement_list() {
+        for (outcome, expected) in [
+            (RecordedExecutionOutcome::Cancelled, "cancelled"),
+            (
+                RecordedExecutionOutcome::Completed { exit_code: None },
+                "completed with unknown exit code",
+            ),
+        ] {
+            assert_eq!(execution_outcome_label(&outcome), expected);
+        }
     }
 
     #[test]
@@ -1497,6 +1541,63 @@ mod tests {
     }
 
     #[test]
+    fn records_only_the_edited_task_after_a_declined_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let task_id = Uuid::now_v7();
+        let mut attempts = 0;
+
+        let (prompt, approved_task_id) = resolve_task_with_editable_tags(
+            "original task".to_owned(),
+            vec!["original".to_owned()],
+            |initial| {
+                assert_eq!(initial, ["original"]);
+                Ok(vec!["edited".to_owned()])
+            },
+            |prompt, tags| {
+                attempts += 1;
+                match attempts {
+                    1 => {
+                        assert_eq!(prompt, "original task");
+                        assert_eq!(tags, ["original"]);
+                        Ok(RunResolution::Edit("edited task".to_owned()))
+                    }
+                    2 => {
+                        assert_eq!(prompt, "edited task");
+                        assert_eq!(tags, ["edited"]);
+                        record_approved_task(
+                            &log,
+                            task_received_event(
+                                task_id,
+                                tags.to_vec(),
+                                prompt,
+                                true,
+                                true,
+                                Timestamp::now(),
+                            ),
+                            "test-default",
+                        )?;
+                        Ok(RunResolution::Run(task_id))
+                    }
+                    _ => panic!("the edited task must be approved on the second attempt"),
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prompt, "edited task");
+        assert_eq!(approved_task_id, task_id);
+        let events = log.read_all().unwrap().events;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0].kind,
+            EventKind::TaskReceived { tags, prompt, .. }
+                if tags == &["edited"] && prompt.as_deref() == Some("edited task")
+        ));
+        assert!(matches!(events[1].kind, EventKind::Assigned { .. }));
+    }
+
+    #[test]
     fn tag_editing_propagates_interrupts_and_end_of_input() {
         for interrupted in [true, false] {
             let result = resolve_task_with_editable_tags(
@@ -1650,12 +1751,12 @@ mod tests {
     }
 
     #[test]
-    fn replaces_an_incompatible_configuration_with_the_selected_prompt_policy() {
+    fn recreates_an_incompatible_configuration_only_after_confirmation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         fs::write(&path, "schema_version = \"old\"\n").unwrap();
         let mut ask = |prompt: &str, default: bool| {
-            assert_eq!(prompt, "Allow full task prompts to be recorded?");
+            assert_eq!(prompt, "Recreate the incompatible configuration?");
             assert!(!default);
             Ok(true)
         };
@@ -1664,27 +1765,47 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(config.record_prompt);
+        assert!(!config.record_prompt);
         assert_eq!(Config::load(&path).unwrap(), config);
     }
 
     #[test]
-    fn preserves_an_incompatible_configuration_if_prompt_policy_input_is_interrupted() {
+    fn preserves_an_incompatible_configuration_if_confirmation_is_interrupted() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         let original = "schema_version = \"old\"\n";
         fs::write(&path, original).unwrap();
         let mut ask = |_: &str, _: bool| {
             Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
+                io::ErrorKind::Interrupted,
                 "test interruption",
             ))
         };
 
         assert!(matches!(
             load_or_create_config_with(&path, &mut ask),
-            Err(AppError::Io(source)) if source.kind() == io::ErrorKind::UnexpectedEof
+            Err(AppError::Io(source)) if source.kind() == io::ErrorKind::Interrupted
         ));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn preserves_an_incompatible_configuration_if_recreation_is_declined() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = "schema_version = \"old\"\n";
+        fs::write(&path, original).unwrap();
+        let mut ask = |prompt: &str, default: bool| {
+            assert_eq!(prompt, "Recreate the incompatible configuration?");
+            assert!(!default);
+            Ok(false)
+        };
+
+        assert!(
+            load_or_create_config_with(&path, &mut ask)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
@@ -1710,6 +1831,32 @@ mod tests {
     }
 
     #[test]
+    fn preserves_a_new_incompatible_configuration_without_asking_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "schema_version = \"old\"\n").unwrap();
+        let newer = "schema_version = \"changed\"\n";
+        let path_for_prompt = path.clone();
+        let mut prompt_count = 0;
+        let mut ask = |prompt: &str, default: bool| {
+            prompt_count += 1;
+            assert_eq!(prompt_count, 1);
+            assert_eq!(prompt, "Recreate the incompatible configuration?");
+            assert!(!default);
+            fs::write(&path_for_prompt, newer).unwrap();
+            Ok(true)
+        };
+
+        assert!(
+            load_or_create_config_with(&path, &mut ask)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(prompt_count, 1);
+        assert_eq!(fs::read_to_string(path).unwrap(), newer);
+    }
+
+    #[test]
     fn backs_up_a_mixed_incompatible_event_log_and_starts_with_empty_history() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
@@ -1727,7 +1874,12 @@ mod tests {
             serde_json::to_string(&old_event()).unwrap()
         );
         fs::write(&path, &original).unwrap();
-        let history = read_event_history(&EventLog::new(&path)).unwrap();
+        let mut ask = |prompt: &str, default: bool| {
+            assert_eq!(prompt, "Back up and clear the incompatible event log?");
+            assert!(!default);
+            Ok(true)
+        };
+        let history = read_event_history_with(&EventLog::new(&path), &mut ask).unwrap();
 
         assert_eq!(history, ReadEvents::default());
         assert!(!path.exists());
@@ -1746,11 +1898,55 @@ mod tests {
     }
 
     #[test]
-    fn keeps_a_log_containing_only_an_invalid_event() {
+    fn preserves_an_incompatible_event_log_if_recreation_is_declined() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        fs::write(&path, "{}\n").unwrap();
-        let history = read_event_history(&EventLog::new(&path)).unwrap();
+        let original = serde_json::to_string(&old_event()).unwrap() + "\n";
+        fs::write(&path, &original).unwrap();
+        let mut ask = |prompt: &str, default: bool| {
+            assert_eq!(prompt, "Back up and clear the incompatible event log?");
+            assert!(!default);
+            Ok(false)
+        };
+
+        assert!(matches!(
+            read_event_history_with(&EventLog::new(&path), &mut ask),
+            Err(AppError::IncompatibleEventLogDeclined)
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn preserves_an_incompatible_event_log_if_confirmation_is_interrupted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let original = serde_json::to_string(&old_event()).unwrap() + "\n";
+        fs::write(&path, &original).unwrap();
+        let mut ask = |_: &str, _: bool| {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "test interruption",
+            ))
+        };
+
+        assert!(matches!(
+            read_event_history_with(&EventLog::new(&path), &mut ask),
+            Err(AppError::Io(source)) if source.kind() == io::ErrorKind::Interrupted
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn keeps_a_log_containing_only_an_invalid_current_format_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        fs::write(
+            &path,
+            format!("{{\"format_version\":{EVENT_FORMAT_VERSION:?}}}\n"),
+        )
+        .unwrap();
+        let mut ask = |_: &str, _: bool| panic!("invalid events do not require confirmation");
+        let history = read_event_history_with(&EventLog::new(&path), &mut ask).unwrap();
 
         assert!(matches!(
             &history.skipped_lines[0].reason,
@@ -1866,30 +2062,5 @@ mod tests {
             collect_tag_candidates(&["configured".to_owned(), "shared".to_owned()], &[old, new]),
             ["configured", "shared", "new", "old"]
         );
-    }
-    #[test]
-    fn preserves_a_new_incompatible_configuration_without_asking_again() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        fs::write(&path, "schema_version = 1\n").unwrap();
-        let newer = "schema_version = 2\n";
-        let path_for_prompt = path.clone();
-        let mut prompt_count = 0;
-        let mut ask = |prompt: &str, default: bool| {
-            prompt_count += 1;
-            assert_eq!(prompt_count, 1);
-            assert_eq!(prompt, "Recreate the incompatible configuration?");
-            assert!(!default);
-            fs::write(&path_for_prompt, newer).unwrap();
-            Ok(true)
-        };
-
-        assert!(
-            load_or_create_config_with(&path, &mut ask)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(prompt_count, 1);
-        assert_eq!(fs::read_to_string(path).unwrap(), newer);
     }
 }
