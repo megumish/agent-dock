@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Dock Release Audit"
+  short_description: "Audit Agent Dock release readiness across docs, code, and tests"
+  default_prompt: "Use $audit-agent-dock-release to audit the next Agent Dock release against the previous tag."
