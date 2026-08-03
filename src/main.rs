@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     io::{self, Write},
     os::unix::fs::PermissionsExt,
@@ -10,12 +10,13 @@ use std::{
 };
 
 use agent_dock::{
-    BackupEventLogOutcome, Config, ConfigError, EVENT_FORMAT_VERSION, Event, EventKind, EventLog,
-    ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionProfile, ExecutionRequest,
-    FailureKind, OutputSource, ProfileDeclaration, ProfileSnapshot, ReadEvents,
-    RecordedExecutionOutcome, ReplaceConfigOutcome, Segment, SegmentScore, SkippedLineReason,
-    Verdict, default_config_path, default_events_path, escape_terminal, execute, format_acceptance,
-    format_duration, format_recency, project, safe_test_profile, segments_for_tags,
+    AppendJudgementOutcome, BackupEventLogOutcome, Config, ConfigError, EVENT_FORMAT_VERSION,
+    Event, EventKind, EventLog, ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionProfile,
+    ExecutionRequest, FailureKind, JudgementCandidate, OutputSource, ProfileDeclaration,
+    ProfileSnapshot, ReadEvents, RecordedExecutionOutcome, ReplaceConfigOutcome, Segment,
+    SegmentScore, SkippedLineReason, Verdict, default_config_path, default_events_path,
+    escape_terminal, execute, format_acceptance, format_duration, format_recency,
+    judgement_candidates, project, safe_test_profile, segments_for_tags,
 };
 use jiff::Timestamp;
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -29,9 +30,14 @@ const ACCEPT_RESULT_DEFAULT: bool = true;
 async fn main() -> ExitCode {
     match run().await {
         Ok(code) => ExitCode::from(normalize_exit_code(code)),
+        Err(AppError::IncompatibleEventLogDeclined) => ExitCode::SUCCESS,
         Err(error) if error.is_interrupted() => {
             eprintln!("agent-dock: cancelled");
             ExitCode::from(130)
+        }
+        Err(AppError::Usage(message)) => {
+            eprintln!("agent-dock: {message}");
+            ExitCode::from(2)
         }
         Err(error) => {
             eprintln!("agent-dock: {error}");
@@ -41,6 +47,17 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<i32, AppError> {
+    match command_from_args(std::env::args_os().skip(1))? {
+        AppCommand::Run => run_task().await,
+        AppCommand::Judge => judge(),
+        AppCommand::Help => {
+            print_usage();
+            Ok(0)
+        }
+    }
+}
+
+async fn run_task() -> Result<i32, AppError> {
     let config_path = default_config_path()?;
     let Some(config) = load_or_create_config(&config_path)? else {
         return Ok(0);
@@ -68,9 +85,7 @@ async fn run() -> Result<i32, AppError> {
 
     let working_directory = std::env::current_dir()?;
     let event_log = EventLog::new(default_events_path()?);
-    let Some(history) = read_event_history(&event_log)? else {
-        return Ok(0);
-    };
+    let history = read_event_history(&event_log)?;
     for skipped in &history.skipped_lines {
         eprintln!(
             "Warning: skipped event log line {}: {}",
@@ -93,9 +108,7 @@ async fn run() -> Result<i32, AppError> {
             let all_segments = segments_for_tags(tags);
             let score_segments = visible_segments(&all_segments);
             let hidden_tags = all_segments.len() - score_segments.len();
-            let Some(fresh_history) = read_event_history(&event_log)? else {
-                return Err(AppError::IncompatibleEventLogDeclined);
-            };
+            let fresh_history = read_event_history(&event_log)?;
             let projection = project(&fresh_history.events, &available, &score_segments);
             for warning in &projection.warnings {
                 eprintln!("Warning: {}", escape_terminal(warning));
@@ -232,6 +245,219 @@ async fn run() -> Result<i32, AppError> {
     Ok(process_exit_code)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppCommand {
+    Run,
+    Judge,
+    Help,
+}
+
+fn command_from_args(
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<AppCommand, AppError> {
+    let command = match arguments.next().as_deref() {
+        None => AppCommand::Run,
+        Some(command) if command == "judge" => AppCommand::Judge,
+        Some(command) if command == "-h" || command == "--help" => AppCommand::Help,
+        Some(command) => {
+            return Err(AppError::Usage(format!(
+                "unknown command `{}`\nUsage: agent-dock [judge]",
+                escape_terminal(&command.to_string_lossy())
+            )));
+        }
+    };
+    if arguments.next().is_some() {
+        return Err(AppError::Usage(
+            "too many arguments\nUsage: agent-dock [judge]".to_owned(),
+        ));
+    }
+    Ok(command)
+}
+
+fn print_usage() {
+    println!("Usage: agent-dock [judge]");
+    println!("\nCommands:");
+    println!("  judge  Append a new judgement to a completed execution");
+}
+
+fn judge() -> Result<i32, AppError> {
+    let event_log = EventLog::new(default_events_path()?);
+    let history = read_event_history(&event_log)?;
+    print_skipped_event_warnings(&history);
+    let candidates = judgement_candidates(&history.events);
+    if candidates.is_empty() {
+        println!("No completed executions are available to judge.");
+        return Ok(0);
+    }
+
+    println!("Choose a completed execution:");
+    for (index, candidate) in candidates.iter().enumerate() {
+        println!("  {}. {}", index + 1, render_judgement_candidate(candidate));
+    }
+    let Some(selected) = choose_judgement_candidate(candidates.len())? else {
+        return Ok(0);
+    };
+    let execution_event_id = candidates[selected].execution_event_id;
+    let Some(verdict) = read_verdict()? else {
+        return Ok(0);
+    };
+
+    loop {
+        let latest = read_event_history(&event_log)?;
+        let Some(candidate) = judgement_candidates(&latest.events)
+            .into_iter()
+            .find(|candidate| candidate.execution_event_id == execution_event_id)
+        else {
+            return Err(AppError::ExecutionNoLongerAvailable(execution_event_id));
+        };
+        println!("Selected: {}", render_judgement_candidate(&candidate));
+        if !confirm(
+            &format!(
+                "Append {} judgement to execution {}?",
+                verdict_label(verdict),
+                execution_event_id
+            ),
+            false,
+        )? {
+            println!("No judgement was recorded.");
+            return Ok(0);
+        }
+
+        match event_log.append_judgement_if_current(
+            execution_event_id,
+            candidate.current_verdict,
+            verdict,
+        )? {
+            AppendJudgementOutcome::Appended => {
+                println!(
+                    "Recorded {} for execution {}.",
+                    verdict_label(verdict),
+                    execution_event_id
+                );
+                return Ok(0);
+            }
+            AppendJudgementOutcome::CurrentVerdictChanged { current } => {
+                eprintln!(
+                    "The current judgement changed from {} to {}; please confirm again.",
+                    optional_verdict_label(candidate.current_verdict),
+                    optional_verdict_label(current)
+                );
+            }
+            AppendJudgementOutcome::ExecutionMissing => {
+                return Err(AppError::ExecutionNoLongerAvailable(execution_event_id));
+            }
+        }
+    }
+}
+
+fn print_skipped_event_warnings(history: &ReadEvents) {
+    for skipped in &history.skipped_lines {
+        eprintln!(
+            "Warning: skipped event log line {}: {}",
+            skipped.line_number,
+            escape_terminal(&skipped.reason.to_string())
+        );
+    }
+}
+
+fn render_judgement_candidate(candidate: &JudgementCandidate) -> String {
+    let model = candidate
+        .profile
+        .model
+        .as_deref()
+        .map(escape_terminal)
+        .unwrap_or_else(|| "default".to_owned());
+    let tags = if candidate.tags.is_empty() {
+        "untagged".to_owned()
+    } else {
+        candidate
+            .tags
+            .iter()
+            .map(|tag| escape_terminal(tag))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "{} | {} | {} [{}; {}; {}] | {} | tags: {} | current: {}",
+        candidate.execution_event_id,
+        candidate.started_at,
+        escape_terminal(&candidate.profile.name),
+        candidate.profile.cli,
+        model,
+        escape_terminal(&candidate.profile.id),
+        execution_outcome_label(&candidate.outcome),
+        tags,
+        optional_verdict_label(candidate.current_verdict),
+    )
+}
+
+fn execution_outcome_label(outcome: &RecordedExecutionOutcome) -> String {
+    match outcome {
+        RecordedExecutionOutcome::Completed {
+            exit_code: Some(code),
+        } => {
+            format!("completed with exit code {code}")
+        }
+        RecordedExecutionOutcome::Completed { exit_code: None } => {
+            "completed with unknown exit code".to_owned()
+        }
+        RecordedExecutionOutcome::Cancelled => "cancelled".to_owned(),
+        RecordedExecutionOutcome::Failed { failure_kind, .. } => {
+            format!("failed ({failure_kind:?})")
+        }
+    }
+}
+
+fn choose_judgement_candidate(count: usize) -> io::Result<Option<usize>> {
+    loop {
+        let input = read_line("Selection (q to quit):")?;
+        if input.trim().eq_ignore_ascii_case("q") {
+            return Ok(None);
+        }
+        if let Some(index) = parse_required_selection(&input, count) {
+            return Ok(Some(index));
+        }
+        eprintln!("Enter a number from 1 to {count}, or q to quit.");
+    }
+}
+
+fn parse_required_selection(input: &str, count: usize) -> Option<usize> {
+    let selected = input.trim().parse::<usize>().ok()?;
+    selected.checked_sub(1).filter(|index| *index < count)
+}
+
+fn read_verdict() -> io::Result<Option<Verdict>> {
+    loop {
+        let input = read_line("New judgement (accepted/rejected, q to quit):")?;
+        if input.trim().eq_ignore_ascii_case("q") {
+            return Ok(None);
+        }
+        if let Some(verdict) = parse_verdict(&input) {
+            return Ok(Some(verdict));
+        }
+        eprintln!("Enter accepted or rejected, or q to quit.");
+    }
+}
+
+fn parse_verdict(input: &str) -> Option<Verdict> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "a" | "accepted" => Some(Verdict::Accepted),
+        "r" | "rejected" => Some(Verdict::Rejected),
+        _ => None,
+    }
+}
+
+fn verdict_label(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Accepted => "accepted",
+        Verdict::Rejected => "rejected",
+    }
+}
+
+fn optional_verdict_label(verdict: Option<Verdict>) -> &'static str {
+    verdict.map_or("unjudged", verdict_label)
+}
+
 fn load_or_create_config(path: &Path) -> Result<Option<Config>, AppError> {
     load_or_create_config_with(path, &mut confirm)
 }
@@ -309,14 +535,14 @@ fn load_or_create_config_with(
     Ok(Some(config))
 }
 
-fn read_event_history(event_log: &EventLog) -> Result<Option<ReadEvents>, AppError> {
+fn read_event_history(event_log: &EventLog) -> Result<ReadEvents, AppError> {
     read_event_history_with(event_log, &mut confirm)
 }
 
 fn read_event_history_with(
     event_log: &EventLog,
     ask: &mut impl FnMut(&str, bool) -> io::Result<bool>,
-) -> Result<Option<ReadEvents>, AppError> {
+) -> Result<ReadEvents, AppError> {
     let history = event_log.read_all()?;
     let mut incompatible_count = 0;
     let mut incompatible_formats = Vec::new();
@@ -329,7 +555,7 @@ fn read_event_history_with(
         }
     }
     if incompatible_count == 0 {
-        return Ok(Some(history));
+        return Ok(history);
     }
 
     eprintln!(
@@ -339,7 +565,7 @@ fn read_event_history_with(
     );
     if !ask("Back up and clear the incompatible event log?", false)? {
         eprintln!("Event log was not changed.");
-        return Ok(None);
+        return Err(AppError::IncompatibleEventLogDeclined);
     }
     match event_log.backup_and_delete_if_unchanged(&history)? {
         BackupEventLogOutcome::BackedUpAndDeleted { backup_path } => {
@@ -348,11 +574,11 @@ fn read_event_history_with(
                 backup_path.display(),
                 event_log.path().display()
             );
-            Ok(Some(ReadEvents::default()))
+            Ok(ReadEvents::default())
         }
         BackupEventLogOutcome::Changed => {
             eprintln!("Event log changed while waiting for confirmation; it was not changed.");
-            Ok(None)
+            Err(AppError::IncompatibleEventLogDeclined)
         }
     }
 }
@@ -791,6 +1017,10 @@ enum AppError {
     NoAvailableProfiles,
     #[error("incompatible event log was not changed")]
     IncompatibleEventLogDeclined,
+    #[error("{0}")]
+    Usage(String),
+    #[error("execution {0} is no longer available")]
+    ExecutionNoLongerAvailable(Uuid),
 }
 
 impl AppError {
@@ -806,6 +1036,26 @@ impl AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn judgement_candidate() -> JudgementCandidate {
+        JudgementCandidate {
+            execution_event_id: Uuid::parse_str("0198a8e2-9a80-7000-8000-000000000001").unwrap(),
+            task_id: Uuid::parse_str("0198a8e2-9a80-7000-8000-000000000002").unwrap(),
+            started_at: "2026-08-01T01:02:03Z".parse().unwrap(),
+            profile: ProfileSnapshot {
+                id: "profile-id".to_owned(),
+                name: "Historical\nProfile".to_owned(),
+                cli: agent_dock::CliKind::Test,
+                executable_override: None,
+                model: Some("model\tname".to_owned()),
+                args: Vec::new(),
+                resolved_executable: PathBuf::from("/usr/bin/true"),
+            },
+            outcome: RecordedExecutionOutcome::Completed { exit_code: Some(2) },
+            tags: vec!["rust\nreview".to_owned()],
+            current_verdict: Some(Verdict::Rejected),
+        }
+    }
 
     fn old_event() -> Event {
         let mut event = Event::new(
@@ -825,6 +1075,51 @@ mod tests {
         assert!(!prompt_is_valid(""));
         assert!(!prompt_is_valid("  \t"));
         assert!(prompt_is_valid("do the work"));
+    }
+
+    #[test]
+    fn parses_commands_without_loading_the_execution_configuration() {
+        assert_eq!(command_from_args([].into_iter()).unwrap(), AppCommand::Run);
+        assert_eq!(
+            command_from_args([OsString::from("judge")].into_iter()).unwrap(),
+            AppCommand::Judge
+        );
+        assert_eq!(
+            command_from_args([OsString::from("--help")].into_iter()).unwrap(),
+            AppCommand::Help
+        );
+        assert!(matches!(
+            command_from_args([OsString::from("unknown")].into_iter()),
+            Err(AppError::Usage(message)) if message.contains("Usage: agent-dock [judge]")
+        ));
+        assert!(matches!(
+            command_from_args(
+                [OsString::from("judge"), OsString::from("extra")].into_iter()
+            ),
+            Err(AppError::Usage(message)) if message.contains("too many arguments")
+        ));
+    }
+
+    #[test]
+    fn parses_explicit_judgement_selections_and_verdicts() {
+        assert_eq!(parse_required_selection("1", 2), Some(0));
+        assert_eq!(parse_required_selection(" 2 ", 2), Some(1));
+        assert_eq!(parse_required_selection("", 2), None);
+        assert_eq!(parse_required_selection("0", 2), None);
+        assert_eq!(parse_required_selection("3", 2), None);
+        assert_eq!(parse_verdict("a"), Some(Verdict::Accepted));
+        assert_eq!(parse_verdict(" ACCEPTED "), Some(Verdict::Accepted));
+        assert_eq!(parse_verdict("r"), Some(Verdict::Rejected));
+        assert_eq!(parse_verdict("rejected"), Some(Verdict::Rejected));
+        assert_eq!(parse_verdict(""), None);
+    }
+
+    #[test]
+    fn renders_identifying_execution_fields_without_terminal_controls() {
+        assert_eq!(
+            render_judgement_candidate(&judgement_candidate()),
+            "0198a8e2-9a80-7000-8000-000000000001 | 2026-08-01T01:02:03Z | Historical\\nProfile [test; model\\tname; profile-id] | completed with exit code 2 | tags: rust\\nreview | current: rejected"
+        );
     }
 
     #[test]
@@ -1221,9 +1516,7 @@ mod tests {
             assert!(!default);
             Ok(true)
         };
-        let history = read_event_history_with(&EventLog::new(&path), &mut ask)
-            .unwrap()
-            .unwrap();
+        let history = read_event_history_with(&EventLog::new(&path), &mut ask).unwrap();
 
         assert_eq!(history, ReadEvents::default());
         assert!(!path.exists());
@@ -1253,11 +1546,10 @@ mod tests {
             Ok(false)
         };
 
-        assert!(
-            read_event_history_with(&EventLog::new(&path), &mut ask)
-                .unwrap()
-                .is_none()
-        );
+        assert!(matches!(
+            read_event_history_with(&EventLog::new(&path), &mut ask),
+            Err(AppError::IncompatibleEventLogDeclined)
+        ));
         assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
@@ -1291,9 +1583,7 @@ mod tests {
         )
         .unwrap();
         let mut ask = |_: &str, _: bool| panic!("invalid events do not require confirmation");
-        let history = read_event_history_with(&EventLog::new(&path), &mut ask)
-            .unwrap()
-            .unwrap();
+        let history = read_event_history_with(&EventLog::new(&path), &mut ask).unwrap();
 
         assert!(matches!(
             &history.skipped_lines[0].reason,

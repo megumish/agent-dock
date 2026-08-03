@@ -3,7 +3,10 @@ use std::collections::{HashMap, HashSet};
 use jiff::Timestamp;
 use uuid::Uuid;
 
-use crate::{Event, EventKind, ExecutionProfile, RecordedExecutionOutcome, Verdict};
+use crate::{
+    Event, EventKind, ExecutionProfile, RecordedExecutionOutcome, Verdict,
+    judgement::latest_verdicts,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Segment {
@@ -88,25 +91,10 @@ pub fn project(
 ) -> Projection {
     let mut projection = Projection::default();
     let mut task_tags: HashMap<Uuid, &[String]> = HashMap::new();
-    let execution_ids: HashSet<Uuid> = events
-        .iter()
-        .filter_map(|event| {
-            matches!(event.kind, EventKind::Executed { .. }).then_some(event.event_id)
-        })
-        .collect();
-    let mut verdicts = HashMap::new();
+    let verdicts = latest_verdicts(events);
     for event in events {
-        match &event.kind {
-            EventKind::TaskReceived { tags, .. } => {
-                task_tags.insert(event.task_id, tags);
-            }
-            EventKind::Judged {
-                execution_event_id,
-                verdict,
-            } if execution_ids.contains(execution_event_id) => {
-                verdicts.insert(*execution_event_id, *verdict);
-            }
-            _ => {}
+        if let EventKind::TaskReceived { tags, .. } = &event.kind {
+            task_tags.insert(event.task_id, tags);
         }
     }
 
