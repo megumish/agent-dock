@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "A locally controlled multi-agent dock"
 license = "MIT"
+exclude = [".claude/skills/"]
 
 # See DEPENDENCIES.md before adding or updating dependencies.
 [dependencies]
@@ -19,6 +20,7 @@ toml = "1.1"
 uuid = { version = "1", default-features = false, features = ["serde", "std", "v5", "v7"] }
 
 [dev-dependencies]
+syn = { version = "2.0.119", features = ["full"] }
 tempfile = "3"
 
 [[example]]
