@@ -24,7 +24,7 @@ jj diff --from <previous-commit> --to <target-commit>
 初期証拠は次のスクリプトで収集する。
 
 ```console
-.agents/skills/audit-agent-dock-release/scripts/collect-evidence.sh <previous-tag-or-commit> <target-revision>
+cargo run --quiet --example collect-release-audit-evidence -- <previous-tag-or-commit> <target-revision>
 ```
 
 ## 文書を監査する
