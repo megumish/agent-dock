@@ -24,3 +24,8 @@ tempfile = "3"
 [[example]]
 name = "sample_events"
 test = true
+
+[[example]]
+name = "collect-release-audit-evidence"
+path = ".agents/skills/audit-agent-dock-release/scripts/collect-evidence.rs"
+test = true
