@@ -42,11 +42,11 @@ DEPENDENCIES と AGENTS は、この具体化の順序とは別に、それぞ�
 1. [VISION.md](./VISION.md)
 2. [DESIGN.md](./DESIGN.md)
 3. [DEPENDENCIES.md](./DEPENDENCIES.md)
-4. [現在のリリース文書](./docs/releases/0.1.0-alpha.4.md)
+4. [現在のリリース文書](./docs/releases/0.1.0-alpha.5.md)
 
-## 0.1.0-alpha.4
+## 0.1.0-alpha.5
 
-0.1.0-alpha.4 は、一つのタスクを登録済みの実行プロファイルへ依頼し、評価イベントの記録、スコアカード、過去実行の判定追記を扱う対話型 CLI である。
+0.1.0-alpha.5 は、一つのタスクを登録済みの実行プロファイルへ依頼し、評価イベントの記録、スコアカード、過去実行の判定追記を扱う対話型 CLI である。
 Claude Code、Codex CLI、Gemini CLI、Antigravity CLI のヘッドレス実行を扱う。
 対応 OS は macOS に限り、ほかの OS での動作は保証しない。
 
@@ -57,8 +57,14 @@ mise install
 mise run
 ```
 
+過去実行へ受け入れ判定を追記する場合は、次のように起動する。
+
+```console
+mise run default -- -- judge
+```
+
 初回起動では、ユーザー設定ディレクトリに四つの既定プロファイルを作成するか確認する。
 実行する CLI のモデル、権限、サンドボックスは各 CLI の通常設定を継承する。
 
-0.1.0-alpha.4 は実行前の再編集と過去実行の判定追記までを対象とし、助言はまだ実装しない。
-現在の実装範囲と挙動は [0.1.0-alpha.4 のリリース文書](./docs/releases/0.1.0-alpha.4.md) に記録する。
+0.1.0-alpha.5 は実行前の再編集と過去実行の判定追記までを対象とし、助言はまだ実装しない。
+現在の実装範囲と挙動は [0.1.0-alpha.5 のリリース文書](./docs/releases/0.1.0-alpha.5.md) に記録する。
