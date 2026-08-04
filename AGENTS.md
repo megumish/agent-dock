@@ -11,3 +11,8 @@ agmsgで別エージェントに `jj diff` の確認を依頼する場合は、�
 単一のWorking Copyを確認させる場合は、そのchange IDとcommit IDを記載し、単に「現在のWorking Copy」や `@` とだけ書かない。
 二つのrevision間の差分を確認させる場合は、始点と終点のcommit ID、および `jj diff --from <始点> --to <終点>` の形式による確認範囲を記載する。
 終点のcommit IDまたはWorking Copyだけを範囲レビューの対象として示さない。
+
+## Issueでのコード参照
+
+Issueやそのコメントなど、作業後も残る記録でコードの位置を参照する場合は、ファイル名と行番号だけを書かない。
+行番号は実装の変更で移動するため、参照時点のcommit IDに固定したpermanent linkを使う。
