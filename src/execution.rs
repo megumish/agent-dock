@@ -266,9 +266,11 @@ mod tests {
         ProfileDeclaration {
             name: "Fake agent".to_owned(),
             cli: CliKind::Claude,
+            execution_platform: crate::ExecutionPlatform::Headless,
             executable: Some(executable.clone()),
             model: None,
             args: Vec::new(),
+            identity: Default::default(),
         }
         .resolve(executable)
         .unwrap()
@@ -278,9 +280,11 @@ mod tests {
         ProfileDeclaration {
             name: "Fake agent".to_owned(),
             cli: CliKind::Antigravity,
+            execution_platform: crate::ExecutionPlatform::Headless,
             executable: Some(executable.clone()),
             model: None,
             args: Vec::new(),
+            identity: Default::default(),
         }
         .resolve(executable)
         .unwrap()

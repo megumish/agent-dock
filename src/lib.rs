@@ -1,26 +1,43 @@
 pub mod adapter;
 pub mod config;
 pub mod execution;
+pub mod hook;
 pub mod judgement;
+pub mod observation;
+pub mod observe_cli;
+pub mod otel;
 pub mod record;
 pub mod scorecard;
 
 pub use adapter::{
-    CliKind, CommandSpec, ExecutionProfile, ProfileDeclaration, PromptTransport,
+    CliKind, CommandSpec, ExecutionPlatform, ExecutionProfile, ProfileDeclaration, PromptTransport,
     safe_test_declaration, safe_test_profile,
 };
 pub use config::{Config, ConfigError, ConfigRevision, ReplaceConfigOutcome, default_config_path};
 pub use execution::{
     ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionRequest, OutputSource, execute,
 };
+pub use hook::{
+    HookEvent, HookObservation, HookParseError, MAX_HOOK_INPUT_BYTES, Provider,
+    parse_hook_observation,
+};
 pub use judgement::{JudgementCandidate, judgement_candidates};
+pub use observation::{
+    ObservationCommand, ObservationError, ObservationOutcome, apply_observation,
+    configuration_for_profile, resolve_observed_session,
+};
+pub use observe_cli::{ObserveCliCommand, parse_observe_args};
+pub use otel::{AuxiliaryFact, OTelProvider, OtelParseError, parse_otlp_logs};
 pub use record::{
-    AppendJudgementOutcome, BackupEventLogOutcome, EVENT_FORMAT_VERSION, Event, EventKind,
-    EventLog, FailureKind, ProfileSnapshot, ReadEvents, RecordError, RecordedExecutionOutcome,
-    SkippedLine, SkippedLineReason, Verdict, default_events_path,
+    ActualCost, AppendBatchOutcome, AppendJudgementOutcome, AttributionFailure,
+    BackupEventLogOutcome, ConfigurationBoundary, EVENT_FORMAT_VERSION, Event, EventKind, EventLog,
+    ExecutionOrigin, FailureKind, ObservationAnomaly, ObservedConfiguration, ObservedTaskStatus,
+    ObservedValue, ProfileAttribution, ProfileSnapshot, Provenance, ReadEvents, RecordError,
+    RecordedExecutionOutcome, SessionPhase, SkippedLine, SkippedLineReason, Verdict,
+    default_events_path,
 };
 pub use scorecard::{
-    AcceptanceAxis, AxisSummary, CostAxis, DurationAxis, ProfileScorecard, Projection, Segment,
-    SegmentScore, escape_terminal, format_acceptance, format_duration, format_recency, project,
-    segments_for_tags,
+    AcceptanceAxis, AxisSummary, CostAxis, DurationAxis, ExclusionReason, ExclusionSummary,
+    OriginCounts, ProfileScorecard, Projection, Segment, SegmentScore, escape_terminal,
+    format_acceptance, format_duration, format_recency, project, segments_for_tags,
 };

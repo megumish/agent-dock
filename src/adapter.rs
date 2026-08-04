@@ -1,13 +1,13 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 const PROFILE_IDENTITY_NAMESPACE: Uuid = Uuid::from_u128(0xa5e6727d6a3755978280568e3f54c1ff);
-const PROFILE_IDENTITY_DOMAIN: &[u8] = b"agent-dock/profile-identity/v1\0";
+const PROFILE_IDENTITY_DOMAIN: &[u8] = b"agent-dock/profile-identity/v2\0";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CliKind {
     Test,
@@ -15,6 +15,23 @@ pub enum CliKind {
     Codex,
     Gemini,
     Antigravity,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPlatform {
+    #[default]
+    Headless,
+    Interactive,
+}
+
+impl std::fmt::Display for ExecutionPlatform {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Headless => "headless",
+            Self::Interactive => "interactive",
+        })
+    }
 }
 
 impl CliKind {
@@ -49,12 +66,16 @@ impl std::fmt::Display for CliKind {
 pub struct ProfileDeclaration {
     pub name: String,
     pub cli: CliKind,
+    #[serde(default)]
+    pub execution_platform: ExecutionPlatform,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub identity: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +95,8 @@ impl ProfileDeclaration {
         encoded.push(0x01);
         push_string(&mut encoded, self.cli.as_str())?;
         encoded.push(0x02);
+        push_string(&mut encoded, &self.execution_platform.to_string())?;
+        encoded.push(0x03);
         push_option_string(
             &mut encoded,
             self.executable
@@ -85,12 +108,18 @@ impl ProfileDeclaration {
                 })
                 .transpose()?,
         )?;
-        encoded.push(0x03);
-        push_option_string(&mut encoded, self.model.as_deref().map(Into::into))?;
         encoded.push(0x04);
+        push_option_string(&mut encoded, self.model.as_deref().map(Into::into))?;
+        encoded.push(0x05);
         push_len(&mut encoded, self.args.len())?;
         for argument in &self.args {
             push_string(&mut encoded, argument)?;
+        }
+        encoded.push(0x06);
+        push_len(&mut encoded, self.identity.len())?;
+        for (key, value) in &self.identity {
+            push_string(&mut encoded, key)?;
+            push_string(&mut encoded, value)?;
         }
         Ok(encoded)
     }
@@ -121,6 +150,21 @@ impl ProfileDeclaration {
         }
         if !allow_test && self.cli == CliKind::Test {
             return Err(ProfileValidationError::ReservedTestCli(self.name.clone()));
+        }
+        if self.execution_platform == ExecutionPlatform::Interactive
+            && !matches!(self.cli, CliKind::Claude | CliKind::Codex)
+        {
+            return Err(ProfileValidationError::UnsupportedInteractiveCli {
+                name: self.name.clone(),
+                cli: self.cli,
+            });
+        }
+        if self.execution_platform == ExecutionPlatform::Interactive
+            && (self.executable.is_some() || !self.args.is_empty())
+        {
+            return Err(ProfileValidationError::InteractiveLaunchFields(
+                self.name.clone(),
+            ));
         }
         if self
             .executable
@@ -153,6 +197,9 @@ impl ExecutionProfile {
     }
     pub fn cli(&self) -> CliKind {
         self.declaration.cli
+    }
+    pub fn execution_platform(&self) -> ExecutionPlatform {
+        self.declaration.execution_platform
     }
     pub fn model(&self) -> Option<&str> {
         self.declaration.model.as_deref()
@@ -246,9 +293,11 @@ pub fn safe_test_declaration() -> ProfileDeclaration {
     ProfileDeclaration {
         name: "Safe test (no agent)".to_owned(),
         cli: CliKind::Test,
+        execution_platform: ExecutionPlatform::Headless,
         executable: None,
         model: None,
         args: Vec::new(),
+        identity: BTreeMap::new(),
     }
 }
 
@@ -280,6 +329,10 @@ pub enum ProfileValidationError {
     PaddedName(String),
     #[error("profile `{0}` cannot use the reserved test CLI")]
     ReservedTestCli(String),
+    #[error("interactive profile `{name}` cannot use CLI `{cli}`")]
+    UnsupportedInteractiveCli { name: String, cli: CliKind },
+    #[error("interactive profile `{0}` cannot declare executable or launch arguments")]
+    InteractiveLaunchFields(String),
     #[error("profile `{0}` has an empty executable override")]
     EmptyExecutable(String),
     #[error("profile `{0}` has a non-UTF-8 executable override")]
@@ -300,9 +353,11 @@ mod tests {
         ProfileDeclaration {
             name: "Test profile".to_owned(),
             cli,
+            execution_platform: ExecutionPlatform::Headless,
             executable: None,
             model: Some("test-model".to_owned()),
             args: vec!["--safe-option".to_owned()],
+            identity: BTreeMap::new(),
         }
     }
 
@@ -311,21 +366,23 @@ mod tests {
         let profile = ProfileDeclaration {
             name: "ignored".to_owned(),
             cli: CliKind::Codex,
+            execution_platform: ExecutionPlatform::Headless,
             executable: None,
             model: Some("gpt-5".to_owned()),
             args: vec!["--foo".to_owned(), "bar".to_owned()],
+            identity: BTreeMap::new(),
         };
         assert_eq!(
             hex(&profile.canonical_identity().unwrap()),
-            "6167656e742d646f636b2f70726f66696c652d6964656e746974792f7631000100000005636f64657802000301000000056770742d350400000002000000052d2d666f6f00000003626172"
+            "6167656e742d646f636b2f70726f66696c652d6964656e746974792f7632000100000005636f6465780200000008686561646c65737303000401000000056770742d350500000002000000052d2d666f6f000000036261720600000000"
         );
         assert_eq!(
             profile.id().unwrap(),
-            "fd1b9963-4d3e-516a-92be-9a18305c71c7"
+            "1592eb4a-f65d-5373-a66f-7e821622d652"
         );
         assert_eq!(
             safe_test_profile().id,
-            "42d38cde-50a8-5024-9f12-d164e82adea6"
+            "570e4209-66ea-5701-b399-d631bf676519"
         );
     }
 

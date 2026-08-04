@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{CliKind, ProfileDeclaration, adapter::ProfileValidationError};
+use crate::{CliKind, ExecutionPlatform, ProfileDeclaration, adapter::ProfileValidationError};
 
-pub const CONFIG_API_VERSION: &str = "agent-dock/config/v1alpha3";
+pub const CONFIG_API_VERSION: &str = "agent-dock/config/v1alpha4";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -48,18 +48,46 @@ impl Config {
             record_prompt,
             tag_candidates: Vec::new(),
             profiles: [
-                ("Codex (default)", CliKind::Codex),
-                ("Claude (default)", CliKind::Claude),
-                ("Gemini (default)", CliKind::Gemini),
-                ("Antigravity (default)", CliKind::Antigravity),
+                (
+                    "Codex (default)",
+                    CliKind::Codex,
+                    ExecutionPlatform::Headless,
+                ),
+                (
+                    "Claude (default)",
+                    CliKind::Claude,
+                    ExecutionPlatform::Headless,
+                ),
+                (
+                    "Gemini (default)",
+                    CliKind::Gemini,
+                    ExecutionPlatform::Headless,
+                ),
+                (
+                    "Antigravity (default)",
+                    CliKind::Antigravity,
+                    ExecutionPlatform::Headless,
+                ),
+                (
+                    "Codex interactive (default)",
+                    CliKind::Codex,
+                    ExecutionPlatform::Interactive,
+                ),
+                (
+                    "Claude interactive (default)",
+                    CliKind::Claude,
+                    ExecutionPlatform::Interactive,
+                ),
             ]
             .into_iter()
-            .map(|(name, cli)| ProfileDeclaration {
+            .map(|(name, cli, execution_platform)| ProfileDeclaration {
                 name: name.to_owned(),
                 cli,
+                execution_platform,
                 executable: None,
                 model: None,
                 args: Vec::new(),
+                identity: Default::default(),
             })
             .collect(),
         }

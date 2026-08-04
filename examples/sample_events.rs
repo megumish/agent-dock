@@ -207,23 +207,20 @@ fn append_run(
     outcome: Outcome,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let task = task(at, tags);
-    let task_id = task.task_id;
+    let task_id = task.task_id.expect("task event has an id");
     log.append(&task)?;
     let execution = execution(task_id, profile, at, elapsed_ms, outcome);
-    let execution_id = execution.event_id;
     log.append(&execution)?;
     match outcome {
         Outcome::Accepted | Outcome::RejudgedRejected => log.append(&Event::new(
             task_id,
             EventKind::Judged {
-                execution_event_id: execution_id,
                 verdict: Verdict::Accepted,
             },
         ))?,
         Outcome::Rejected => log.append(&Event::new(
             task_id,
             EventKind::Judged {
-                execution_event_id: execution_id,
                 verdict: Verdict::Rejected,
             },
         ))?,
@@ -233,7 +230,6 @@ fn append_run(
         log.append(&Event::new(
             task_id,
             EventKind::Judged {
-                execution_event_id: execution_id,
                 verdict: Verdict::Rejected,
             },
         ))?;
@@ -264,6 +260,7 @@ fn execution(
     Event::new(
         task_id,
         EventKind::Executed {
+            origin: agent_dock::ExecutionOrigin::Brokered,
             profile: ProfileSnapshot::from(profile),
             working_directory: PathBuf::from("/tmp/agent-dock-sample"),
             started_at: parse(at)
@@ -289,6 +286,7 @@ fn sample_profiles() -> Vec<ExecutionProfile> {
         Config::defaults(false)
             .profiles
             .into_iter()
+            .filter(|profile| profile.execution_platform == agent_dock::ExecutionPlatform::Headless)
             .map(|declaration| {
                 let resolved_executable = declaration.executable();
                 declaration

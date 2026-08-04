@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     os::{
@@ -13,30 +14,64 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{CliKind, ExecutionProfile, ProfileDeclaration};
+use crate::{CliKind, ExecutionPlatform, ExecutionProfile, ProfileDeclaration};
 
-pub const EVENT_FORMAT_VERSION: &str = "agent-dock/events/v1alpha2";
+pub const EVENT_FORMAT_VERSION: &str = "agent-dock/events/v1alpha3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub format_version: String,
     pub event_id: Uuid,
-    pub task_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
     pub occurred_at: Timestamp,
+    pub provenance: Provenance,
     #[serde(flatten)]
     pub kind: EventKind,
 }
 
 impl Event {
     pub fn new(task_id: Uuid, kind: EventKind) -> Self {
+        Self::for_task(task_id, Provenance::Dock, kind)
+    }
+
+    pub fn for_task(task_id: Uuid, provenance: Provenance, kind: EventKind) -> Self {
         Self {
             format_version: EVENT_FORMAT_VERSION.to_owned(),
             event_id: Uuid::now_v7(),
-            task_id,
+            task_id: Some(task_id),
             occurred_at: Timestamp::now(),
+            provenance,
             kind,
         }
     }
+
+    pub fn for_session(provenance: Provenance, kind: EventKind) -> Self {
+        Self {
+            format_version: EVENT_FORMAT_VERSION.to_owned(),
+            event_id: Uuid::now_v7(),
+            task_id: None,
+            occurred_at: Timestamp::now(),
+            provenance,
+            kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provenance {
+    Dock,
+    ManualMark,
+    CliHook,
+    OpenTelemetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionOrigin {
+    Brokered,
+    DirectObservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +86,7 @@ pub enum EventKind {
         profile_id: String,
     },
     Executed {
+        origin: ExecutionOrigin,
         profile: ProfileSnapshot,
         working_directory: PathBuf,
         started_at: Timestamp,
@@ -59,9 +95,124 @@ pub enum EventKind {
         cost: Option<()>,
     },
     Judged {
-        execution_event_id: Uuid,
         verdict: Verdict,
     },
+    SessionObserved {
+        session_id: Uuid,
+        cli: CliKind,
+        phase: SessionPhase,
+        external_session_id: Option<String>,
+        working_directory: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configuration: Option<ObservedConfiguration>,
+    },
+    ObservedTaskStarted {
+        session_id: Uuid,
+        origin: ExecutionOrigin,
+        tags: Vec<String>,
+        prompt: Option<String>,
+        prompt_chars: usize,
+    },
+    ObservedTaskEnded {
+        session_id: Uuid,
+        status: ObservedTaskStatus,
+    },
+    ConfigurationObserved {
+        session_id: Uuid,
+        boundary: ConfigurationBoundary,
+        configuration: ObservedConfiguration,
+    },
+    ProfileAttributed {
+        session_id: Uuid,
+        attribution: ProfileAttribution,
+    },
+    MeasurementObserved {
+        session_id: Uuid,
+        elapsed_ms: Option<u64>,
+        actual_cost: Option<ActualCost>,
+    },
+    AuxiliaryMeasurementObserved {
+        session_id: Uuid,
+        interval_started_at: Timestamp,
+        interval_ended_at: Timestamp,
+        model: Option<String>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        estimated_cost_usd_micros: Option<u64>,
+    },
+    ObservationAnomaly {
+        session_id: Option<Uuid>,
+        anomaly: ObservationAnomaly,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPhase {
+    Started,
+    Resumed,
+    Ended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedTaskStatus {
+    Completed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationBoundary {
+    Start,
+    End,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum ObservedValue<T> {
+    Observed(T),
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedConfiguration {
+    pub cli: CliKind,
+    pub execution_platform: ExecutionPlatform,
+    pub model: ObservedValue<Option<String>>,
+    pub identity: BTreeMap<String, ObservedValue<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProfileAttribution {
+    Matched { profile: ProfileSnapshot },
+    Unattributed { reason: AttributionFailure },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionFailure {
+    MissingConfiguration,
+    ConfigurationChanged,
+    NoMatchingProfile,
+    AmbiguousProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActualCost {
+    pub currency: String,
+    pub minor_units: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObservationAnomaly {
+    OrphanTaskEnd,
+    SessionEndMissing,
+    UncorrelatedAuxiliaryFact,
+    UnsupportedHook { provider: String, event: String },
+    InvalidHook { provider: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,10 +220,12 @@ pub struct ProfileSnapshot {
     pub id: String,
     pub name: String,
     pub cli: CliKind,
+    pub execution_platform: ExecutionPlatform,
     pub executable_override: Option<PathBuf>,
     pub model: Option<String>,
     pub args: Vec<String>,
-    pub resolved_executable: PathBuf,
+    pub identity: BTreeMap<String, String>,
+    pub resolved_executable: Option<PathBuf>,
 }
 
 impl From<&ExecutionProfile> for ProfileSnapshot {
@@ -81,10 +234,12 @@ impl From<&ExecutionProfile> for ProfileSnapshot {
             id: profile.id.clone(),
             name: profile.name().to_owned(),
             cli: profile.cli(),
+            execution_platform: profile.execution_platform(),
             executable_override: profile.declaration.executable.clone(),
             model: profile.declaration.model.clone(),
             args: profile.declaration.args.clone(),
-            resolved_executable: profile.resolved_executable.clone(),
+            identity: profile.declaration.identity.clone(),
+            resolved_executable: Some(profile.resolved_executable.clone()),
         }
     }
 }
@@ -94,10 +249,28 @@ impl ProfileSnapshot {
         ProfileDeclaration {
             name: self.name.clone(),
             cli: self.cli,
+            execution_platform: self.execution_platform,
             executable: self.executable_override.clone(),
             model: self.model.clone(),
             args: self.args.clone(),
+            identity: self.identity.clone(),
         }
+    }
+
+    pub fn observed(
+        declaration: &ProfileDeclaration,
+    ) -> Result<Self, crate::adapter::ProfileValidationError> {
+        Ok(Self {
+            id: declaration.id()?,
+            name: declaration.name.clone(),
+            cli: declaration.cli,
+            execution_platform: declaration.execution_platform,
+            executable_override: declaration.executable.clone(),
+            model: declaration.model.clone(),
+            args: declaration.args.clone(),
+            identity: declaration.identity.clone(),
+            resolved_executable: None,
+        })
     }
 }
 
@@ -191,10 +364,16 @@ pub enum BackupEventLogOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendBatchOutcome {
+    Appended,
+    Changed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendJudgementOutcome {
     Appended,
     CurrentVerdictChanged { current: Option<Verdict> },
-    ExecutionMissing,
+    TaskMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,27 +401,96 @@ impl EventLog {
         self.append_unlocked(event)
     }
 
+    pub fn append_batch_if_unchanged(
+        &self,
+        expected: &ReadEvents,
+        events: &[Event],
+    ) -> Result<AppendBatchOutcome, RecordError> {
+        let mut encoded = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut encoded, event).map_err(RecordError::Serialize)?;
+            encoded.push(b'\n');
+        }
+        let _lock = FileLock::acquire(self.open_lock_file()?, libc::LOCK_EX, &self.lock_path())?;
+        let current = self.read_all_unlocked()?;
+        if current.revision != expected.revision {
+            return Ok(AppendBatchOutcome::Changed);
+        }
+        if encoded.is_empty() {
+            return Ok(AppendBatchOutcome::Appended);
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| RecordError::MissingParent(self.path.clone()))?;
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("events.jsonl");
+        let temporary_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::now_v7()));
+        let mut replacement = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(source) => {
+                return Err(RecordError::Read {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        replacement.extend(encoded);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary_path)
+            .map_err(|source| RecordError::Open {
+                path: temporary_path.clone(),
+                source,
+            })?;
+        let result = file
+            .write_all(&replacement)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&temporary_path, &self.path));
+        if let Err(source) = result {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(RecordError::Write {
+                path: self.path.clone(),
+                source,
+            });
+        }
+        Ok(AppendBatchOutcome::Appended)
+    }
+
     pub fn append_judgement_if_current(
         &self,
-        execution_event_id: Uuid,
+        task_id: Uuid,
         expected_current: Option<Verdict>,
         verdict: Verdict,
     ) -> Result<AppendJudgementOutcome, RecordError> {
         let _lock = FileLock::acquire(self.open_lock_file()?, libc::LOCK_EX, &self.lock_path())?;
         let history = self.read_all_unlocked()?;
-        let Some(task_id) = history.events.iter().find_map(|event| {
-            (event.event_id == execution_event_id
-                && matches!(event.kind, EventKind::Executed { .. }))
-            .then_some(event.task_id)
-        }) else {
-            return Ok(AppendJudgementOutcome::ExecutionMissing);
-        };
+        let task_exists = history.events.iter().any(|event| {
+            event.task_id == Some(task_id)
+                && matches!(
+                    event.kind,
+                    EventKind::Executed {
+                        outcome: RecordedExecutionOutcome::Completed { .. }
+                            | RecordedExecutionOutcome::Cancelled,
+                        ..
+                    } | EventKind::ObservedTaskEnded {
+                        status: ObservedTaskStatus::Completed,
+                        ..
+                    }
+                )
+        });
+        if !task_exists {
+            return Ok(AppendJudgementOutcome::TaskMissing);
+        }
         let current = history.events.iter().fold(None, |current, event| {
-            if let EventKind::Judged {
-                execution_event_id: target,
-                verdict,
-            } = event.kind
-                && target == execution_event_id
+            if let EventKind::Judged { verdict } = event.kind
+                && event.task_id == Some(task_id)
             {
                 Some(verdict)
             } else {
@@ -252,13 +500,7 @@ impl EventLog {
         if current != expected_current {
             return Ok(AppendJudgementOutcome::CurrentVerdictChanged { current });
         }
-        self.append_unlocked(&Event::new(
-            task_id,
-            EventKind::Judged {
-                execution_event_id,
-                verdict,
-            },
-        ))?;
+        self.append_unlocked(&Event::new(task_id, EventKind::Judged { verdict }))?;
         Ok(AppendJudgementOutcome::Appended)
     }
 
@@ -448,9 +690,44 @@ fn decode_event_line(line: &str) -> Result<Event, SkippedLineReason> {
             expected: EVENT_FORMAT_VERSION,
         });
     }
-    serde_json::from_value(document).map_err(|source| SkippedLineReason::InvalidEvent {
-        message: source.to_string(),
-    })
+    let event: Event =
+        serde_json::from_value(document).map_err(|source| SkippedLineReason::InvalidEvent {
+            message: source.to_string(),
+        })?;
+    let requires_task = !matches!(
+        event.kind,
+        EventKind::SessionObserved { .. } | EventKind::ObservationAnomaly { .. }
+    );
+    if requires_task != event.task_id.is_some() {
+        return Err(SkippedLineReason::InvalidEvent {
+            message: if requires_task {
+                "task event is missing task_id".to_owned()
+            } else {
+                "session event must not contain task_id".to_owned()
+            },
+        });
+    }
+    let semantics_valid = match &event.kind {
+        EventKind::ObservedTaskStarted { origin, .. } => {
+            *origin == ExecutionOrigin::DirectObservation
+                && event.provenance == Provenance::ManualMark
+        }
+        EventKind::ObservedTaskEnded { .. } => event.provenance == Provenance::ManualMark,
+        EventKind::ConfigurationObserved { .. } => event.provenance == Provenance::ManualMark,
+        EventKind::AuxiliaryMeasurementObserved { .. } => {
+            event.provenance == Provenance::OpenTelemetry
+        }
+        EventKind::Executed { origin, .. } => *origin == ExecutionOrigin::Brokered,
+        EventKind::SessionObserved { .. } => event.provenance != Provenance::OpenTelemetry,
+        _ => true,
+    };
+    if !semantics_valid {
+        return Err(SkippedLineReason::InvalidEvent {
+            message: "event provenance or execution origin is inconsistent with its kind"
+                .to_owned(),
+        });
+    }
+    Ok(event)
 }
 
 pub fn default_events_path() -> Result<PathBuf, RecordError> {
@@ -572,11 +849,14 @@ mod tests {
                     id: "test-default".to_owned(),
                     name: "Safe test".to_owned(),
                     cli: CliKind::Test,
+                    execution_platform: ExecutionPlatform::Headless,
                     executable_override: None,
                     model: None,
                     args: Vec::new(),
-                    resolved_executable: PathBuf::from("/usr/bin/true"),
+                    identity: Default::default(),
+                    resolved_executable: Some(PathBuf::from("/usr/bin/true")),
                 },
+                origin: ExecutionOrigin::Brokered,
                 working_directory: PathBuf::from("/tmp/project"),
                 started_at: Timestamp::now(),
                 elapsed_ms: 10,
@@ -593,9 +873,8 @@ mod tests {
         let log = EventLog::new(&path);
         let execution = completed_execution(Uuid::now_v7());
         let prior = Event::new(
-            execution.task_id,
+            execution.task_id.unwrap(),
             EventKind::Judged {
-                execution_event_id: execution.event_id,
                 verdict: Verdict::Rejected,
             },
         );
@@ -605,7 +884,7 @@ mod tests {
 
         assert_eq!(
             log.append_judgement_if_current(
-                execution.event_id,
+                execution.task_id.unwrap(),
                 Some(Verdict::Rejected),
                 Verdict::Accepted,
             )
@@ -621,9 +900,8 @@ mod tests {
         assert!(matches!(
             events[2].kind,
             EventKind::Judged {
-                execution_event_id,
-                verdict: Verdict::Accepted,
-            } if execution_event_id == execution.event_id
+                verdict: Verdict::Accepted
+            }
         ));
     }
 
@@ -635,14 +913,13 @@ mod tests {
         assert_eq!(
             log.append_judgement_if_current(Uuid::now_v7(), None, Verdict::Accepted)
                 .unwrap(),
-            AppendJudgementOutcome::ExecutionMissing
+            AppendJudgementOutcome::TaskMissing
         );
         let execution = completed_execution(Uuid::now_v7());
         log.append(&execution).unwrap();
         log.append(&Event::new(
-            execution.task_id,
+            execution.task_id.unwrap(),
             EventKind::Judged {
-                execution_event_id: execution.event_id,
                 verdict: Verdict::Accepted,
             },
         ))
@@ -650,7 +927,7 @@ mod tests {
         let original = fs::read(&path).unwrap();
 
         assert_eq!(
-            log.append_judgement_if_current(execution.event_id, None, Verdict::Rejected)
+            log.append_judgement_if_current(execution.task_id.unwrap(), None, Verdict::Rejected)
                 .unwrap(),
             AppendJudgementOutcome::CurrentVerdictChanged {
                 current: Some(Verdict::Accepted)
@@ -670,10 +947,10 @@ mod tests {
         for verdict in [Verdict::Accepted, Verdict::Rejected] {
             let log = log.clone();
             let barrier = barrier.clone();
-            let execution_event_id = execution.event_id;
+            let task_id = execution.task_id.unwrap();
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                log.append_judgement_if_current(execution_event_id, None, verdict)
+                log.append_judgement_if_current(task_id, None, verdict)
                     .unwrap()
             }));
         }
@@ -745,10 +1022,12 @@ mod tests {
             id: "codex-test".to_owned(),
             name: "Codex test".to_owned(),
             cli: CliKind::Codex,
+            execution_platform: ExecutionPlatform::Headless,
             executable_override: None,
             model: Some("test-model".to_owned()),
             args: vec!["--safe-option".to_owned()],
-            resolved_executable: PathBuf::from("/usr/local/bin/codex"),
+            identity: Default::default(),
+            resolved_executable: Some(PathBuf::from("/usr/local/bin/codex")),
         };
         let executed = [
             RecordedExecutionOutcome::Completed { exit_code: Some(7) },
@@ -764,6 +1043,7 @@ mod tests {
             Event::new(
                 task_id,
                 EventKind::Executed {
+                    origin: ExecutionOrigin::Brokered,
                     profile: profile.clone(),
                     working_directory: PathBuf::from("/work"),
                     started_at: Timestamp::now(),
@@ -783,7 +1063,6 @@ mod tests {
             Event::new(
                 task_id,
                 EventKind::Judged {
-                    execution_event_id: Uuid::now_v7(),
                     verdict: Verdict::Rejected,
                 },
             ),
@@ -917,6 +1196,55 @@ mod tests {
             BackupEventLogOutcome::Changed
         );
         assert_eq!(log.read_all().unwrap().events, [first, second]);
+    }
+
+    #[test]
+    fn batch_append_preserves_prefix_and_commits_every_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        let first = task_event(Uuid::now_v7(), None);
+        let second = task_event(Uuid::now_v7(), Some("second"));
+        let third = task_event(Uuid::now_v7(), Some("third"));
+        log.append(&first).unwrap();
+        let expected = log.read_all().unwrap();
+        let prefix = fs::read(&path).unwrap();
+
+        assert_eq!(
+            log.append_batch_if_unchanged(&expected, &[second.clone(), third.clone()])
+                .unwrap(),
+            AppendBatchOutcome::Appended
+        );
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&prefix));
+        assert_eq!(log.read_all().unwrap().events, [first, second, third]);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn stale_batch_append_changes_no_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        let first = task_event(Uuid::now_v7(), None);
+        let intervening = task_event(Uuid::now_v7(), Some("intervening"));
+        let stale_batch = task_event(Uuid::now_v7(), Some("stale"));
+        log.append(&first).unwrap();
+        let stale = log.read_all().unwrap();
+        log.append(&intervening).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        assert_eq!(
+            log.append_batch_if_unchanged(&stale, &[stale_batch])
+                .unwrap(),
+            AppendBatchOutcome::Changed
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert_eq!(log.read_all().unwrap().events, [first, intervening]);
     }
 
     #[test]

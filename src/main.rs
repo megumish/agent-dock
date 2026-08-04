@@ -1,8 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     ffi::{OsStr, OsString},
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -10,13 +10,17 @@ use std::{
 };
 
 use agent_dock::{
-    AppendJudgementOutcome, BackupEventLogOutcome, Config, ConfigError, EVENT_FORMAT_VERSION,
-    Event, EventKind, EventLog, ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionProfile,
-    ExecutionRequest, FailureKind, JudgementCandidate, OutputSource, ProfileDeclaration,
-    ProfileSnapshot, ReadEvents, RecordedExecutionOutcome, ReplaceConfigOutcome, Segment,
-    SegmentScore, SkippedLineReason, Verdict, default_config_path, default_events_path,
-    escape_terminal, execute, format_acceptance, format_duration, format_recency,
-    judgement_candidates, project, safe_test_profile, segments_for_tags,
+    AppendJudgementOutcome, AttributionFailure, BackupEventLogOutcome, Config, ConfigError,
+    EVENT_FORMAT_VERSION, Event, EventKind, EventLog, ExclusionReason, ExecutionError,
+    ExecutionEvent, ExecutionOrigin, ExecutionOutcome, ExecutionPlatform, ExecutionProfile,
+    ExecutionRequest, FailureKind, HookEvent, JudgementCandidate, MAX_HOOK_INPUT_BYTES,
+    ObservationCommand, ObserveCliCommand, OutputSource, ProfileAttribution, ProfileDeclaration,
+    ProfileSnapshot, Provenance, ReadEvents, RecordedExecutionOutcome, ReplaceConfigOutcome,
+    Segment, SegmentScore, SessionPhase, SkippedLineReason, Verdict, apply_observation,
+    configuration_for_profile, default_config_path, default_events_path, escape_terminal, execute,
+    format_acceptance, format_duration, format_recency, judgement_candidates,
+    parse_hook_observation, parse_observe_args, parse_otlp_logs, project, resolve_observed_session,
+    safe_test_profile, segments_for_tags,
 };
 use jiff::Timestamp;
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -50,6 +54,8 @@ async fn run() -> Result<i32, AppError> {
     match command_from_args(std::env::args_os().skip(1))? {
         AppCommand::Run => run_task().await,
         AppCommand::Judge => judge(),
+        AppCommand::Scorecard => scorecard(),
+        AppCommand::Observe(command) => observe(command),
         AppCommand::Help => {
             print_usage();
             Ok(0)
@@ -65,6 +71,9 @@ async fn run_task() -> Result<i32, AppError> {
 
     let mut available = vec![safe_test_profile()];
     for declaration in &config.profiles {
+        if declaration.execution_platform != ExecutionPlatform::Headless {
+            continue;
+        }
         if let Some(executable) = resolve_executable(declaration) {
             available.push(
                 declaration
@@ -82,6 +91,18 @@ async fn run_task() -> Result<i32, AppError> {
     if available.is_empty() {
         return Err(AppError::NoAvailableProfiles);
     }
+    let mut projection_profiles = available.clone();
+    projection_profiles.extend(
+        config
+            .profiles
+            .iter()
+            .filter(|profile| profile.execution_platform == ExecutionPlatform::Interactive)
+            .map(|profile| {
+                profile
+                    .resolve(profile.executable())
+                    .expect("validated configuration")
+            }),
+    );
 
     let working_directory = std::env::current_dir()?;
     let event_log = EventLog::new(default_events_path()?);
@@ -114,9 +135,16 @@ async fn run_task() -> Result<i32, AppError> {
             let score_segments = visible_segments(&all_segments);
             let hidden_tags = all_segments.len() - score_segments.len();
             let fresh_history = read_event_history(&event_log)?;
-            let projection = project(&fresh_history.events, &available, &score_segments);
+            let projection = project(&fresh_history.events, &projection_profiles, &score_segments);
             for warning in &projection.warnings {
                 eprintln!("Warning: {}", escape_terminal(warning));
+            }
+            for exclusion in &projection.exclusions {
+                eprintln!(
+                    "Direct observation excluded ({}): {}",
+                    exclusion_reason_label(exclusion.reason),
+                    exclusion.count
+                );
             }
             let choices = render_profile_choices(
                 &available,
@@ -187,6 +215,7 @@ async fn run_task() -> Result<i32, AppError> {
             event_log.append(&Event::new(
                 task_id,
                 EventKind::Executed {
+                    origin: ExecutionOrigin::Brokered,
                     profile: ProfileSnapshot::from(profile),
                     working_directory,
                     started_at,
@@ -218,6 +247,7 @@ async fn run_task() -> Result<i32, AppError> {
     let executed = Event::new(
         task_id,
         EventKind::Executed {
+            origin: ExecutionOrigin::Brokered,
             profile: ProfileSnapshot::from(profile),
             working_directory,
             started_at,
@@ -226,7 +256,6 @@ async fn run_task() -> Result<i32, AppError> {
             cost: None,
         },
     );
-    let execution_event_id = executed.event_id;
     event_log.append(&executed)?;
 
     if !should_ask_immediate_judgement(&outcome) {
@@ -243,7 +272,6 @@ async fn run_task() -> Result<i32, AppError> {
     event_log.append(&Event::new(
         task_id,
         EventKind::Judged {
-            execution_event_id,
             verdict: if accepted {
                 Verdict::Accepted
             } else {
@@ -254,10 +282,12 @@ async fn run_task() -> Result<i32, AppError> {
     Ok(process_exit_code)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AppCommand {
     Run,
     Judge,
+    Scorecard,
+    Observe(ObserveCliCommand),
     Help,
 }
 
@@ -267,26 +297,312 @@ fn command_from_args(
     let command = match arguments.next().as_deref() {
         None => AppCommand::Run,
         Some(command) if command == "judge" => AppCommand::Judge,
+        Some(command) if command == "scorecard" => AppCommand::Scorecard,
+        Some(command) if command == "observe" => {
+            return parse_observe_args(arguments)
+                .map(AppCommand::Observe)
+                .map_err(AppError::Usage);
+        }
         Some(command) if command == "-h" || command == "--help" => AppCommand::Help,
         Some(command) => {
             return Err(AppError::Usage(format!(
-                "unknown command `{}`\nUsage: agent-dock [judge]",
+                "unknown command `{}`\nUsage: agent-dock [judge|scorecard|observe]",
                 escape_terminal(&command.to_string_lossy())
             )));
         }
     };
     if arguments.next().is_some() {
         return Err(AppError::Usage(
-            "too many arguments\nUsage: agent-dock [judge]".to_owned(),
+            "too many arguments\nUsage: agent-dock [judge|scorecard|observe]".to_owned(),
         ));
     }
     Ok(command)
 }
 
 fn print_usage() {
-    println!("Usage: agent-dock [judge]");
+    println!("Usage: agent-dock [judge|scorecard|observe]");
     println!("\nCommands:");
     println!("  judge  Append a new judgement to a completed or cancelled execution");
+    println!("  scorecard  Show brokered and direct evidence for every profile");
+    println!("  observe  Record a direct Claude Code or Codex CLI session");
+}
+
+fn observe(command: ObserveCliCommand) -> Result<i32, AppError> {
+    let event_log = EventLog::new(default_events_path()?);
+    match command {
+        ObserveCliCommand::Session {
+            phase,
+            session_id,
+            cli,
+            external_session_id,
+            working_directory,
+        } => {
+            let outcome = apply_observation(
+                &event_log,
+                &[],
+                ObservationCommand::ObserveSession {
+                    session_id,
+                    cli,
+                    phase,
+                    external_session_id,
+                    working_directory,
+                    configuration: None,
+                    provenance: Provenance::ManualMark,
+                },
+            )?;
+            println!("{}", outcome.session_id);
+        }
+        ObserveCliCommand::SessionFind {
+            cli,
+            external_session_id,
+        } => {
+            let history = event_log.read_all()?;
+            let session_id = resolve_observed_session(&history, cli, &external_session_id)?
+                .ok_or_else(|| AppError::Usage("observed session was not found".to_owned()))?;
+            println!("{session_id}");
+        }
+        ObserveCliCommand::TaskStart {
+            session_id,
+            profile,
+            tags,
+            prompt_chars,
+        } => {
+            let config = load_observation_config()?;
+            let configuration = profile
+                .as_deref()
+                .map(|profile| interactive_profile(&config, profile))
+                .transpose()?
+                .map(configuration_for_profile);
+            let outcome = apply_observation(
+                &event_log,
+                &config.profiles,
+                ObservationCommand::StartTask {
+                    session_id,
+                    tags,
+                    prompt: None,
+                    prompt_chars,
+                    configuration,
+                },
+            )?;
+            println!("{}", outcome.task_id.expect("task start returns a task id"));
+        }
+        ObserveCliCommand::TaskEnd {
+            session_id,
+            profile,
+            status,
+        } => {
+            let config = load_observation_config()?;
+            let configuration = profile
+                .as_deref()
+                .map(|profile| interactive_profile(&config, profile))
+                .transpose()?
+                .map(configuration_for_profile);
+            let outcome = apply_observation(
+                &event_log,
+                &config.profiles,
+                ObservationCommand::EndTask {
+                    session_id,
+                    status,
+                    configuration,
+                },
+            )?;
+            if outcome.anomaly_recorded {
+                return Err(AppError::OrphanTaskEnd(session_id));
+            }
+            println!("{}", outcome.task_id.expect("task end returns a task id"));
+        }
+        ObserveCliCommand::Attribution {
+            session_id,
+            task_id,
+            profile,
+            failure,
+        } => {
+            let config = load_observation_config()?;
+            let attribution = if let Some(profile) = profile {
+                let profile = interactive_profile(&config, &profile)?;
+                ProfileAttribution::Matched {
+                    profile: ProfileSnapshot::observed(profile)
+                        .map_err(|error| AppError::Usage(error.to_string()))?,
+                }
+            } else {
+                ProfileAttribution::Unattributed {
+                    reason: failure.unwrap_or(AttributionFailure::MissingConfiguration),
+                }
+            };
+            let outcome = apply_observation(
+                &event_log,
+                &config.profiles,
+                ObservationCommand::CorrectAttribution {
+                    session_id,
+                    task_id,
+                    attribution,
+                },
+            )?;
+            println!("{}", outcome.task_id.expect("correction returns a task id"));
+        }
+        ObserveCliCommand::Hook { provider } => {
+            let mut payload = Vec::new();
+            io::stdin()
+                .take((MAX_HOOK_INPUT_BYTES + 1) as u64)
+                .read_to_end(&mut payload)?;
+            let hook = parse_hook_observation(provider, &payload)?;
+            let cli = match hook.provider {
+                agent_dock::Provider::Claude => agent_dock::CliKind::Claude,
+                agent_dock::Provider::Codex => agent_dock::CliKind::Codex,
+            };
+            let phase = match &hook.event {
+                HookEvent::SessionEnd { .. } => SessionPhase::Ended,
+                HookEvent::SessionStart { source, .. }
+                    if matches!(source.as_deref(), Some("startup" | "fork")) =>
+                {
+                    SessionPhase::Started
+                }
+                HookEvent::SessionStart { .. } => SessionPhase::Resumed,
+                _ => SessionPhase::Started,
+            };
+            let working_directory = match &hook.event {
+                HookEvent::CwdChanged { new_cwd, .. } => PathBuf::from(new_cwd),
+                _ => PathBuf::from(&hook.cwd),
+            };
+            let configuration = hook_configuration(cli, &hook.event);
+            let outcome = apply_observation(
+                &event_log,
+                &[],
+                ObservationCommand::ObserveSession {
+                    session_id: None,
+                    cli,
+                    phase,
+                    external_session_id: Some(hook.external_session_id),
+                    working_directory: Some(working_directory),
+                    configuration,
+                    provenance: Provenance::CliHook,
+                },
+            )?;
+            println!("{}", outcome.session_id);
+        }
+        ObserveCliCommand::OTel { provider } => {
+            let mut payload = Vec::new();
+            io::stdin()
+                .take((MAX_HOOK_INPUT_BYTES + 1) as u64)
+                .read_to_end(&mut payload)?;
+            let facts = parse_otlp_logs(provider, &payload)?;
+            let mut recorded = 0usize;
+            let mut anomalies = 0usize;
+            for fact in facts {
+                let outcome = apply_observation(
+                    &event_log,
+                    &[],
+                    ObservationCommand::RecordAuxiliaryFact { fact },
+                )?;
+                recorded += usize::from(outcome.task_id.is_some());
+                anomalies += usize::from(outcome.anomaly_recorded);
+            }
+            println!("recorded={recorded} anomalies={anomalies}");
+        }
+    }
+    Ok(0)
+}
+
+fn hook_configuration(
+    cli: agent_dock::CliKind,
+    event: &HookEvent,
+) -> Option<agent_dock::ObservedConfiguration> {
+    let (model, permission_mode) = match event {
+        HookEvent::SessionStart {
+            model,
+            permission_mode,
+            ..
+        }
+        | HookEvent::Stop {
+            model,
+            permission_mode,
+        } => (model, permission_mode),
+        _ => return None,
+    };
+    let model = model
+        .clone()
+        .map(|model| agent_dock::ObservedValue::Observed(Some(model)))
+        .unwrap_or(agent_dock::ObservedValue::Missing);
+    let permission_mode = permission_mode
+        .clone()
+        .map(agent_dock::ObservedValue::Observed)
+        .unwrap_or(agent_dock::ObservedValue::Missing);
+    Some(agent_dock::ObservedConfiguration {
+        cli,
+        execution_platform: ExecutionPlatform::Interactive,
+        model,
+        identity: BTreeMap::from([("permission_mode".to_owned(), permission_mode)]),
+    })
+}
+
+fn load_observation_config() -> Result<Config, AppError> {
+    let path = default_config_path()?;
+    if !path.exists() {
+        return Err(AppError::Usage(format!(
+            "configuration does not exist: {}",
+            path.display()
+        )));
+    }
+    Ok(Config::load(&path)?)
+}
+
+fn interactive_profile<'a>(
+    config: &'a Config,
+    name: &str,
+) -> Result<&'a ProfileDeclaration, AppError> {
+    config
+        .profiles
+        .iter()
+        .find(|profile| {
+            profile.name == name && profile.execution_platform == ExecutionPlatform::Interactive
+        })
+        .ok_or_else(|| {
+            AppError::Usage(format!(
+                "unknown interactive profile `{}`",
+                escape_terminal(name)
+            ))
+        })
+}
+
+fn scorecard() -> Result<i32, AppError> {
+    let config = load_observation_config()?;
+    let profiles: Vec<_> = config
+        .profiles
+        .iter()
+        .map(|profile| {
+            profile
+                .resolve(profile.executable())
+                .expect("validated configuration")
+        })
+        .collect();
+    let event_log = EventLog::new(default_events_path()?);
+    let history = read_event_history(&event_log)?;
+    print_skipped_event_warnings(&history);
+    let tags = collect_tag_candidates(&config.tag_candidates, &history.events);
+    let all_segments = segments_for_tags(&tags);
+    let segments = visible_segments(&all_segments);
+    let hidden_tags = all_segments.len() - segments.len();
+    let projection = project(&history.events, &profiles, &segments);
+    for warning in &projection.warnings {
+        eprintln!("Warning: {}", escape_terminal(warning));
+    }
+    for exclusion in &projection.exclusions {
+        eprintln!(
+            "Direct observation excluded ({}): {}",
+            exclusion_reason_label(exclusion.reason),
+            exclusion.count
+        );
+    }
+    let rendered = render_profile_choices(
+        &profiles,
+        &projection.scorecards,
+        hidden_tags,
+        Timestamp::now(),
+    );
+    for card in rendered {
+        println!("{card}");
+    }
+    Ok(0)
 }
 
 fn judge() -> Result<i32, AppError> {
@@ -309,7 +625,7 @@ fn judge() -> Result<i32, AppError> {
                 &format!(
                     "Append {} judgement to execution {}?",
                     verdict_label(verdict),
-                    candidate.execution_event_id
+                    candidate.task_id
                 ),
                 false,
             )
@@ -329,14 +645,9 @@ fn judge() -> Result<i32, AppError> {
         }
         JudgementResolution::Quit => {}
         JudgementResolution::Declined => println!("No judgement was recorded."),
-        JudgementResolution::Appended {
-            execution_event_id,
-            verdict,
-        } => println!(
-            "Recorded {} for execution {}.",
-            verdict_label(verdict),
-            execution_event_id
-        ),
+        JudgementResolution::Appended { task_id, verdict } => {
+            println!("Recorded {} for task {}.", verdict_label(verdict), task_id)
+        }
     }
     Ok(0)
 }
@@ -346,10 +657,7 @@ enum JudgementResolution {
     NoCandidates,
     Quit,
     Declined,
-    Appended {
-        execution_event_id: Uuid,
-        verdict: Verdict,
-    },
+    Appended { task_id: Uuid, verdict: Verdict },
 }
 
 fn resolve_judgement_with(
@@ -367,10 +675,10 @@ fn resolve_judgement_with(
     let Some(selected) = choose(&candidates)? else {
         return Ok(JudgementResolution::Quit);
     };
-    let execution_event_id = candidates
+    let task_id = candidates
         .get(selected)
         .ok_or_else(|| AppError::Usage("selected execution is out of range".to_owned()))?
-        .execution_event_id;
+        .task_id;
     let Some(verdict) = read_new_verdict()? else {
         return Ok(JudgementResolution::Quit);
     };
@@ -379,29 +687,22 @@ fn resolve_judgement_with(
         let latest = read_event_history(event_log)?;
         let Some(candidate) = judgement_candidates(&latest.events)
             .into_iter()
-            .find(|candidate| candidate.execution_event_id == execution_event_id)
+            .find(|candidate| candidate.task_id == task_id)
         else {
-            return Err(AppError::ExecutionNoLongerAvailable(execution_event_id));
+            return Err(AppError::ExecutionNoLongerAvailable(task_id));
         };
         if !confirm_append(&candidate, verdict)? {
             return Ok(JudgementResolution::Declined);
         }
-        match event_log.append_judgement_if_current(
-            execution_event_id,
-            candidate.current_verdict,
-            verdict,
-        )? {
+        match event_log.append_judgement_if_current(task_id, candidate.current_verdict, verdict)? {
             AppendJudgementOutcome::Appended => {
-                return Ok(JudgementResolution::Appended {
-                    execution_event_id,
-                    verdict,
-                });
+                return Ok(JudgementResolution::Appended { task_id, verdict });
             }
             AppendJudgementOutcome::CurrentVerdictChanged { current } => {
                 judgement_changed(candidate.current_verdict, current);
             }
-            AppendJudgementOutcome::ExecutionMissing => {
-                return Err(AppError::ExecutionNoLongerAvailable(execution_event_id));
+            AppendJudgementOutcome::TaskMissing => {
+                return Err(AppError::ExecutionNoLongerAvailable(task_id));
             }
         }
     }
@@ -436,7 +737,7 @@ fn render_judgement_candidate(candidate: &JudgementCandidate) -> String {
     };
     format!(
         "{} | {} | {} [{}; {}; {}] | {} | tags: {} | current: {}",
-        candidate.execution_event_id,
+        candidate.target_event_id,
         candidate.started_at,
         escape_terminal(&candidate.profile.name),
         candidate.profile.cli,
@@ -843,13 +1144,44 @@ fn render_segment(score: &SegmentScore, now: Timestamp) -> String {
         String::new()
     };
     format!(
-        "{label}: Acceptance {}{} | Duration {}{} | Cost missing (0){}",
+        "{label}: Acceptance {}{} | Duration {}{} | {}{}",
         format_acceptance(&score.acceptance),
         acceptance_recency,
         format_duration(&score.duration),
         duration_recency,
+        format_cost(&score.cost),
         excluded,
     )
+}
+
+fn format_cost(cost: &agent_dock::CostAxis) -> String {
+    match (
+        cost.currency.as_deref(),
+        cost.total_minor_units,
+        cost.summary.count,
+    ) {
+        (Some(currency), Some(total), count) => format!(
+            "Cost {currency} {total} minor units ({count}, {} missing)",
+            cost.missing_count
+        ),
+        (None, None, count) if count > 0 => format!(
+            "Cost mixed currencies ({count}, {} missing)",
+            cost.missing_count
+        ),
+        _ => format!("Cost missing ({})", cost.missing_count),
+    }
+}
+
+fn exclusion_reason_label(reason: ExclusionReason) -> &'static str {
+    match reason {
+        ExclusionReason::Ongoing => "ongoing",
+        ExclusionReason::Interrupted => "interrupted",
+        ExclusionReason::InvalidTiming => "invalid timing",
+        ExclusionReason::MissingConfiguration => "missing configuration",
+        ExclusionReason::ConfigurationChanged => "configuration changed",
+        ExclusionReason::NoMatchingProfile => "no matching profile",
+        ExclusionReason::AmbiguousProfile => "ambiguous profile",
+    }
 }
 
 fn prompt_is_valid(prompt: &str) -> bool {
@@ -1025,7 +1357,9 @@ fn record_approved_task(
     received: Event,
     profile_id: &str,
 ) -> Result<(), AppError> {
-    let task_id = received.task_id;
+    let task_id = received
+        .task_id
+        .ok_or_else(|| AppError::Usage("task event is missing task identity".to_owned()))?;
     event_log.append(&received)?;
     record_assignment(event_log, task_id, profile_id)
 }
@@ -1091,6 +1425,12 @@ enum AppError {
     #[error(transparent)]
     Record(#[from] agent_dock::RecordError),
     #[error(transparent)]
+    Observation(#[from] agent_dock::ObservationError),
+    #[error(transparent)]
+    Hook(#[from] agent_dock::HookParseError),
+    #[error(transparent)]
+    OTel(#[from] agent_dock::OtelParseError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Readline(#[from] ReadlineError),
@@ -1102,6 +1442,8 @@ enum AppError {
     Usage(String),
     #[error("execution {0} is no longer available")]
     ExecutionNoLongerAvailable(Uuid),
+    #[error("session {0} has no active task; recorded an orphan end mark")]
+    OrphanTaskEnd(Uuid),
 }
 
 impl AppError {
@@ -1118,19 +1460,51 @@ impl AppError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn hook_configuration_keeps_only_attribution_fields() {
+        let configuration = hook_configuration(
+            agent_dock::CliKind::Codex,
+            &HookEvent::Stop {
+                model: Some("gpt-5".to_owned()),
+                permission_mode: Some("default".to_owned()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            configuration.model,
+            agent_dock::ObservedValue::Observed(Some("gpt-5".to_owned()))
+        );
+        assert_eq!(
+            configuration.identity,
+            BTreeMap::from([(
+                "permission_mode".to_owned(),
+                agent_dock::ObservedValue::Observed("default".to_owned()),
+            )])
+        );
+        assert!(
+            hook_configuration(
+                agent_dock::CliKind::Codex,
+                &HookEvent::SessionEnd { reason: None }
+            )
+            .is_none()
+        );
+    }
+
     fn judgement_candidate() -> JudgementCandidate {
         JudgementCandidate {
-            execution_event_id: Uuid::parse_str("0198a8e2-9a80-7000-8000-000000000001").unwrap(),
+            target_event_id: Uuid::parse_str("0198a8e2-9a80-7000-8000-000000000001").unwrap(),
             task_id: Uuid::parse_str("0198a8e2-9a80-7000-8000-000000000002").unwrap(),
             started_at: "2026-08-01T01:02:03Z".parse().unwrap(),
             profile: ProfileSnapshot {
                 id: "profile-id".to_owned(),
                 name: "Historical\nProfile".to_owned(),
                 cli: agent_dock::CliKind::Test,
+                execution_platform: ExecutionPlatform::Headless,
                 executable_override: None,
                 model: Some("model\tname".to_owned()),
                 args: Vec::new(),
-                resolved_executable: PathBuf::from("/usr/bin/true"),
+                identity: Default::default(),
+                resolved_executable: Some(PathBuf::from("/usr/bin/true")),
             },
             outcome: RecordedExecutionOutcome::Completed { exit_code: Some(2) },
             tags: vec!["rust\nreview".to_owned()],
@@ -1143,6 +1517,7 @@ mod tests {
         let mut execution = Event::new(
             candidate.task_id,
             EventKind::Executed {
+                origin: ExecutionOrigin::Brokered,
                 profile: candidate.profile,
                 working_directory: PathBuf::from("/tmp/project"),
                 started_at: candidate.started_at,
@@ -1151,7 +1526,7 @@ mod tests {
                 cost: None,
             },
         );
-        execution.event_id = candidate.execution_event_id;
+        execution.event_id = candidate.target_event_id;
         execution
     }
 
@@ -1183,12 +1558,16 @@ mod tests {
             AppCommand::Judge
         );
         assert_eq!(
+            command_from_args([OsString::from("scorecard")].into_iter()).unwrap(),
+            AppCommand::Scorecard
+        );
+        assert_eq!(
             command_from_args([OsString::from("--help")].into_iter()).unwrap(),
             AppCommand::Help
         );
         assert!(matches!(
             command_from_args([OsString::from("unknown")].into_iter()),
-            Err(AppError::Usage(message)) if message.contains("Usage: agent-dock [judge]")
+            Err(AppError::Usage(message)) if message.contains("Usage: agent-dock [judge|scorecard|observe]")
         ));
         assert!(matches!(
             command_from_args(
@@ -1281,7 +1660,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let log = EventLog::new(directory.path().join("events.jsonl"));
         let execution = judgement_execution();
-        let execution_event_id = execution.event_id;
+        let task_id = execution.task_id.unwrap();
         log.append(&execution).unwrap();
         let mut confirmed = Vec::new();
         let mut changes = Vec::new();
@@ -1296,7 +1675,6 @@ mod tests {
                     log.append(&Event::new(
                         candidate.task_id,
                         EventKind::Judged {
-                            execution_event_id,
                             verdict: Verdict::Accepted,
                         },
                     ))?;
@@ -1310,7 +1688,7 @@ mod tests {
         assert_eq!(
             resolution,
             JudgementResolution::Appended {
-                execution_event_id,
+                task_id,
                 verdict: Verdict::Rejected
             }
         );
@@ -1321,9 +1699,8 @@ mod tests {
         assert!(matches!(
             events[2].kind,
             EventKind::Judged {
-                execution_event_id: target,
-                verdict: Verdict::Rejected,
-            } if target == execution_event_id
+                verdict: Verdict::Rejected
+            }
         ));
     }
 
@@ -1333,7 +1710,7 @@ mod tests {
         let path = directory.path().join("events.jsonl");
         let log = EventLog::new(&path);
         let execution = judgement_execution();
-        let execution_event_id = execution.event_id;
+        let task_id = execution.task_id.unwrap();
         log.append(&execution).unwrap();
 
         let error = resolve_judgement_with(
@@ -1350,7 +1727,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            AppError::ExecutionNoLongerAvailable(target) if target == execution_event_id
+            AppError::ExecutionNoLongerAvailable(target) if target == task_id
         ));
         assert!(!path.exists());
     }
@@ -1692,9 +2069,9 @@ mod tests {
         let events = log.read_all().unwrap().events;
         assert_eq!(resolution, RunResolution::Run(task_id));
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].task_id, task_id);
+        assert_eq!(events[0].task_id, Some(task_id));
         assert!(matches!(events[0].kind, EventKind::TaskReceived { .. }));
-        assert_eq!(events[1].task_id, task_id);
+        assert_eq!(events[1].task_id, Some(task_id));
         assert!(matches!(events[1].kind, EventKind::Assigned { .. }));
     }
 
@@ -1986,6 +2363,7 @@ mod tests {
             acceptance: agent_dock::AcceptanceAxis::default(),
             duration: agent_dock::DurationAxis::default(),
             cost: agent_dock::CostAxis::default(),
+            origins: agent_dock::OriginCounts::default(),
         };
 
         assert_eq!(
@@ -1999,9 +2377,11 @@ mod tests {
         let profile = ProfileDeclaration {
             name: "Missing".to_owned(),
             cli: agent_dock::CliKind::Claude,
+            execution_platform: ExecutionPlatform::Headless,
             executable: Some(std::path::PathBuf::from("/definitely/not/installed")),
             model: None,
             args: Vec::new(),
+            identity: Default::default(),
         };
 
         assert!(resolve_executable(&profile).is_none());

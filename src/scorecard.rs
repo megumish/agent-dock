@@ -4,7 +4,8 @@ use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::{
-    Event, EventKind, ExecutionProfile, RecordedExecutionOutcome, Verdict,
+    ActualCost, AttributionFailure, Event, EventKind, ExecutionOrigin, ExecutionProfile,
+    ObservedTaskStatus, ProfileAttribution, RecordedExecutionOutcome, Verdict,
     judgement::latest_verdicts,
 };
 
@@ -36,6 +37,9 @@ pub struct DurationAxis {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CostAxis {
     pub summary: AxisSummary,
+    pub currency: Option<String>,
+    pub total_minor_units: Option<u64>,
+    pub missing_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +50,13 @@ pub struct SegmentScore {
     pub acceptance: AcceptanceAxis,
     pub duration: DurationAxis,
     pub cost: CostAxis,
+    pub origins: OriginCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OriginCounts {
+    pub brokered: usize,
+    pub direct_observation: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,15 +68,45 @@ pub struct ProfileScorecard {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Projection {
     pub scorecards: Vec<ProfileScorecard>,
+    pub exclusions: Vec<ExclusionSummary>,
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExclusionReason {
+    Ongoing,
+    Interrupted,
+    InvalidTiming,
+    MissingConfiguration,
+    ConfigurationChanged,
+    NoMatchingProfile,
+    AmbiguousProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExclusionSummary {
+    pub reason: ExclusionReason,
+    pub count: usize,
+}
+
 struct Execution<'a> {
-    event_id: Uuid,
+    task_id: Uuid,
     started_at: Timestamp,
     elapsed_ms: u64,
-    outcome: &'a RecordedExecutionOutcome,
+    completed: bool,
+    actual_cost: Option<&'a ActualCost>,
+    origin: ExecutionOrigin,
     tags: &'a [String],
+}
+
+#[derive(Default)]
+struct DirectTask<'a> {
+    started_at: Option<Timestamp>,
+    status: Option<ObservedTaskStatus>,
+    attribution: Option<&'a ProfileAttribution>,
+    elapsed_ms: Option<u64>,
+    actual_cost: Option<&'a ActualCost>,
+    origin: Option<ExecutionOrigin>,
 }
 
 pub fn segments_for_tags(tags: &[String]) -> Vec<Segment> {
@@ -94,7 +135,13 @@ pub fn project(
     let verdicts = latest_verdicts(events);
     for event in events {
         if let EventKind::TaskReceived { tags, .. } = &event.kind {
-            task_tags.insert(event.task_id, tags);
+            if let Some(task_id) = event.task_id {
+                task_tags.insert(task_id, tags);
+            }
+        } else if let EventKind::ObservedTaskStarted { tags, .. } = &event.kind
+            && let Some(task_id) = event.task_id
+        {
+            task_tags.insert(task_id, tags);
         }
     }
 
@@ -106,6 +153,7 @@ pub fn project(
     let empty_tags = Vec::new();
     for event in events {
         let EventKind::Executed {
+            origin,
             profile,
             started_at,
             elapsed_ms,
@@ -113,6 +161,13 @@ pub fn project(
             ..
         } = &event.kind
         else {
+            continue;
+        };
+        let Some(task_id) = event.task_id else {
+            projection.warnings.push(format!(
+                "execution event {} is missing task identity; excluded",
+                event.event_id
+            ));
             continue;
         };
         let Some(current_profile) = current.get(profile.id.as_str()) else {
@@ -132,16 +187,113 @@ pub fn project(
             .entry(profile.id.as_str())
             .or_default()
             .push(Execution {
-                event_id: event.event_id,
+                task_id,
                 started_at: *started_at,
                 elapsed_ms: *elapsed_ms,
-                outcome,
-                tags: task_tags
-                    .get(&event.task_id)
-                    .copied()
-                    .unwrap_or(&empty_tags),
+                completed: matches!(outcome, RecordedExecutionOutcome::Completed { .. }),
+                actual_cost: None,
+                origin: *origin,
+                tags: task_tags.get(&task_id).copied().unwrap_or(&empty_tags),
             });
     }
+
+    let mut direct: HashMap<Uuid, DirectTask<'_>> = HashMap::new();
+    for event in events {
+        let Some(task_id) = event.task_id else {
+            continue;
+        };
+        match &event.kind {
+            EventKind::ObservedTaskStarted { origin, .. } => {
+                let task = direct.entry(task_id).or_default();
+                task.started_at = Some(event.occurred_at);
+                task.origin = Some(*origin);
+            }
+            EventKind::ObservedTaskEnded { status, .. } => {
+                direct.entry(task_id).or_default().status = Some(*status);
+            }
+            EventKind::ProfileAttributed { attribution, .. } => {
+                direct.entry(task_id).or_default().attribution = Some(attribution);
+            }
+            EventKind::MeasurementObserved {
+                elapsed_ms,
+                actual_cost,
+                ..
+            } => {
+                let task = direct.entry(task_id).or_default();
+                task.elapsed_ms = *elapsed_ms;
+                task.actual_cost = actual_cost.as_ref();
+            }
+            _ => {}
+        }
+    }
+    let mut exclusion_counts: HashMap<ExclusionReason, usize> = HashMap::new();
+    for (task_id, task) in direct {
+        let reason = match task.status {
+            None => Some(ExclusionReason::Ongoing),
+            Some(ObservedTaskStatus::Interrupted) => Some(ExclusionReason::Interrupted),
+            Some(ObservedTaskStatus::Completed)
+                if task.started_at.is_none()
+                    || task.elapsed_ms.is_none()
+                    || task.origin != Some(ExecutionOrigin::DirectObservation) =>
+            {
+                Some(ExclusionReason::InvalidTiming)
+            }
+            Some(ObservedTaskStatus::Completed) => match task.attribution {
+                Some(ProfileAttribution::Matched { .. }) => None,
+                Some(ProfileAttribution::Unattributed { reason }) => Some(match reason {
+                    AttributionFailure::MissingConfiguration => {
+                        ExclusionReason::MissingConfiguration
+                    }
+                    AttributionFailure::ConfigurationChanged => {
+                        ExclusionReason::ConfigurationChanged
+                    }
+                    AttributionFailure::NoMatchingProfile => ExclusionReason::NoMatchingProfile,
+                    AttributionFailure::AmbiguousProfile => ExclusionReason::AmbiguousProfile,
+                }),
+                None => Some(ExclusionReason::MissingConfiguration),
+            },
+        };
+        if let Some(reason) = reason {
+            *exclusion_counts.entry(reason).or_default() += 1;
+            continue;
+        }
+        let Some(ProfileAttribution::Matched { profile }) = task.attribution else {
+            continue;
+        };
+        let Some(current_profile) = current.get(profile.id.as_str()) else {
+            *exclusion_counts
+                .entry(ExclusionReason::NoMatchingProfile)
+                .or_default() += 1;
+            continue;
+        };
+        let same_identity = profile.declaration().canonical_identity().ok()
+            == current_profile.declaration.canonical_identity().ok();
+        if !same_identity {
+            *exclusion_counts
+                .entry(ExclusionReason::NoMatchingProfile)
+                .or_default() += 1;
+            continue;
+        }
+        executions
+            .entry(profile.id.as_str())
+            .or_default()
+            .push(Execution {
+                task_id,
+                started_at: task.started_at.expect("validated above"),
+                elapsed_ms: task.elapsed_ms.expect("validated above"),
+                completed: true,
+                actual_cost: task.actual_cost,
+                origin: ExecutionOrigin::DirectObservation,
+                tags: task_tags.get(&task_id).copied().unwrap_or(&empty_tags),
+            });
+    }
+    projection.exclusions = exclusion_counts
+        .into_iter()
+        .map(|(reason, count)| ExclusionSummary { reason, count })
+        .collect();
+    projection
+        .exclusions
+        .sort_by_key(|summary| summary.reason as u8);
 
     let mut seen_profiles = HashSet::new();
     let mut seen_segments = HashSet::new();
@@ -190,22 +342,22 @@ fn score_segment(
     verdicts: &HashMap<Uuid, Verdict>,
 ) -> SegmentScore {
     let mut acceptance = AcceptanceAxis::default();
+    let mut origins = OriginCounts::default();
     let mut durations = Vec::new();
     let mut duration_latest = None;
     let mut included = HashSet::new();
     for execution in executions {
-        if let Some(verdict) = verdicts.get(&execution.event_id) {
+        match execution.origin {
+            ExecutionOrigin::Brokered => origins.brokered += 1,
+            ExecutionOrigin::DirectObservation => origins.direct_observation += 1,
+        }
+        if let Some(verdict) = verdicts.get(&execution.task_id) {
             acceptance.summary.count += 1;
             acceptance.accepted += usize::from(*verdict == Verdict::Accepted);
             acceptance.summary.latest_started_at =
                 latest(acceptance.summary.latest_started_at, execution.started_at);
-            included.insert(execution.event_id);
-            if *verdict == Verdict::Accepted
-                && matches!(
-                    execution.outcome,
-                    RecordedExecutionOutcome::Completed { .. }
-                )
-            {
+            included.insert(execution.task_id);
+            if *verdict == Verdict::Accepted && execution.completed {
                 durations.push(execution.elapsed_ms);
                 duration_latest = latest(duration_latest, execution.started_at);
             }
@@ -222,15 +374,42 @@ fn score_segment(
     };
     let excluded_count = executions
         .iter()
-        .filter(|execution| !included.contains(&execution.event_id))
+        .filter(|execution| !included.contains(&execution.task_id))
         .count();
+    let costs: Vec<_> = executions
+        .iter()
+        .filter_map(|execution| execution.actual_cost)
+        .collect();
+    let currency = costs.first().map(|cost| cost.currency.clone());
+    let same_currency = currency
+        .as_ref()
+        .is_some_and(|currency| costs.iter().all(|cost| &cost.currency == currency));
+    let total_minor_units = same_currency.then(|| {
+        costs
+            .iter()
+            .fold(0_u64, |total, cost| total.saturating_add(cost.minor_units))
+    });
     SegmentScore {
         segment,
         execution_count: executions.len(),
         excluded_count,
         acceptance,
         duration,
-        cost: CostAxis::default(),
+        cost: CostAxis {
+            summary: AxisSummary {
+                count: costs.len(),
+                latest_started_at: executions
+                    .iter()
+                    .filter(|execution| execution.actual_cost.is_some())
+                    .fold(None, |latest_at, execution| {
+                        latest(latest_at, execution.started_at)
+                    }),
+            },
+            currency: same_currency.then_some(currency).flatten(),
+            total_minor_units,
+            missing_count: executions.len().saturating_sub(costs.len()),
+        },
+        origins,
     }
 }
 
@@ -313,6 +492,7 @@ pub fn format_recency(now: Timestamp, latest: Option<Timestamp>) -> Option<Strin
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use super::*;
@@ -320,6 +500,22 @@ mod tests {
 
     fn timestamp(value: &str) -> Timestamp {
         value.parse().unwrap()
+    }
+
+    fn interactive_profile() -> (crate::ProfileDeclaration, ExecutionProfile) {
+        let declaration = crate::ProfileDeclaration {
+            name: "Codex interactive".to_owned(),
+            cli: crate::CliKind::Codex,
+            execution_platform: crate::ExecutionPlatform::Interactive,
+            executable: None,
+            model: Some("gpt-5".to_owned()),
+            args: Vec::new(),
+            identity: BTreeMap::from([("permission_mode".to_owned(), "default".to_owned())]),
+        };
+        let resolved = declaration
+            .resolve(PathBuf::from("codex"))
+            .expect("profile is valid");
+        (declaration, resolved)
     }
 
     fn task(task_id: Uuid, at: &str, tags: &[&str]) -> Event {
@@ -346,9 +542,11 @@ mod tests {
         Event {
             format_version: crate::EVENT_FORMAT_VERSION.to_owned(),
             event_id,
-            task_id,
+            task_id: Some(task_id),
             occurred_at: timestamp(at),
+            provenance: crate::Provenance::Dock,
             kind: EventKind::Executed {
+                origin: crate::ExecutionOrigin::Brokered,
                 profile: ProfileSnapshot::from(&profile),
                 working_directory: PathBuf::from("/tmp"),
                 started_at: timestamp(at),
@@ -363,14 +561,8 @@ mod tests {
         }
     }
 
-    fn judged(task_id: Uuid, execution_event_id: Uuid, verdict: Verdict) -> Event {
-        Event::new(
-            task_id,
-            EventKind::Judged {
-                execution_event_id,
-                verdict,
-            },
-        )
+    fn judged(task_id: Uuid, _execution_event_id: Uuid, verdict: Verdict) -> Event {
+        Event::new(task_id, EventKind::Judged { verdict })
     }
 
     #[test]
@@ -419,37 +611,43 @@ mod tests {
     fn duration_uses_only_completed_crew_member_runtime() {
         let task_id = Uuid::now_v7();
         let cancelled = Uuid::now_v7();
-        let missing_task_id = Uuid::now_v7();
-        let accepted_earlier = Uuid::now_v7();
+        let accepted_earlier_task = Uuid::now_v7();
         let accepted_without_task = Uuid::now_v7();
+        let rejected_task = Uuid::now_v7();
+        let accepted_earlier = Uuid::now_v7();
+        let accepted_without_task_event = Uuid::now_v7();
         let later_rejected = Uuid::now_v7();
         let events = vec![
             task(task_id, "2026-01-01T00:00:00Z", &[]),
             execution(task_id, cancelled, "2026-01-01T00:00:01Z", 10, false),
             execution(
-                missing_task_id,
+                accepted_earlier_task,
                 accepted_earlier,
                 "2026-01-01T00:00:00Z",
                 6,
                 true,
             ),
-            judged(missing_task_id, accepted_earlier, Verdict::Accepted),
+            judged(accepted_earlier_task, accepted_earlier, Verdict::Accepted),
             execution(
-                missing_task_id,
                 accepted_without_task,
+                accepted_without_task_event,
                 "2026-01-01T00:00:02Z",
                 14,
                 true,
             ),
-            judged(missing_task_id, accepted_without_task, Verdict::Accepted),
+            judged(
+                accepted_without_task,
+                accepted_without_task_event,
+                Verdict::Accepted,
+            ),
             execution(
-                missing_task_id,
+                rejected_task,
                 later_rejected,
                 "2026-01-01T00:00:03Z",
                 100,
                 true,
             ),
-            judged(missing_task_id, later_rejected, Verdict::Rejected),
+            judged(rejected_task, later_rejected, Verdict::Rejected),
         ];
         let projection = project(&events, &[safe_test_profile()], &[Segment::Overall]);
         let score = &projection.scorecards[0].scores[0];
@@ -499,6 +697,224 @@ mod tests {
             Some(timestamp("2026-01-01T00:00:01Z"))
         );
         assert_eq!(score.excluded_count, 0);
+    }
+
+    #[test]
+    fn completed_attributed_direct_task_joins_the_profile_scorecard() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = crate::EventLog::new(directory.path().join("events.jsonl"));
+        let (declaration, profile) = interactive_profile();
+        let session = crate::apply_observation(
+            &log,
+            &[],
+            crate::ObservationCommand::ObserveSession {
+                session_id: None,
+                cli: crate::CliKind::Codex,
+                phase: crate::SessionPhase::Started,
+                external_session_id: Some("codex-session".to_owned()),
+                working_directory: Some(PathBuf::from("/tmp/project")),
+                configuration: None,
+                provenance: crate::Provenance::CliHook,
+            },
+        )
+        .unwrap()
+        .session_id;
+        let configuration = crate::configuration_for_profile(&declaration);
+        let task = crate::apply_observation(
+            &log,
+            std::slice::from_ref(&declaration),
+            crate::ObservationCommand::StartTask {
+                session_id: session,
+                tags: vec!["rust".to_owned()],
+                prompt: None,
+                prompt_chars: 0,
+                configuration: Some(configuration.clone()),
+            },
+        )
+        .unwrap()
+        .task_id
+        .unwrap();
+        crate::apply_observation(
+            &log,
+            std::slice::from_ref(&declaration),
+            crate::ObservationCommand::EndTask {
+                session_id: session,
+                status: crate::ObservedTaskStatus::Completed,
+                configuration: Some(configuration),
+            },
+        )
+        .unwrap();
+        log.append_judgement_if_current(task, None, Verdict::Accepted)
+            .unwrap();
+
+        let projection = project(
+            &log.read_all().unwrap().events,
+            &[profile],
+            &[Segment::Overall, Segment::Tag("rust".to_owned())],
+        );
+        assert!(projection.exclusions.is_empty());
+        for score in &projection.scorecards[0].scores {
+            assert_eq!(score.execution_count, 1);
+            assert_eq!(score.acceptance.accepted, 1);
+            assert_eq!(score.duration.summary.count, 1);
+            assert_eq!(score.cost.missing_count, 1);
+        }
+    }
+
+    #[test]
+    fn direct_task_exclusions_keep_distinct_reasons() {
+        let task_ids: Vec<_> = (0..7).map(|_| Uuid::now_v7()).collect();
+        let session = Uuid::now_v7();
+        let configuration = crate::ObservedConfiguration {
+            cli: crate::CliKind::Codex,
+            execution_platform: crate::ExecutionPlatform::Interactive,
+            model: crate::ObservedValue::Missing,
+            identity: Default::default(),
+        };
+        let mut events = Vec::new();
+        for task_id in &task_ids {
+            events.push(Event::for_task(
+                *task_id,
+                crate::Provenance::ManualMark,
+                EventKind::ObservedTaskStarted {
+                    session_id: session,
+                    origin: crate::ExecutionOrigin::DirectObservation,
+                    tags: Vec::new(),
+                    prompt: None,
+                    prompt_chars: 0,
+                },
+            ));
+        }
+        events.extend([
+            Event::for_task(
+                task_ids[1],
+                crate::Provenance::ManualMark,
+                EventKind::ObservedTaskEnded {
+                    session_id: session,
+                    status: crate::ObservedTaskStatus::Interrupted,
+                },
+            ),
+            Event::for_task(
+                task_ids[2],
+                crate::Provenance::ManualMark,
+                EventKind::ObservedTaskEnded {
+                    session_id: session,
+                    status: crate::ObservedTaskStatus::Completed,
+                },
+            ),
+            Event::for_task(
+                task_ids[2],
+                crate::Provenance::Dock,
+                EventKind::MeasurementObserved {
+                    session_id: session,
+                    elapsed_ms: None,
+                    actual_cost: None,
+                },
+            ),
+            Event::for_task(
+                task_ids[3],
+                crate::Provenance::ManualMark,
+                EventKind::ObservedTaskEnded {
+                    session_id: session,
+                    status: crate::ObservedTaskStatus::Completed,
+                },
+            ),
+            Event::for_task(
+                task_ids[3],
+                crate::Provenance::Dock,
+                EventKind::MeasurementObserved {
+                    session_id: session,
+                    elapsed_ms: Some(10),
+                    actual_cost: None,
+                },
+            ),
+            Event::for_task(
+                task_ids[3],
+                crate::Provenance::Dock,
+                EventKind::ProfileAttributed {
+                    session_id: session,
+                    attribution: crate::ProfileAttribution::Unattributed {
+                        reason: crate::AttributionFailure::MissingConfiguration,
+                    },
+                },
+            ),
+            Event::for_task(
+                task_ids[3],
+                crate::Provenance::ManualMark,
+                EventKind::ConfigurationObserved {
+                    session_id: session,
+                    boundary: crate::ConfigurationBoundary::Start,
+                    configuration,
+                },
+            ),
+        ]);
+        for (task_id, reason) in task_ids[4..].iter().zip([
+            crate::AttributionFailure::ConfigurationChanged,
+            crate::AttributionFailure::NoMatchingProfile,
+            crate::AttributionFailure::AmbiguousProfile,
+        ]) {
+            events.extend([
+                Event::for_task(
+                    *task_id,
+                    crate::Provenance::ManualMark,
+                    EventKind::ObservedTaskEnded {
+                        session_id: session,
+                        status: crate::ObservedTaskStatus::Completed,
+                    },
+                ),
+                Event::for_task(
+                    *task_id,
+                    crate::Provenance::Dock,
+                    EventKind::MeasurementObserved {
+                        session_id: session,
+                        elapsed_ms: Some(10),
+                        actual_cost: None,
+                    },
+                ),
+                Event::for_task(
+                    *task_id,
+                    crate::Provenance::Dock,
+                    EventKind::ProfileAttributed {
+                        session_id: session,
+                        attribution: crate::ProfileAttribution::Unattributed { reason },
+                    },
+                ),
+            ]);
+        }
+        let projection = project(&events, &[], &[Segment::Overall]);
+        assert_eq!(
+            projection.exclusions,
+            vec![
+                ExclusionSummary {
+                    reason: ExclusionReason::Ongoing,
+                    count: 1
+                },
+                ExclusionSummary {
+                    reason: ExclusionReason::Interrupted,
+                    count: 1
+                },
+                ExclusionSummary {
+                    reason: ExclusionReason::InvalidTiming,
+                    count: 1
+                },
+                ExclusionSummary {
+                    reason: ExclusionReason::MissingConfiguration,
+                    count: 1
+                },
+                ExclusionSummary {
+                    reason: ExclusionReason::ConfigurationChanged,
+                    count: 1
+                },
+                ExclusionSummary {
+                    reason: ExclusionReason::NoMatchingProfile,
+                    count: 1
+                },
+                ExclusionSummary {
+                    reason: ExclusionReason::AmbiguousProfile,
+                    count: 1
+                },
+            ]
+        );
     }
 
     #[test]

@@ -42,12 +42,12 @@ DEPENDENCIES と AGENTS は、この具体化の順序とは別に、それぞ�
 1. [VISION.md](./VISION.md)
 2. [DESIGN.md](./DESIGN.md)
 3. [DEPENDENCIES.md](./DEPENDENCIES.md)
-4. [現在のリリース文書](./docs/releases/0.1.0-alpha.5.md)
+4. [現在のリリース文書](./docs/releases/0.1.0-alpha.6.md)
 
-## 0.1.0-alpha.5
+## 0.1.0-alpha.6
 
-0.1.0-alpha.5 は、一つのタスクを登録済みの実行プロファイルへ依頼し、評価イベントの記録、スコアカード、過去実行の判定追記を扱う対話型 CLI である。
-Claude Code、Codex CLI、Gemini CLI、Antigravity CLI のヘッドレス実行を扱う。
+0.1.0-alpha.6 は、一つのタスクを登録済みの実行プロファイルへ依頼する仲介実行に加え、ユーザーが直接起動した Claude Code と Codex CLI の対話セッションを観測する。
+仲介実行では Claude Code、Codex CLI、Gemini CLI、Antigravity CLI のヘッドレス実行を扱う。
 対応 OS は macOS に限り、ほかの OS での動作は保証しない。
 
 Rust ツールチェーンは mise で管理する。
@@ -63,8 +63,57 @@ mise run
 mise run default -- -- judge
 ```
 
-初回起動では、ユーザー設定ディレクトリに四つの既定プロファイルを作成するか確認する。
-実行する CLI のモデル、権限、サンドボックスは各 CLI の通常設定を継承する。
+すべての登録済みプロファイルについて、仲介実行と帰属済みの直接実行を同じスコアカードで確認できる。
 
-0.1.0-alpha.5 は実行前の再編集と過去実行の判定追記までを対象とし、助言はまだ実装しない。
-現在の実装範囲と挙動は [0.1.0-alpha.5 のリリース文書](./docs/releases/0.1.0-alpha.5.md) に記録する。
+```console
+mise run default -- -- scorecard
+```
+
+初回起動では、ユーザー設定ディレクトリに四つのヘッドレス実行プロファイルと、Claude Code、Codex CLI 用の二つの対話型プロファイルを作成するか確認する。
+実行する CLI のモデル、権限、サンドボックスは各 CLI の通常設定を継承する。
+対話型プロファイルへ直接実行を自動帰属させる場合は、実際に使うモデルと、必要に応じて `identity.permission_mode` を設定する。
+
+## 直接実行を観測する
+
+Claude Code の `SessionStart`、`SessionEnd`、`CwdChanged`、`StopFailure` hook には、標準入力を次のコマンドへ渡す。
+
+```console
+agent-dock observe hook claude
+```
+
+Codex CLI の `SessionStart`、`SessionEnd`、`Stop` hook には、標準入力を次のコマンドへ渡す。
+
+```console
+agent-dock observe hook codex
+```
+
+hook の定義場所と command 型 hook の信頼確認は、それぞれの CLI の公式手順に従う。
+各コマンドは、許可したセッション識別子、作業ディレクトリ、モデル、権限モードだけを正規化し、会話記録のパス、入力、応答、ツールの引数と出力を保存しない。
+
+タスクの開始と終了は自動推測せず、同じセッションで一つずつ明示する。
+外部セッション ID しか分からない場合は、最初にローカルセッション ID を取得する。
+
+```console
+agent-dock observe session-find --cli codex --external-id <external-session-id>
+agent-dock observe task-start --session <local-session-id> --tag rust
+agent-dock observe task-complete --session <local-session-id>
+```
+
+中断したタスクは `task-interrupt` で閉じる。
+hook からモデルまたは必要な識別項目を取得できない場合は自動帰属せず、`task-start` と `task-complete` の両方へ `--profile '<対話型プロファイル名>'` を渡して構成を明示申告できる。
+終了境界では、タスク開始後に改めて届いた構成だけを使うため、終了まで構成を再通知しない Claude Code では通常この明示申告または後続の帰属訂正が必要になる。
+誤った帰属は `task-attribute` または `task-unattribute` で訂正し、過去イベントを上書きせず新しい帰属イベントを追記する。
+
+Claude Code または Codex CLI が出力した OTLP/HTTP JSON の Logs ペイロードは、次のコマンドの標準入力から補助事実として取り込める。
+
+```console
+agent-dock observe otel claude < otlp-logs.json
+agent-dock observe otel codex < otlp-logs.json
+```
+
+このコマンドは HTTP 受信サーバーではない。
+本文を含まない設定でエクスポートしたペイロードを、ファイル出力またはローカル Collector から渡す。
+発生区間が一つの完了済み明示タスクへ完全に含まれる API 要求だけを関連付け、推定コストは実支出としてスコアへ加えない。
+
+0.1.0-alpha.6 は直接実行の観測までを対象とし、助言はまだ実装しない。
+現在の実装範囲と挙動は [0.1.0-alpha.6 のリリース文書](./docs/releases/0.1.0-alpha.6.md) に記録する。
