@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Dock Documentation Maintenance"
+  short_description: "Maintain Agent Dock docs by role, authority, and time scope"
+  default_prompt: "Use $maintain-agent-dock-docs to place and update Agent Dock documentation in the correct source of truth."
