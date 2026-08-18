@@ -5,7 +5,6 @@ pub mod hook;
 pub mod judgement;
 pub mod observation;
 pub mod observe_cli;
-pub mod otel;
 pub mod record;
 pub mod scorecard;
 
@@ -27,7 +26,6 @@ pub use observation::{
     configuration_for_profile, resolve_observed_session,
 };
 pub use observe_cli::{ObserveCliCommand, parse_observe_args};
-pub use otel::{AuxiliaryFact, OTelProvider, OtelParseError, parse_otlp_logs};
 pub use record::{
     ActualCost, AppendBatchOutcome, AppendJudgementOutcome, AttributionFailure,
     BackupEventLogOutcome, ConfigurationBoundary, EVENT_FORMAT_VERSION, Event, EventKind, EventLog,

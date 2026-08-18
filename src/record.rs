@@ -64,7 +64,6 @@ pub enum Provenance {
     Dock,
     ManualMark,
     CliHook,
-    OpenTelemetry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,15 +129,6 @@ pub enum EventKind {
         session_id: Uuid,
         elapsed_ms: Option<u64>,
         actual_cost: Option<ActualCost>,
-    },
-    AuxiliaryMeasurementObserved {
-        session_id: Uuid,
-        interval_started_at: Timestamp,
-        interval_ended_at: Timestamp,
-        model: Option<String>,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        estimated_cost_usd_micros: Option<u64>,
     },
     ObservationAnomaly {
         session_id: Option<Uuid>,
@@ -210,7 +200,6 @@ pub struct ActualCost {
 pub enum ObservationAnomaly {
     OrphanTaskEnd,
     SessionEndMissing,
-    UncorrelatedAuxiliaryFact,
     UnsupportedHook { provider: String, event: String },
     InvalidHook { provider: String },
 }
@@ -714,11 +703,7 @@ fn decode_event_line(line: &str) -> Result<Event, SkippedLineReason> {
         }
         EventKind::ObservedTaskEnded { .. } => event.provenance == Provenance::ManualMark,
         EventKind::ConfigurationObserved { .. } => event.provenance == Provenance::ManualMark,
-        EventKind::AuxiliaryMeasurementObserved { .. } => {
-            event.provenance == Provenance::OpenTelemetry
-        }
         EventKind::Executed { origin, .. } => *origin == ExecutionOrigin::Brokered,
-        EventKind::SessionObserved { .. } => event.provenance != Provenance::OpenTelemetry,
         _ => true,
     };
     if !semantics_valid {

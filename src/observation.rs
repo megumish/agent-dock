@@ -5,10 +5,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    AppendBatchOutcome, AttributionFailure, AuxiliaryFact, CliKind, ConfigurationBoundary, Event,
-    EventKind, EventLog, ExecutionOrigin, ExecutionPlatform, OTelProvider, ObservationAnomaly,
-    ObservedConfiguration, ObservedTaskStatus, ObservedValue, ProfileAttribution,
-    ProfileDeclaration, ProfileSnapshot, Provenance, ReadEvents, RecordError, SessionPhase,
+    AppendBatchOutcome, AttributionFailure, CliKind, ConfigurationBoundary, Event, EventKind,
+    EventLog, ExecutionOrigin, ExecutionPlatform, ObservationAnomaly, ObservedConfiguration,
+    ObservedTaskStatus, ObservedValue, ProfileAttribution, ProfileDeclaration, ProfileSnapshot,
+    Provenance, ReadEvents, RecordError, SessionPhase,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 8;
@@ -46,9 +46,6 @@ pub enum ObservationCommand {
         task_id: Uuid,
         attribution: ProfileAttribution,
     },
-    RecordAuxiliaryFact {
-        fact: AuxiliaryFact,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,21 +75,12 @@ struct ObservationState {
     sessions: HashMap<Uuid, SessionState>,
     external_sessions: HashMap<(CliKind, String), Uuid>,
     tasks: HashMap<Uuid, ObservedTaskState>,
-    task_intervals: Vec<TaskInterval>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ObservedTaskState {
     session_id: Uuid,
     ended: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TaskInterval {
-    task_id: Uuid,
-    session_id: Uuid,
-    started_at: Timestamp,
-    ended_at: Timestamp,
 }
 
 pub fn apply_observation(
@@ -482,62 +470,6 @@ fn decide(
                 )],
             ))
         }
-        ObservationCommand::RecordAuxiliaryFact { fact } => {
-            let cli = match fact.provider {
-                OTelProvider::Claude => CliKind::Claude,
-                OTelProvider::Codex => CliKind::Codex,
-            };
-            let session_id = state
-                .external_sessions
-                .get(&(cli, fact.external_session_id.clone()))
-                .copied();
-            let matches: Vec<_> = state
-                .task_intervals
-                .iter()
-                .filter(|interval| {
-                    Some(interval.session_id) == session_id
-                        && fact.started_at >= interval.started_at
-                        && fact.ended_at <= interval.ended_at
-                })
-                .collect();
-            if let (Some(session_id), [interval]) = (session_id, matches.as_slice()) {
-                return Ok((
-                    ObservationOutcome {
-                        session_id,
-                        task_id: Some(interval.task_id),
-                        anomaly_recorded: false,
-                    },
-                    vec![Event::for_task(
-                        interval.task_id,
-                        Provenance::OpenTelemetry,
-                        EventKind::AuxiliaryMeasurementObserved {
-                            session_id,
-                            interval_started_at: fact.started_at,
-                            interval_ended_at: fact.ended_at,
-                            model: fact.model.clone(),
-                            input_tokens: fact.input_tokens,
-                            output_tokens: fact.output_tokens,
-                            estimated_cost_usd_micros: fact.estimated_cost_usd_micros,
-                        },
-                    )],
-                ));
-            }
-            let session_for_event = session_id;
-            Ok((
-                ObservationOutcome {
-                    session_id: session_id.unwrap_or_else(Uuid::nil),
-                    task_id: None,
-                    anomaly_recorded: true,
-                },
-                vec![Event::for_session(
-                    Provenance::OpenTelemetry,
-                    EventKind::ObservationAnomaly {
-                        session_id: session_for_event,
-                        anomaly: ObservationAnomaly::UncorrelatedAuxiliaryFact,
-                    },
-                )],
-            ))
-        }
     }
 }
 
@@ -545,7 +477,6 @@ fn reconstruct(events: &[Event]) -> Result<ObservationState, ObservationError> {
     let mut state = ObservationState::default();
     let mut task_sessions = HashMap::new();
     let mut ended_tasks = std::collections::HashSet::new();
-    let mut task_intervals = Vec::new();
     for event in events {
         match &event.kind {
             EventKind::SessionObserved {
@@ -556,8 +487,7 @@ fn reconstruct(events: &[Event]) -> Result<ObservationState, ObservationError> {
                 configuration,
                 ..
             } => {
-                if event.task_id.is_some() || matches!(event.provenance, Provenance::OpenTelemetry)
-                {
+                if event.task_id.is_some() {
                     return Err(ObservationError::InvalidHistory);
                 }
                 if state
@@ -664,16 +594,6 @@ fn reconstruct(events: &[Event]) -> Result<ObservationState, ObservationError> {
                 {
                     return Err(ObservationError::InvalidHistory);
                 }
-                let active = session
-                    .active_task
-                    .as_ref()
-                    .ok_or(ObservationError::InvalidHistory)?;
-                task_intervals.push(TaskInterval {
-                    task_id,
-                    session_id: *session_id,
-                    started_at: active.started_at,
-                    ended_at: event.occurred_at,
-                });
                 session.active_task = None;
             }
             EventKind::ConfigurationObserved {
@@ -707,26 +627,6 @@ fn reconstruct(events: &[Event]) -> Result<ObservationState, ObservationError> {
                     return Err(ObservationError::InvalidHistory);
                 }
             }
-            EventKind::AuxiliaryMeasurementObserved {
-                session_id,
-                interval_started_at,
-                interval_ended_at,
-                ..
-            } => {
-                let Some(task_id) = event.task_id else {
-                    return Err(ObservationError::InvalidHistory);
-                };
-                if event.provenance != Provenance::OpenTelemetry
-                    || !task_intervals.iter().any(|interval| {
-                        interval.task_id == task_id
-                            && interval.session_id == *session_id
-                            && *interval_started_at >= interval.started_at
-                            && *interval_ended_at <= interval.ended_at
-                    })
-                {
-                    return Err(ObservationError::InvalidHistory);
-                }
-            }
             _ => {}
         }
     }
@@ -742,7 +642,6 @@ fn reconstruct(events: &[Event]) -> Result<ObservationState, ObservationError> {
             )
         })
         .collect();
-    state.task_intervals = task_intervals;
     Ok(state)
 }
 
@@ -1497,114 +1396,5 @@ mod tests {
             attributions.last(),
             Some(ProfileAttribution::Matched { .. })
         ));
-    }
-
-    #[test]
-    fn auxiliary_facts_use_source_intervals_and_reject_boundary_crossing() {
-        let directory = tempfile::tempdir().unwrap();
-        let log = EventLog::new(directory.path().join("events.jsonl"));
-        let session_id = Uuid::now_v7();
-        let configuration = ObservedConfiguration {
-            cli: CliKind::Codex,
-            execution_platform: ExecutionPlatform::Interactive,
-            model: ObservedValue::Observed(Some("gpt-5".to_owned())),
-            identity: Default::default(),
-        };
-        let session = at(
-            Event::for_session(
-                Provenance::CliHook,
-                EventKind::SessionObserved {
-                    session_id,
-                    cli: CliKind::Codex,
-                    phase: SessionPhase::Started,
-                    external_session_id: Some("conversation-1".to_owned()),
-                    working_directory: None,
-                    configuration: None,
-                },
-            ),
-            "2026-08-04T00:00:00Z".parse().unwrap(),
-        );
-        log.append(&session).unwrap();
-        let mut task_ids = Vec::new();
-        for (start, end) in [
-            ("2026-08-04T00:00:01Z", "2026-08-04T00:00:10Z"),
-            ("2026-08-04T00:00:11Z", "2026-08-04T00:00:20Z"),
-        ] {
-            let task_id = Uuid::now_v7();
-            task_ids.push(task_id);
-            log.append(&at(
-                Event::for_task(
-                    task_id,
-                    Provenance::ManualMark,
-                    EventKind::ObservedTaskStarted {
-                        session_id,
-                        origin: ExecutionOrigin::DirectObservation,
-                        tags: Vec::new(),
-                        prompt: None,
-                        prompt_chars: 0,
-                    },
-                ),
-                start.parse().unwrap(),
-            ))
-            .unwrap();
-            log.append(&at(
-                Event::for_task(
-                    task_id,
-                    Provenance::ManualMark,
-                    EventKind::ConfigurationObserved {
-                        session_id,
-                        boundary: ConfigurationBoundary::Start,
-                        configuration: configuration.clone(),
-                    },
-                ),
-                start.parse().unwrap(),
-            ))
-            .unwrap();
-            log.append(&at(
-                Event::for_task(
-                    task_id,
-                    Provenance::ManualMark,
-                    EventKind::ObservedTaskEnded {
-                        session_id,
-                        status: ObservedTaskStatus::Completed,
-                    },
-                ),
-                end.parse().unwrap(),
-            ))
-            .unwrap();
-        }
-        let fact = AuxiliaryFact {
-            provider: OTelProvider::Codex,
-            external_session_id: "conversation-1".to_owned(),
-            started_at: "2026-08-04T00:00:02Z".parse().unwrap(),
-            ended_at: "2026-08-04T00:00:03Z".parse().unwrap(),
-            model: Some("gpt-5".to_owned()),
-            input_tokens: None,
-            output_tokens: None,
-            estimated_cost_usd_micros: None,
-            duration_ms: 1_000,
-        };
-        let outcome = apply_observation(
-            &log,
-            &[],
-            ObservationCommand::RecordAuxiliaryFact { fact: fact.clone() },
-        )
-        .unwrap();
-        assert_eq!(outcome.task_id, Some(task_ids[0]));
-
-        let crossing = AuxiliaryFact {
-            started_at: "2026-08-04T00:00:09Z".parse().unwrap(),
-            ended_at: "2026-08-04T00:00:12Z".parse().unwrap(),
-            duration_ms: 3_000,
-            ..fact
-        };
-        let outcome = apply_observation(
-            &log,
-            &[],
-            ObservationCommand::RecordAuxiliaryFact { fact: crossing },
-        )
-        .unwrap();
-        assert!(outcome.anomaly_recorded);
-        assert_eq!(outcome.task_id, None);
     }
 }

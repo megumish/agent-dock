@@ -104,16 +104,5 @@ hook からモデルまたは必要な識別項目を取得できない場合は
 終了境界では、タスク開始後に改めて届いた構成だけを使うため、終了まで構成を再通知しない Claude Code では通常この明示申告または後続の帰属訂正が必要になる。
 誤った帰属は `task-attribute` または `task-unattribute` で訂正し、過去イベントを上書きせず新しい帰属イベントを追記する。
 
-Claude Code または Codex CLI が出力した OTLP/HTTP JSON の Logs ペイロードは、次のコマンドの標準入力から補助事実として取り込める。
-
-```console
-agent-dock observe otel claude < otlp-logs.json
-agent-dock observe otel codex < otlp-logs.json
-```
-
-このコマンドは HTTP 受信サーバーではない。
-本文を含まない設定でエクスポートしたペイロードを、ファイル出力またはローカル Collector から渡す。
-発生区間が一つの完了済み明示タスクへ完全に含まれる API 要求だけを関連付け、推定コストは実支出としてスコアへ加えない。
-
 0.1.0-alpha.6 は直接実行の観測までを対象とし、助言はまだ実装しない。
 現在の実装範囲と挙動は [0.1.0-alpha.6 のリリース文書](./docs/releases/0.1.0-alpha.6.md) に記録する。

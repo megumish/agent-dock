@@ -19,7 +19,7 @@ use agent_dock::{
     Segment, SegmentScore, SessionPhase, SkippedLineReason, Verdict, apply_observation,
     configuration_for_profile, default_config_path, default_events_path, escape_terminal, execute,
     format_acceptance, format_duration, format_recency, judgement_candidates,
-    parse_hook_observation, parse_observe_args, parse_otlp_logs, project, resolve_observed_session,
+    parse_hook_observation, parse_observe_args, project, resolve_observed_session,
     safe_test_profile, segments_for_tags,
 };
 use jiff::Timestamp;
@@ -479,25 +479,6 @@ fn observe(command: ObserveCliCommand) -> Result<i32, AppError> {
                 },
             )?;
             println!("{}", outcome.session_id);
-        }
-        ObserveCliCommand::OTel { provider } => {
-            let mut payload = Vec::new();
-            io::stdin()
-                .take((MAX_HOOK_INPUT_BYTES + 1) as u64)
-                .read_to_end(&mut payload)?;
-            let facts = parse_otlp_logs(provider, &payload)?;
-            let mut recorded = 0usize;
-            let mut anomalies = 0usize;
-            for fact in facts {
-                let outcome = apply_observation(
-                    &event_log,
-                    &[],
-                    ObservationCommand::RecordAuxiliaryFact { fact },
-                )?;
-                recorded += usize::from(outcome.task_id.is_some());
-                anomalies += usize::from(outcome.anomaly_recorded);
-            }
-            println!("recorded={recorded} anomalies={anomalies}");
         }
     }
     Ok(0)
@@ -1428,8 +1409,6 @@ enum AppError {
     Observation(#[from] agent_dock::ObservationError),
     #[error(transparent)]
     Hook(#[from] agent_dock::HookParseError),
-    #[error(transparent)]
-    OTel(#[from] agent_dock::OtelParseError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

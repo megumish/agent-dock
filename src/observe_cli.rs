@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::{AttributionFailure, CliKind, ObservedTaskStatus, SessionPhase};
 
 const USAGE: &str = "Usage: agent-dock observe \
-<session-start|session-resume|session-end|session-find|task-start|task-complete|task-interrupt|task-attribute|task-unattribute|hook|otel> ...";
+<session-start|session-resume|session-end|session-find|task-start|task-complete|task-interrupt|task-attribute|task-unattribute|hook> ...";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObserveCliCommand {
@@ -40,9 +40,6 @@ pub enum ObserveCliCommand {
     Hook {
         provider: crate::hook::Provider,
     },
-    OTel {
-        provider: crate::otel::OTelProvider,
-    },
 }
 
 pub fn parse_observe_args(
@@ -65,7 +62,6 @@ pub fn parse_observe_args(
         "task-attribute" => parse_attribution(args, true),
         "task-unattribute" => parse_attribution(args, false),
         "hook" => parse_hook(args),
-        "otel" => parse_otel(args),
         _ => Err(usage("unknown command")),
     }
 }
@@ -267,20 +263,6 @@ fn parse_hook(mut args: impl Iterator<Item = OsString>) -> Result<ObserveCliComm
         return Err(usage("trailing hook argument"));
     }
     Ok(ObserveCliCommand::Hook { provider })
-}
-
-fn parse_otel(mut args: impl Iterator<Item = OsString>) -> Result<ObserveCliCommand, String> {
-    let provider = args.next().ok_or_else(|| usage("missing OTel provider"))?;
-    let provider = utf8(provider, "OTel provider is not valid UTF-8")?;
-    let provider = match provider.as_str() {
-        "claude" => crate::otel::OTelProvider::Claude,
-        "codex" => crate::otel::OTelProvider::Codex,
-        _ => return Err(usage("unsupported OTel provider")),
-    };
-    if args.next().is_some() {
-        return Err(usage("trailing OTel argument"));
-    }
-    Ok(ObserveCliCommand::OTel { provider })
 }
 
 fn value(args: &mut impl Iterator<Item = OsString>) -> Result<String, String> {
@@ -486,12 +468,6 @@ mod tests {
             })
         );
         assert!(parse(&["hook", "gemini"]).is_err());
-        assert_eq!(
-            parse(&["otel", "claude"]),
-            Ok(ObserveCliCommand::OTel {
-                provider: crate::otel::OTelProvider::Claude,
-            })
-        );
     }
 
     #[test]
