@@ -6,8 +6,9 @@ use std::{
 };
 
 use agent_dock::{
-    BackupEventLogOutcome, Config, Event, EventKind, EventLog, ExecutionProfile, ProfileSnapshot,
-    RecordedExecutionOutcome, Verdict, default_events_path, safe_test_profile,
+    Advice, AdviceOutcome, BackupEventLogOutcome, Config, Event, EventKind, EventLog,
+    ExecutionProfile, ProfileSnapshot, RecordedExecutionOutcome, Verdict, advise,
+    default_events_path, project, safe_test_profile, segments_for_tags,
 };
 use jiff::Timestamp;
 use uuid::Uuid;
@@ -15,7 +16,10 @@ use uuid::Uuid;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scenario = scenario_argument(std::env::args().skip(1))?;
     let target = default_events_path()?;
-    eprintln!("WARNING: this replaces the active 0.1.0-alpha.4 event log with synthetic data.");
+    eprintln!(
+        "WARNING: this replaces the active {} event log with synthetic data.",
+        env!("CARGO_PKG_VERSION")
+    );
     eprintln!("Stop every agent-dock process before continuing.");
     let backup = replace_with_scenario(&target, &scenario)?;
     println!("Installed `{scenario}` at `{}`.", target.display());
@@ -130,14 +134,16 @@ fn write_current_scenario(
     profile: &ExecutionProfile,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match scenario {
-        "few" => append_run(
-            log,
-            profile,
-            "2026-07-01T00:00:00Z",
-            &[],
-            1_500,
-            Outcome::Accepted,
-        )?,
+        "few" => {
+            for (at, elapsed_ms) in [
+                ("2026-07-01T00:00:00Z", 1_500),
+                ("2026-07-01T00:01:00Z", 1_500),
+                ("2026-07-01T00:02:00Z", 1_500),
+                ("2026-07-01T00:03:00Z", 1_500),
+            ] {
+                append_run(log, profile, at, &[], elapsed_ms, Outcome::Accepted)?;
+            }
+        }
         "many-tags" => append_run(
             log,
             profile,
@@ -208,7 +214,10 @@ fn append_run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let task = task(at, tags);
     let task_id = task.task_id.expect("task event has an id");
+    let tags = tags.iter().map(|tag| (*tag).to_owned()).collect::<Vec<_>>();
+    let advice = advice_for_task(log, &tags)?;
     log.append(&task)?;
+    append_advice(log, task_id, &advice, profile)?;
     let execution = execution(task_id, profile, at, elapsed_ms, outcome);
     log.append(&execution)?;
     match outcome {
@@ -233,6 +242,59 @@ fn append_run(
                 verdict: Verdict::Rejected,
             },
         ))?;
+    }
+    Ok(())
+}
+
+fn advice_for_task(log: &EventLog, tags: &[String]) -> Result<Advice, Box<dyn std::error::Error>> {
+    let history = log.read_all()?;
+    let profiles = sample_profiles();
+    let segments = segments_for_tags(tags);
+    let projection = project(&history.events, &profiles, &segments);
+    Ok(advise(&projection, tags, &profiles))
+}
+
+fn append_advice(
+    log: &EventLog,
+    task_id: Uuid,
+    advice: &Advice,
+    selected_profile: &ExecutionProfile,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let advised = Event::new(task_id, advice.event_kind());
+    let advice_event_id = advised.event_id;
+    log.append(&advised)?;
+    match &advice.outcome {
+        AdviceOutcome::Proposed { profile_id, .. } if profile_id == &selected_profile.id => {
+            log.append(&Event::new(
+                task_id,
+                EventKind::Approved {
+                    advice_event_id,
+                    profile_id: selected_profile.id.clone(),
+                },
+            ))?;
+        }
+        AdviceOutcome::Proposed { .. } => {
+            log.append(&Event::new(
+                task_id,
+                EventKind::Declined { advice_event_id },
+            ))?;
+            log.append(&Event::new(
+                task_id,
+                EventKind::Designated {
+                    advice_event_id,
+                    profile_id: selected_profile.id.clone(),
+                },
+            ))?;
+        }
+        AdviceOutcome::Abstained { .. } => {
+            log.append(&Event::new(
+                task_id,
+                EventKind::Designated {
+                    advice_event_id,
+                    profile_id: selected_profile.id.clone(),
+                },
+            ))?;
+        }
     }
     Ok(())
 }
@@ -304,7 +366,7 @@ fn parse(value: &str) -> Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_dock::{Segment, project};
+    use agent_dock::{Segment, advise, project, segments_for_tags};
 
     #[test]
     fn defaults_to_showcase_when_the_scenario_is_omitted() {
@@ -365,7 +427,7 @@ mod tests {
         replace_with_scenario(&target, "showcase").unwrap();
 
         let history = EventLog::new(target).read_all().unwrap();
-        assert_eq!(history.events.len(), 28);
+        assert_eq!(history.events.len(), 68);
         assert!(history.skipped_lines.is_empty());
 
         let profiles = sample_profiles();
@@ -386,7 +448,7 @@ mod tests {
             })
             .collect();
         let expected = [
-            (profiles[0].id.as_str(), 1, 1, 1, Some(1_500), 0),
+            (profiles[0].id.as_str(), 4, 4, 4, Some(1_500), 0),
             (profiles[1].id.as_str(), 1, 1, 1, Some(2_500), 0),
             (profiles[2].id.as_str(), 2, 0, 2, None, 0),
             (profiles[3].id.as_str(), 1, 0, 1, None, 0),
@@ -394,6 +456,83 @@ mod tests {
         ];
         assert_eq!(actual, expected);
         assert!(projection.warnings.is_empty());
+
+        let mut advised_count = 0;
+        let mut approved_count = 0;
+        let mut declined_count = 0;
+        let mut abstained_count = 0;
+        for (index, event) in history.events.iter().enumerate() {
+            let EventKind::Advised { outcome, .. } = &event.kind else {
+                continue;
+            };
+            advised_count += 1;
+            let task_id = event.task_id.expect("advice event has a task identity");
+            let task_index = history.events[..index]
+                .iter()
+                .rposition(|candidate| {
+                    candidate.task_id == Some(task_id)
+                        && matches!(&candidate.kind, EventKind::TaskReceived { .. })
+                })
+                .expect("advice event has a preceding task event");
+            assert_eq!(index, task_index + 1);
+            let tags = match &history.events[task_index].kind {
+                EventKind::TaskReceived { tags, .. } => tags.clone(),
+                _ => unreachable!("the preceding task event was found by kind"),
+            };
+            let segments = segments_for_tags(&tags);
+            let expected_kind = advise(
+                &project(&history.events[..task_index], &profiles, &segments),
+                &tags,
+                &profiles,
+            )
+            .event_kind();
+            assert_eq!(&event.kind, &expected_kind);
+            let advice_event_id = event.event_id;
+            match outcome {
+                AdviceOutcome::Proposed { profile_id, .. } => match &history.events[index + 1].kind
+                {
+                    EventKind::Approved {
+                        advice_event_id: approved_advice_event_id,
+                        profile_id: approved_profile_id,
+                    } => {
+                        approved_count += 1;
+                        assert_eq!(*approved_advice_event_id, advice_event_id);
+                        assert_eq!(approved_profile_id, profile_id);
+                    }
+                    EventKind::Declined {
+                        advice_event_id: declined_advice_event_id,
+                    } => {
+                        declined_count += 1;
+                        assert_eq!(*declined_advice_event_id, advice_event_id);
+                        let EventKind::Designated {
+                            advice_event_id: designated_advice_event_id,
+                            profile_id: designated_profile_id,
+                        } = &history.events[index + 2].kind
+                        else {
+                            panic!("a declined proposal must be followed by a designation");
+                        };
+                        assert_eq!(*designated_advice_event_id, advice_event_id);
+                        assert_ne!(designated_profile_id, profile_id);
+                    }
+                    _ => panic!("a proposal must be approved or declined"),
+                },
+                AdviceOutcome::Abstained { .. } => {
+                    abstained_count += 1;
+                    let EventKind::Designated {
+                        advice_event_id: designated_advice_event_id,
+                        ..
+                    } = &history.events[index + 1].kind
+                    else {
+                        panic!("an abstained advice must be followed by a designation");
+                    };
+                    assert_eq!(*designated_advice_event_id, advice_event_id);
+                }
+            }
+        }
+        assert!(advised_count > 0);
+        assert!(approved_count > 0);
+        assert!(declined_count > 0);
+        assert!(abstained_count > 0);
     }
 
     #[test]

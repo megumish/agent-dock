@@ -10,13 +10,15 @@ use std::{
 };
 
 use agent_dock::{
+    Advice, AdviceEvidence, AdviceOutcome, AdviceReason, AdviceSegmentCount, AppendBatchOutcome,
     AppendJudgementOutcome, AttributionFailure, BackupEventLogOutcome, Config, ConfigError,
-    EVENT_FORMAT_VERSION, Event, EventKind, EventLog, ExclusionReason, ExecutionError,
-    ExecutionEvent, ExecutionOrigin, ExecutionOutcome, ExecutionPlatform, ExecutionProfile,
-    ExecutionRequest, FailureKind, HookEvent, JudgementCandidate, MAX_HOOK_INPUT_BYTES,
-    ObservationCommand, ObserveCliCommand, OutputSource, ProfileAttribution, ProfileDeclaration,
-    ProfileSnapshot, Provenance, ReadEvents, RecordedExecutionOutcome, ReplaceConfigOutcome,
-    Segment, SegmentScore, SessionPhase, SkippedLineReason, Verdict, apply_observation,
+    EVENT_FORMAT_VERSION, Event, EventKind, EventLog, EvidenceAcceptance, EvidenceCost,
+    EvidenceDuration, EvidenceSegment, ExclusionReason, ExecutionError, ExecutionEvent,
+    ExecutionOrigin, ExecutionOutcome, ExecutionPlatform, ExecutionProfile, ExecutionRequest,
+    FailureKind, HookEvent, JudgementCandidate, MAX_HOOK_INPUT_BYTES, ObservationCommand,
+    ObserveCliCommand, OutputSource, ProfileAttribution, ProfileDeclaration, ProfileSnapshot,
+    Projection, Provenance, ReadEvents, RecordedExecutionOutcome, ReplaceConfigOutcome, Segment,
+    SegmentScore, SessionPhase, SkippedLineReason, Verdict, advise, apply_observation,
     configuration_for_profile, default_config_path, default_events_path, escape_terminal, execute,
     format_acceptance, format_duration, format_recency, judgement_candidates,
     parse_hook_observation, parse_observe_args, project, resolve_observed_session,
@@ -131,58 +133,59 @@ async fn run_task() -> Result<i32, AppError> {
             } else {
                 false
             };
-            let all_segments = segments_for_tags(tags);
-            let score_segments = visible_segments(&all_segments);
-            let hidden_tags = all_segments.len() - score_segments.len();
-            let fresh_history = read_event_history(&event_log)?;
-            let projection = project(&fresh_history.events, &projection_profiles, &score_segments);
-            for warning in &projection.warnings {
-                eprintln!("Warning: {}", escape_terminal(warning));
-            }
-            for exclusion in &projection.exclusions {
-                eprintln!(
-                    "Direct observation excluded ({}): {}",
-                    exclusion_reason_label(exclusion.reason),
-                    exclusion.count
+            let resolution = resolve_advised_task_with(&event_log, |fresh_history| {
+                let (all_segments, projection, advice) = prepare_advice_for_task(
+                    &fresh_history.events,
+                    tags,
+                    &projection_profiles,
+                    &available,
                 );
-            }
-            let choices = render_profile_choices(
-                &available,
-                &projection.scorecards,
-                hidden_tags,
-                Timestamp::now(),
-            );
-            let selected = choose_profile(&choices)?;
-            let profile = &available[selected];
-            print_execution_summary(profile, prompt, &working_directory);
-            let confirmation = confirm_run()?;
-            if let Some((warning, transition)) = run_confirmation_notice(confirmation) {
-                eprintln!("Warning: {warning}");
-                println!("{transition}");
-            }
-            resolve_run_confirmation(
-                prompt,
-                confirmation,
-                &mut |initial| {
-                    read_non_empty_prompt(&mut prompt_editor, Some(initial)).map_err(AppError::from)
-                },
-                || {
-                    let task_id = Uuid::now_v7();
-                    record_approved_task(
-                        &event_log,
-                        task_received_event(
+                let hidden_tags = all_segments.len() - visible_segments(&all_segments).len();
+                for warning in &projection.warnings {
+                    eprintln!("Warning: {}", escape_terminal(warning));
+                }
+                for exclusion in &projection.exclusions {
+                    eprintln!(
+                        "Direct observation excluded ({}): {}",
+                        exclusion_reason_label(exclusion.reason),
+                        exclusion.count
+                    );
+                }
+                let now = Timestamp::now();
+                print_advice(&advice, &available, now);
+                let choices =
+                    render_profile_choices(&available, &projection.scorecards, hidden_tags, now);
+                let default_index = advice_default_index(&advice, &available);
+                let selected = choose_profile(&choices, default_index)?;
+                let profile = &available[selected];
+                print_execution_summary(profile, prompt, &working_directory);
+                let confirmation = confirm_run()?;
+                if let Some((warning, transition)) = run_confirmation_notice(confirmation) {
+                    eprintln!("Warning: {warning}");
+                    println!("{transition}");
+                }
+                resolve_run_confirmation(
+                    prompt,
+                    confirmation,
+                    &mut |initial| {
+                        read_non_empty_prompt(&mut prompt_editor, Some(initial))
+                            .map_err(AppError::from)
+                    },
+                    || {
+                        let task_id = Uuid::now_v7();
+                        let received = task_received_event(
                             task_id,
                             tags.to_vec(),
                             prompt,
                             config.record_prompt,
                             prompt_approved,
                             Timestamp::now(),
-                        ),
-                        &profile.id,
-                    )?;
-                    Ok((task_id, selected))
-                },
-            )
+                        );
+                        Ok((received, advice, profile.id.clone(), (task_id, selected)))
+                    },
+                )
+            })?;
+            Ok(resolution)
         },
     )?;
     let profile = &available[selected];
@@ -557,13 +560,12 @@ fn scorecard() -> Result<i32, AppError> {
         })
         .collect();
     let event_log = EventLog::new(default_events_path()?);
-    let history = read_event_history(&event_log)?;
+    let history = read_event_history_without_migration(&event_log)?;
     print_skipped_event_warnings(&history);
     let tags = collect_tag_candidates(&config.tag_candidates, &history.events);
     let all_segments = segments_for_tags(&tags);
-    let segments = visible_segments(&all_segments);
-    let hidden_tags = all_segments.len() - segments.len();
-    let projection = project(&history.events, &profiles, &segments);
+    let hidden_tags = all_segments.len() - visible_segments(&all_segments).len();
+    let projection = project(&history.events, &profiles, &all_segments);
     for warning in &projection.warnings {
         eprintln!("Warning: {}", escape_terminal(warning));
     }
@@ -588,7 +590,7 @@ fn scorecard() -> Result<i32, AppError> {
 
 fn judge() -> Result<i32, AppError> {
     let event_log = EventLog::new(default_events_path()?);
-    let history = read_event_history(&event_log)?;
+    let history = read_event_history_without_migration(&event_log)?;
     print_skipped_event_warnings(&history);
     let resolution = resolve_judgement_with(
         &event_log,
@@ -648,7 +650,7 @@ fn resolve_judgement_with(
     mut confirm_append: impl FnMut(&JudgementCandidate, Verdict) -> Result<bool, AppError>,
     mut judgement_changed: impl FnMut(Option<Verdict>, Option<Verdict>),
 ) -> Result<JudgementResolution, AppError> {
-    let history = read_event_history(event_log)?;
+    let history = read_event_history_without_migration(event_log)?;
     let candidates = judgement_candidates(&history.events);
     if candidates.is_empty() {
         return Ok(JudgementResolution::NoCandidates);
@@ -665,7 +667,7 @@ fn resolve_judgement_with(
     };
 
     loop {
-        let latest = read_event_history(event_log)?;
+        let latest = read_event_history_without_migration(event_log)?;
         let Some(candidate) = judgement_candidates(&latest.events)
             .into_iter()
             .find(|candidate| candidate.task_id == task_id)
@@ -878,6 +880,18 @@ fn read_event_history(event_log: &EventLog) -> Result<ReadEvents, AppError> {
     read_event_history_with(event_log, &mut confirm)
 }
 
+fn read_event_history_without_migration(event_log: &EventLog) -> Result<ReadEvents, AppError> {
+    let history = event_log.read_all()?;
+    if history
+        .skipped_lines
+        .iter()
+        .any(|skipped| matches!(skipped.reason, SkippedLineReason::UnsupportedFormat { .. }))
+    {
+        return Err(AppError::IncompatibleEventLog);
+    }
+    Ok(history)
+}
+
 fn read_event_history_with(
     event_log: &EventLog,
     ask: &mut impl FnMut(&str, bool) -> io::Result<bool>,
@@ -1007,6 +1021,34 @@ fn resolve_task_with_editable_tags<T>(
     }
 }
 
+fn resolve_advised_task_with<T>(
+    event_log: &EventLog,
+    mut prepare: impl FnMut(&ReadEvents) -> Result<RunResolution<(Event, Advice, String, T)>, AppError>,
+) -> Result<RunResolution<T>, AppError> {
+    loop {
+        let history = read_event_history(event_log)?;
+        match prepare(&history)? {
+            RunResolution::Edit(prompt) => return Ok(RunResolution::Edit(prompt)),
+            RunResolution::Run((received, advice, selected_profile_id, value)) => {
+                match record_advised_task(
+                    event_log,
+                    &history,
+                    received,
+                    &advice,
+                    &selected_profile_id,
+                )? {
+                    AppendBatchOutcome::Appended => return Ok(RunResolution::Run(value)),
+                    AppendBatchOutcome::Changed => {
+                        eprintln!(
+                            "Event log changed while waiting for confirmation; recalculating advice."
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn run_confirmation_notice(confirmation: RunConfirmation) -> Option<(&'static str, &'static str)> {
     (confirmation == RunConfirmation::Edit)
         .then_some(("Task was not run.", "Returning to task definition..."))
@@ -1033,25 +1075,29 @@ fn parse_confirmation(input: &str, default: bool) -> Option<bool> {
     }
 }
 
-fn choose_profile(labels: &[String]) -> io::Result<usize> {
+fn choose_profile(labels: &[String], default_index: usize) -> io::Result<usize> {
     println!("Choose a crew member:");
     for (index, label) in labels.iter().enumerate() {
         println!("  {}. {label}", index + 1);
     }
 
     loop {
-        let input = read_line("Selection [1]:")?;
-        if let Some(index) = parse_selection(&input, labels.len()) {
+        let default_label = default_index
+            .checked_add(1)
+            .filter(|index| *index <= labels.len())
+            .unwrap_or(1);
+        let input = read_line(&format!("Selection [{default_label}]:"))?;
+        if let Some(index) = parse_selection(&input, labels.len(), default_index) {
             return Ok(index);
         }
         eprintln!("Enter a number from 1 to {}.", labels.len());
     }
 }
 
-fn parse_selection(input: &str, count: usize) -> Option<usize> {
+fn parse_selection(input: &str, count: usize, default_index: usize) -> Option<usize> {
     let input = input.trim();
-    if input.is_empty() && count > 0 {
-        return Some(0);
+    if input.is_empty() && default_index < count {
+        return Some(default_index);
     }
     let selected = input.parse::<usize>().ok()?;
     selected.checked_sub(1).filter(|index| *index < count)
@@ -1073,6 +1119,181 @@ fn visible_segments(segments: &[Segment]) -> Vec<Segment> {
         .collect()
 }
 
+fn prepare_advice_for_task(
+    events: &[Event],
+    tags: &[String],
+    projection_profiles: &[ExecutionProfile],
+    selectable_profiles: &[ExecutionProfile],
+) -> (Vec<Segment>, Projection, Advice) {
+    let segments = segments_for_tags(tags);
+    let projection = project(events, projection_profiles, &segments);
+    let advice = advise(&projection, tags, selectable_profiles);
+    (segments, projection, advice)
+}
+
+fn advice_default_index(advice: &Advice, profiles: &[ExecutionProfile]) -> usize {
+    advice
+        .proposed_profile_id()
+        .and_then(|profile_id| profiles.iter().position(|profile| profile.id == profile_id))
+        .unwrap_or(0)
+}
+
+fn print_advice(advice: &Advice, profiles: &[ExecutionProfile], now: Timestamp) {
+    match &advice.outcome {
+        AdviceOutcome::Proposed {
+            profile_id,
+            evidence,
+        } => {
+            println!("{}", render_advice_proposal(profile_id, profiles));
+            for evidence in evidence {
+                println!("  {}", render_advice_evidence(evidence, now));
+            }
+        }
+        AdviceOutcome::Abstained { reason } => {
+            println!("Advice: abstain ({})", advice_reason_label(reason));
+            match reason {
+                AdviceReason::NoEvidence { max_judged }
+                | AdviceReason::InsufficientEvidence { max_judged } => {
+                    println!(
+                        "  Max judged by segment: {}",
+                        render_segment_counts(max_judged)
+                    );
+                    if matches!(reason, AdviceReason::InsufficientEvidence { .. }) {
+                        println!("  Threshold: {} judged", advice.threshold);
+                    }
+                }
+                AdviceReason::NoUniqueLeader { profile_ids } => {
+                    println!(
+                        "  Competing profiles: {}",
+                        profile_ids
+                            .iter()
+                            .map(|profile_id| escape_terminal(profile_id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn render_advice_proposal(profile_id: &str, profiles: &[ExecutionProfile]) -> String {
+    let profile = profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .map(|profile| escape_terminal(profile.name()))
+        .unwrap_or_else(|| escape_terminal(profile_id));
+    format!(
+        "Advice: propose {profile} ({})",
+        escape_terminal(profile_id)
+    )
+}
+
+fn advice_reason_label(reason: &AdviceReason) -> &'static str {
+    match reason {
+        AdviceReason::NoEvidence { .. } => "no_evidence",
+        AdviceReason::InsufficientEvidence { .. } => "insufficient_evidence",
+        AdviceReason::NoUniqueLeader { .. } => "no_unique_leader",
+    }
+}
+
+fn render_segment_counts(counts: &[AdviceSegmentCount]) -> String {
+    counts
+        .iter()
+        .map(|count| {
+            format!(
+                "{}={}",
+                render_evidence_segment(&count.segment),
+                count.max_judged
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_advice_evidence(evidence: &AdviceEvidence, _now: Timestamp) -> String {
+    let acceptance_latest = render_evidence_latest(&evidence.acceptance.summary);
+    let duration_latest = render_evidence_latest(&evidence.duration.summary);
+    let cost_latest = render_evidence_latest(&evidence.cost.summary);
+    format!(
+        "{}: Acceptance {}{} | Duration {}{} | {}{}",
+        render_evidence_segment(&evidence.segment),
+        format_evidence_acceptance(&evidence.acceptance),
+        acceptance_latest,
+        format_evidence_duration(&evidence.duration),
+        duration_latest,
+        format_evidence_cost(&evidence.cost),
+        cost_latest,
+    )
+}
+
+fn render_evidence_segment(segment: &EvidenceSegment) -> String {
+    match segment {
+        EvidenceSegment::Overall => "Overall".to_owned(),
+        EvidenceSegment::Untagged => "Untagged".to_owned(),
+        EvidenceSegment::Tag(tag) => {
+            format!("Tag \"{}\"", escape_terminal(tag).replace('"', "\\\""))
+        }
+    }
+}
+
+fn render_evidence_latest(summary: &agent_dock::EvidenceAxisSummary) -> String {
+    summary
+        .latest_started_at
+        .map(|latest| format!(", latest {latest}"))
+        .unwrap_or_default()
+}
+
+fn format_evidence_acceptance(axis: &EvidenceAcceptance) -> String {
+    if axis.summary.count == 0 {
+        return "- (0/0)".to_owned();
+    }
+    let tenths = ((axis.accepted as u128 * 1_000) + axis.summary.count as u128 / 2)
+        / axis.summary.count as u128;
+    format!(
+        "{}.{:01}% ({}/{})",
+        tenths / 10,
+        tenths % 10,
+        axis.accepted,
+        axis.summary.count
+    )
+}
+
+fn format_evidence_duration(axis: &EvidenceDuration) -> String {
+    let Some(ms) = axis.median_ms else {
+        return format!("- ({})", axis.summary.count);
+    };
+    let value = if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{}.{:01}s", ms / 1_000, (ms % 1_000) / 100)
+    } else if ms < 3_600_000 {
+        format!("{}m{:02}s", ms / 60_000, (ms / 1_000) % 60)
+    } else {
+        format!("{}h{:02}m", ms / 3_600_000, (ms / 60_000) % 60)
+    };
+    format!("{value} ({})", axis.summary.count)
+}
+
+fn format_evidence_cost(cost: &EvidenceCost) -> String {
+    match (
+        cost.currency.as_deref(),
+        cost.total_minor_units,
+        cost.summary.count,
+    ) {
+        (Some(currency), Some(total), count) => format!(
+            "Cost {} {total} minor units ({count}, {} missing)",
+            escape_terminal(currency),
+            cost.missing_count
+        ),
+        (None, None, count) if count > 0 => format!(
+            "Cost mixed currencies ({count}, {} missing)",
+            cost.missing_count
+        ),
+        _ => format!("Cost missing ({})", cost.missing_count),
+    }
+}
+
 fn render_profile_choices(
     profiles: &[ExecutionProfile],
     scorecards: &[agent_dock::ProfileScorecard],
@@ -1081,8 +1302,7 @@ fn render_profile_choices(
 ) -> Vec<String> {
     profiles
         .iter()
-        .zip(scorecards)
-        .map(|(profile, card)| {
+        .map(|profile| {
             let model = profile
                 .model()
                 .map(escape_terminal)
@@ -1093,8 +1313,11 @@ fn render_profile_choices(
                 profile.cli(),
                 model
             )];
-            for score in &card.scores {
-                lines.push(format!("     {}", render_segment(score, now)));
+            if let Some(card) = scorecards.iter().find(|card| card.profile_id == profile.id) {
+                let visible_score_count = card.scores.len().saturating_sub(hidden_tags);
+                for score in card.scores.iter().take(visible_score_count) {
+                    lines.push(format!("     {}", render_segment(score, now)));
+                }
             }
             if hidden_tags > 0 {
                 lines.push(format!("     ... {hidden_tags} more tags"));
@@ -1142,7 +1365,8 @@ fn format_cost(cost: &agent_dock::CostAxis) -> String {
         cost.summary.count,
     ) {
         (Some(currency), Some(total), count) => format!(
-            "Cost {currency} {total} minor units ({count}, {} missing)",
+            "Cost {} {total} minor units ({count}, {} missing)",
+            escape_terminal(currency),
             cost.missing_count
         ),
         (None, None, count) if count > 0 => format!(
@@ -1319,30 +1543,59 @@ fn task_received_event(
     event
 }
 
-fn record_assignment(
-    event_log: &EventLog,
-    task_id: Uuid,
-    profile_id: &str,
-) -> Result<(), AppError> {
-    event_log.append(&Event::new(
-        task_id,
-        EventKind::Assigned {
-            profile_id: profile_id.to_owned(),
-        },
-    ))?;
-    Ok(())
-}
-
-fn record_approved_task(
-    event_log: &EventLog,
+fn advised_task_events(
     received: Event,
-    profile_id: &str,
-) -> Result<(), AppError> {
+    advice: &Advice,
+    selected_profile_id: &str,
+) -> Result<Vec<Event>, AppError> {
     let task_id = received
         .task_id
         .ok_or_else(|| AppError::Usage("task event is missing task identity".to_owned()))?;
-    event_log.append(&received)?;
-    record_assignment(event_log, task_id, profile_id)
+    let advised = Event::new(task_id, advice.event_kind());
+    let advice_event_id = advised.event_id;
+    let mut events = vec![received, advised];
+    match &advice.outcome {
+        AdviceOutcome::Proposed { profile_id, .. } if profile_id == selected_profile_id => {
+            events.push(Event::new(
+                task_id,
+                EventKind::Approved {
+                    advice_event_id,
+                    profile_id: selected_profile_id.to_owned(),
+                },
+            ));
+        }
+        AdviceOutcome::Proposed { .. } => {
+            events.push(Event::new(task_id, EventKind::Declined { advice_event_id }));
+            events.push(Event::new(
+                task_id,
+                EventKind::Designated {
+                    advice_event_id,
+                    profile_id: selected_profile_id.to_owned(),
+                },
+            ));
+        }
+        AdviceOutcome::Abstained { .. } => {
+            events.push(Event::new(
+                task_id,
+                EventKind::Designated {
+                    advice_event_id,
+                    profile_id: selected_profile_id.to_owned(),
+                },
+            ));
+        }
+    }
+    Ok(events)
+}
+
+fn record_advised_task(
+    event_log: &EventLog,
+    expected: &ReadEvents,
+    received: Event,
+    advice: &Advice,
+    selected_profile_id: &str,
+) -> Result<AppendBatchOutcome, AppError> {
+    let events = advised_task_events(received, advice, selected_profile_id)?;
+    Ok(event_log.append_batch_if_unchanged(expected, &events)?)
 }
 
 fn print_execution_summary(profile: &ExecutionProfile, prompt: &str, working_directory: &Path) {
@@ -1417,6 +1670,8 @@ enum AppError {
     NoAvailableProfiles,
     #[error("incompatible event log was not changed")]
     IncompatibleEventLogDeclined,
+    #[error("incompatible event log")]
+    IncompatibleEventLog,
     #[error("{0}")]
     Usage(String),
     #[error("execution {0} is no longer available")]
@@ -1509,7 +1764,7 @@ mod tests {
         execution
     }
 
-    fn old_event() -> Event {
+    fn old_event_with_format(format_version: &str) -> Event {
         let mut event = Event::new(
             Uuid::now_v7(),
             EventKind::TaskReceived {
@@ -1518,8 +1773,59 @@ mod tests {
                 prompt_chars: 1,
             },
         );
-        event.format_version = "old".to_owned();
+        event.format_version = format_version.to_owned();
         event
+    }
+
+    fn test_advice() -> Advice {
+        Advice {
+            referenced_segments: vec![Segment::Untagged],
+            outcome: AdviceOutcome::Abstained {
+                reason: AdviceReason::NoEvidence {
+                    max_judged: vec![AdviceSegmentCount {
+                        segment: EvidenceSegment::Untagged,
+                        max_judged: 0,
+                    }],
+                },
+            },
+            threshold: agent_dock::ADVICE_MIN_JUDGED,
+        }
+    }
+
+    fn proposed_test_advice(profile_id: &str) -> Advice {
+        Advice {
+            referenced_segments: vec![Segment::Untagged],
+            outcome: AdviceOutcome::Proposed {
+                profile_id: profile_id.to_owned(),
+                evidence: vec![AdviceEvidence {
+                    segment: EvidenceSegment::Untagged,
+                    acceptance: EvidenceAcceptance {
+                        summary: agent_dock::EvidenceAxisSummary {
+                            count: 3,
+                            latest_started_at: None,
+                        },
+                        accepted: 2,
+                    },
+                    duration: EvidenceDuration {
+                        summary: agent_dock::EvidenceAxisSummary {
+                            count: 0,
+                            latest_started_at: None,
+                        },
+                        median_ms: None,
+                    },
+                    cost: EvidenceCost {
+                        summary: agent_dock::EvidenceAxisSummary {
+                            count: 0,
+                            latest_started_at: None,
+                        },
+                        currency: None,
+                        total_minor_units: None,
+                        missing_count: 3,
+                    },
+                }],
+            },
+            threshold: agent_dock::ADVICE_MIN_JUDGED,
+        }
     }
 
     #[test]
@@ -1783,8 +2089,9 @@ mod tests {
         };
         let first_attempt =
             resolve_run_confirmation("do not run", confirmation, &mut first_edit, || {
-                record_approved_task(
+                record_advised_task(
                     &log,
+                    &log.read_all()?,
                     task_received_event(
                         Uuid::now_v7(),
                         Vec::new(),
@@ -1793,8 +2100,10 @@ mod tests {
                         false,
                         Timestamp::now(),
                     ),
+                    &test_advice(),
                     "test-default",
                 )
+                .map(|_| ())
             })
             .unwrap();
         let RunResolution::Edit(edited) = first_attempt else {
@@ -1809,8 +2118,9 @@ mod tests {
         };
         let second_attempt =
             resolve_run_confirmation(&edited, confirmation, &mut second_edit, || {
-                record_approved_task(
+                record_advised_task(
                     &log,
+                    &log.read_all()?,
                     task_received_event(
                         Uuid::now_v7(),
                         Vec::new(),
@@ -1819,8 +2129,10 @@ mod tests {
                         false,
                         Timestamp::now(),
                     ),
+                    &test_advice(),
                     "test-default",
                 )
+                .map(|_| ())
             })
             .unwrap();
         let RunResolution::Edit(edited) = second_attempt else {
@@ -1921,8 +2233,9 @@ mod tests {
                     2 => {
                         assert_eq!(prompt, "edited task");
                         assert_eq!(tags, ["edited"]);
-                        record_approved_task(
+                        record_advised_task(
                             &log,
+                            &log.read_all()?,
                             task_received_event(
                                 task_id,
                                 tags.to_vec(),
@@ -1931,6 +2244,7 @@ mod tests {
                                 true,
                                 Timestamp::now(),
                             ),
+                            &test_advice(),
                             "test-default",
                         )?;
                         Ok(RunResolution::Run(task_id))
@@ -1944,13 +2258,14 @@ mod tests {
         assert_eq!(prompt, "edited task");
         assert_eq!(approved_task_id, task_id);
         let events = log.read_all().unwrap().events;
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert!(matches!(
             &events[0].kind,
             EventKind::TaskReceived { tags, prompt, .. }
                 if tags == &["edited"] && prompt.as_deref() == Some("edited task")
         ));
-        assert!(matches!(events[1].kind, EventKind::Assigned { .. }));
+        assert!(matches!(events[1].kind, EventKind::Advised { .. }));
+        assert!(matches!(events[2].kind, EventKind::Designated { .. }));
     }
 
     #[test]
@@ -2019,7 +2334,7 @@ mod tests {
     }
 
     #[test]
-    fn records_received_before_assignment_only_after_approval() {
+    fn records_task_events_only_after_run_approval() {
         let directory = tempfile::tempdir().unwrap();
         let log = EventLog::new(directory.path().join("events.jsonl"));
         let task_id = Uuid::now_v7();
@@ -2029,8 +2344,9 @@ mod tests {
         };
         let resolution =
             resolve_run_confirmation("run this", RunConfirmation::Run, &mut edit, || {
-                record_approved_task(
+                record_advised_task(
                     &log,
+                    &log.read_all()?,
                     task_received_event(
                         task_id,
                         vec!["rust".to_owned()],
@@ -2039,6 +2355,7 @@ mod tests {
                         false,
                         Timestamp::now(),
                     ),
+                    &test_advice(),
                     "test-default",
                 )?;
                 Ok(task_id)
@@ -2047,11 +2364,422 @@ mod tests {
 
         let events = log.read_all().unwrap().events;
         assert_eq!(resolution, RunResolution::Run(task_id));
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert_eq!(events[0].task_id, Some(task_id));
         assert!(matches!(events[0].kind, EventKind::TaskReceived { .. }));
         assert_eq!(events[1].task_id, Some(task_id));
-        assert!(matches!(events[1].kind, EventKind::Assigned { .. }));
+        assert!(matches!(events[1].kind, EventKind::Advised { .. }));
+        assert!(matches!(events[2].kind, EventKind::Designated { .. }));
+    }
+
+    #[test]
+    fn records_approval_with_the_advice_event_id_in_one_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let profile = safe_test_profile();
+        let task_id = Uuid::now_v7();
+        let advice = proposed_test_advice(&profile.id);
+
+        assert_eq!(
+            record_advised_task(
+                &log,
+                &log.read_all().unwrap(),
+                task_received_event(
+                    task_id,
+                    Vec::new(),
+                    "run this",
+                    false,
+                    false,
+                    Timestamp::now(),
+                ),
+                &advice,
+                &profile.id,
+            )
+            .unwrap(),
+            AppendBatchOutcome::Appended
+        );
+        log.append(&Event::new(
+            task_id,
+            EventKind::Executed {
+                origin: ExecutionOrigin::Brokered,
+                profile: ProfileSnapshot::from(&profile),
+                working_directory: PathBuf::from("/tmp"),
+                started_at: Timestamp::now(),
+                elapsed_ms: 100,
+                outcome: RecordedExecutionOutcome::Completed { exit_code: Some(0) },
+                cost: None,
+            },
+        ))
+        .unwrap();
+        let events = log.read_all().unwrap().events;
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0].kind, EventKind::TaskReceived { .. }));
+        let EventKind::Advised {
+            referenced_segments,
+            outcome,
+            threshold,
+        } = &events[1].kind
+        else {
+            panic!("the second event must contain the advice");
+        };
+        assert_eq!(referenced_segments, &vec![EvidenceSegment::Untagged]);
+        assert_eq!(*threshold, agent_dock::ADVICE_MIN_JUDGED as u64);
+        let AdviceOutcome::Proposed {
+            profile_id,
+            evidence,
+        } = outcome
+        else {
+            panic!("the approval test must use a proposal");
+        };
+        assert_eq!(profile_id, &profile.id);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].segment, EvidenceSegment::Untagged);
+        assert_eq!(evidence[0].acceptance.summary.count, 3);
+        assert_eq!(evidence[0].acceptance.accepted, 2);
+        assert_eq!(evidence[0].duration.summary.count, 0);
+        assert_eq!(evidence[0].duration.median_ms, None);
+        assert_eq!(evidence[0].cost.summary.count, 0);
+        assert_eq!(evidence[0].cost.missing_count, 3);
+        let advice_event_id = events[1].event_id;
+        assert!(matches!(
+            &events[2].kind,
+            EventKind::Approved {
+                advice_event_id: id,
+                profile_id,
+            } if *id == advice_event_id && profile_id == &profile.id
+        ));
+        assert!(matches!(events[3].kind, EventKind::Executed { .. }));
+    }
+
+    #[test]
+    fn records_declined_advice_before_a_designation() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let selected = safe_test_profile();
+        let task_id = Uuid::now_v7();
+        let advice = proposed_test_advice("recommended");
+        record_advised_task(
+            &log,
+            &log.read_all().unwrap(),
+            task_received_event(
+                task_id,
+                vec!["rust".to_owned()],
+                "run this",
+                false,
+                false,
+                Timestamp::now(),
+            ),
+            &advice,
+            &selected.id,
+        )
+        .unwrap();
+
+        let events = log.read_all().unwrap().events;
+        assert_eq!(events.len(), 4);
+        let advice_event_id = events[1].event_id;
+        assert!(matches!(
+            events[2].kind,
+            EventKind::Declined { advice_event_id: id } if id == advice_event_id
+        ));
+        assert!(matches!(
+            &events[3].kind,
+            EventKind::Designated {
+                advice_event_id: id,
+                profile_id,
+            } if *id == advice_event_id && profile_id == &selected.id
+        ));
+    }
+
+    #[test]
+    fn records_only_a_designation_after_abstaining() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let profile = safe_test_profile();
+        let task_id = Uuid::now_v7();
+        record_advised_task(
+            &log,
+            &log.read_all().unwrap(),
+            task_received_event(
+                task_id,
+                Vec::new(),
+                "run this",
+                false,
+                false,
+                Timestamp::now(),
+            ),
+            &test_advice(),
+            &profile.id,
+        )
+        .unwrap();
+
+        let events = log.read_all().unwrap().events;
+        assert_eq!(events.len(), 3);
+        let advice_event_id = events[1].event_id;
+        assert!(matches!(
+            &events[2].kind,
+            EventKind::Designated {
+                advice_event_id: id,
+                profile_id,
+            } if *id == advice_event_id && profile_id == &profile.id
+        ));
+    }
+
+    #[test]
+    fn does_not_append_a_stale_advice_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        let initial = log.read_all().unwrap();
+        log.append(&task_received_event(
+            Uuid::now_v7(),
+            Vec::new(),
+            "another task",
+            false,
+            false,
+            Timestamp::now(),
+        ))
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        let profile = safe_test_profile();
+
+        assert_eq!(
+            record_advised_task(
+                &log,
+                &initial,
+                task_received_event(
+                    Uuid::now_v7(),
+                    Vec::new(),
+                    "stale task",
+                    false,
+                    false,
+                    Timestamp::now(),
+                ),
+                &test_advice(),
+                &profile.id,
+            )
+            .unwrap(),
+            AppendBatchOutcome::Changed
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn retries_advice_after_the_event_log_is_removed_during_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        log.append(&task_received_event(
+            Uuid::now_v7(),
+            Vec::new(),
+            "existing task",
+            false,
+            false,
+            Timestamp::now(),
+        ))
+        .unwrap();
+        let profile = safe_test_profile();
+        let mut preparations = 0;
+
+        let result = resolve_advised_task_with(&log, |history| {
+            preparations += 1;
+            let received = task_received_event(
+                Uuid::now_v7(),
+                Vec::new(),
+                "run this",
+                false,
+                false,
+                Timestamp::now(),
+            );
+            if preparations == 1 {
+                assert_eq!(history.events.len(), 1);
+                fs::remove_file(&path)?;
+                Ok(RunResolution::Run((
+                    received,
+                    test_advice(),
+                    profile.id.clone(),
+                    "stale".to_owned(),
+                )))
+            } else {
+                assert!(history.events.is_empty());
+                Ok(RunResolution::Run((
+                    received,
+                    proposed_test_advice(&profile.id),
+                    profile.id.clone(),
+                    "recalculated".to_owned(),
+                )))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(result, RunResolution::Run("recalculated".to_owned()));
+        assert_eq!(preparations, 2);
+        let events = log.read_all().unwrap().events;
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[1].kind,
+            EventKind::Advised {
+                outcome: AdviceOutcome::Proposed { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn propagates_advice_batch_append_errors_before_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        let log = EventLog::new(&path);
+        log.append(&task_received_event(
+            Uuid::now_v7(),
+            Vec::new(),
+            "existing task",
+            false,
+            false,
+            Timestamp::now(),
+        ))
+        .unwrap();
+        let profile = safe_test_profile();
+
+        let result = resolve_advised_task_with(&log, |_| {
+            fs::remove_file(&path)?;
+            fs::create_dir(&path)?;
+            Ok(RunResolution::Run((
+                task_received_event(
+                    Uuid::now_v7(),
+                    Vec::new(),
+                    "run this",
+                    false,
+                    false,
+                    Timestamp::now(),
+                ),
+                test_advice(),
+                profile.id.clone(),
+                (),
+            )))
+        });
+
+        let Err(error) = result else {
+            panic!("an append error must not resolve the task for execution");
+        };
+        assert!(matches!(error, AppError::Record(_)));
+        assert!(path.is_dir());
+        assert!(fs::read_dir(path).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn propagates_interruption_after_representing_advice_without_recording_a_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let profile = safe_test_profile();
+        let mut preparations = 0;
+
+        let result = resolve_advised_task_with(&log, |history| {
+            preparations += 1;
+            if preparations == 1 {
+                log.append(&task_received_event(
+                    Uuid::now_v7(),
+                    Vec::new(),
+                    "intervening task",
+                    false,
+                    false,
+                    Timestamp::now(),
+                ))?;
+                Ok(RunResolution::Run((
+                    task_received_event(
+                        Uuid::now_v7(),
+                        Vec::new(),
+                        "run this",
+                        false,
+                        false,
+                        Timestamp::now(),
+                    ),
+                    test_advice(),
+                    profile.id.clone(),
+                    (),
+                )))
+            } else {
+                assert_eq!(history.events.len(), 1);
+                Err(AppError::Readline(ReadlineError::Interrupted))
+            }
+        });
+
+        assert!(matches!(
+            result,
+            Err(AppError::Readline(ReadlineError::Interrupted))
+        ));
+        assert_eq!(preparations, 2);
+        let events = log.read_all().unwrap().events;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].kind, EventKind::TaskReceived { .. }));
+    }
+
+    #[test]
+    fn retries_advice_preparation_after_the_history_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let profile = safe_test_profile();
+        let mut preparations = 0_usize;
+        let result = resolve_advised_task_with(&log, |history| {
+            preparations += 1;
+            let received = task_received_event(
+                Uuid::now_v7(),
+                Vec::new(),
+                "run this",
+                false,
+                false,
+                Timestamp::now(),
+            );
+            let advice = if history.events.is_empty() {
+                test_advice()
+            } else {
+                proposed_test_advice(&profile.id)
+            };
+            if preparations == 1 {
+                log.append(&task_received_event(
+                    Uuid::now_v7(),
+                    Vec::new(),
+                    "intervening task",
+                    false,
+                    false,
+                    Timestamp::now(),
+                ))?;
+            }
+            assert_eq!(history.events.len(), preparations.saturating_sub(1));
+            Ok(RunResolution::Run((
+                received,
+                advice,
+                profile.id.clone(),
+                "done".to_owned(),
+            )))
+        })
+        .unwrap();
+
+        assert_eq!(result, RunResolution::Run("done".to_owned()));
+        assert_eq!(preparations, 2);
+        let events = log.read_all().unwrap().events;
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            &events[2].kind,
+            EventKind::Advised {
+                outcome: AdviceOutcome::Proposed { profile_id, .. },
+                ..
+            } if profile_id == &profile.id
+        ));
+        assert!(matches!(
+            &events[3].kind,
+            EventKind::Approved { profile_id, .. } if profile_id == &profile.id
+        ));
+    }
+
+    #[test]
+    fn chooses_the_proposed_profile_as_the_default_by_id() {
+        let first = safe_test_profile();
+        let mut declaration = agent_dock::safe_test_declaration();
+        declaration.model = Some("second".to_owned());
+        let second = declaration.resolve(PathBuf::from("/usr/bin/true")).unwrap();
+        let proposed = proposed_test_advice(&second.id);
+        assert_eq!(advice_default_index(&proposed, &[first, second.clone()]), 1);
+        assert_eq!(advice_default_index(&test_advice(), &[second]), 0);
     }
 
     #[test]
@@ -2225,9 +2953,10 @@ mod tests {
             },
         );
         let original = format!(
-            "{}\n{}\n",
+            "{}\n{}\n{}\n",
             serde_json::to_string(&current).unwrap(),
-            serde_json::to_string(&old_event()).unwrap()
+            serde_json::to_string(&old_event_with_format("old")).unwrap(),
+            serde_json::to_string(&old_event_with_format("agent-dock/events/v1alpha3")).unwrap()
         );
         fs::write(&path, &original).unwrap();
         let mut ask = |prompt: &str, default: bool| {
@@ -2257,39 +2986,62 @@ mod tests {
     fn preserves_an_incompatible_event_log_if_recreation_is_declined() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        let original = serde_json::to_string(&old_event()).unwrap() + "\n";
-        fs::write(&path, &original).unwrap();
-        let mut ask = |prompt: &str, default: bool| {
-            assert_eq!(prompt, "Back up and clear the incompatible event log?");
-            assert!(!default);
-            Ok(false)
-        };
+        for format_version in ["old", "agent-dock/events/v1alpha3"] {
+            let original =
+                serde_json::to_string(&old_event_with_format(format_version)).unwrap() + "\n";
+            fs::write(&path, &original).unwrap();
+            let mut ask = |prompt: &str, default: bool| {
+                assert_eq!(prompt, "Back up and clear the incompatible event log?");
+                assert!(!default);
+                Ok(false)
+            };
 
-        assert!(matches!(
-            read_event_history_with(&EventLog::new(&path), &mut ask),
-            Err(AppError::IncompatibleEventLogDeclined)
-        ));
-        assert_eq!(fs::read_to_string(path).unwrap(), original);
+            assert!(matches!(
+                read_event_history_with(&EventLog::new(&path), &mut ask),
+                Err(AppError::IncompatibleEventLogDeclined)
+            ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
     }
 
     #[test]
     fn preserves_an_incompatible_event_log_if_confirmation_is_interrupted() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        let original = serde_json::to_string(&old_event()).unwrap() + "\n";
-        fs::write(&path, &original).unwrap();
-        let mut ask = |_: &str, _: bool| {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "test interruption",
-            ))
-        };
+        for format_version in ["old", "agent-dock/events/v1alpha3"] {
+            let original =
+                serde_json::to_string(&old_event_with_format(format_version)).unwrap() + "\n";
+            fs::write(&path, &original).unwrap();
+            let mut ask = |_: &str, _: bool| {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "test interruption",
+                ))
+            };
 
-        assert!(matches!(
-            read_event_history_with(&EventLog::new(&path), &mut ask),
-            Err(AppError::Io(source)) if source.kind() == io::ErrorKind::Interrupted
-        ));
-        assert_eq!(fs::read_to_string(path).unwrap(), original);
+            assert!(matches!(
+                read_event_history_with(&EventLog::new(&path), &mut ask),
+                Err(AppError::Io(source)) if source.kind() == io::ErrorKind::Interrupted
+            ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn non_interactive_history_reads_reject_old_formats_without_changing_the_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        for format_version in ["old", "agent-dock/events/v1alpha3"] {
+            let original =
+                serde_json::to_string(&old_event_with_format(format_version)).unwrap() + "\n";
+            fs::write(&path, &original).unwrap();
+
+            assert!(matches!(
+                read_event_history_without_migration(&EventLog::new(&path)),
+                Err(AppError::IncompatibleEventLog)
+            ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
     }
 
     #[test]
@@ -2313,13 +3065,14 @@ mod tests {
 
     #[test]
     fn parses_one_based_profile_selections() {
-        assert_eq!(parse_selection("", 3), Some(0));
-        assert_eq!(parse_selection("1", 3), Some(0));
-        assert_eq!(parse_selection(" 3 ", 3), Some(2));
-        assert_eq!(parse_selection("0", 3), None);
-        assert_eq!(parse_selection("4", 3), None);
-        assert_eq!(parse_selection("one", 3), None);
-        assert_eq!(parse_selection("", 0), None);
+        assert_eq!(parse_selection("", 3, 0), Some(0));
+        assert_eq!(parse_selection("", 3, 2), Some(2));
+        assert_eq!(parse_selection("1", 3, 2), Some(0));
+        assert_eq!(parse_selection(" 3 ", 3, 0), Some(2));
+        assert_eq!(parse_selection("0", 3, 0), None);
+        assert_eq!(parse_selection("4", 3, 0), None);
+        assert_eq!(parse_selection("one", 3, 0), None);
+        assert_eq!(parse_selection("", 0, 0), None);
     }
 
     #[test]
@@ -2331,6 +3084,193 @@ mod tests {
         assert_eq!(all.len() - visible.len(), 2);
         assert!(matches!(visible[0], Segment::Overall));
         assert!(matches!(&visible[5], Segment::Tag(tag) if tag == "tag-4"));
+    }
+
+    #[test]
+    fn renders_only_the_first_six_scorecard_segments_and_hidden_tag_count() {
+        let profile = safe_test_profile();
+        let score = |segment| SegmentScore {
+            segment,
+            execution_count: 0,
+            excluded_count: 0,
+            acceptance: agent_dock::AcceptanceAxis::default(),
+            duration: agent_dock::DurationAxis::default(),
+            cost: agent_dock::CostAxis::default(),
+            origins: agent_dock::OriginCounts::default(),
+        };
+        let scores = std::iter::once(score(Segment::Overall))
+            .chain((0..8).map(|index| score(Segment::Tag(format!("tag-{index}")))))
+            .collect();
+        let scorecards = vec![agent_dock::ProfileScorecard {
+            profile_id: profile.id.clone(),
+            scores,
+        }];
+
+        let rendered = render_profile_choices(&[profile], &scorecards, 3, Timestamp::now());
+        let lines: Vec<_> = rendered[0].lines().collect();
+
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines[1], "     Overall: No history");
+        for (line, index) in lines[2..7].iter().zip(0..5) {
+            assert_eq!(*line, format!("     Tag \"tag-{index}\": No history"));
+        }
+        assert_eq!(lines[7], "     ... 3 more tags");
+        assert!(lines.iter().all(|line| {
+            !line.contains("tag-5") && !line.contains("tag-6") && !line.contains("tag-7")
+        }));
+    }
+
+    #[test]
+    fn advises_from_all_tag_segments_in_event_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let profile = safe_test_profile();
+        let tags: Vec<_> = (0..7).map(|index| format!("tag-{index}")).collect();
+
+        for index in 0..3 {
+            let task_id = Uuid::now_v7();
+            log.append(&task_received_event(
+                task_id,
+                tags.clone(),
+                &format!("tagged task {index}"),
+                false,
+                false,
+                Timestamp::now(),
+            ))
+            .unwrap();
+            log.append(&Event::new(
+                task_id,
+                EventKind::Executed {
+                    origin: ExecutionOrigin::Brokered,
+                    profile: ProfileSnapshot::from(&profile),
+                    working_directory: PathBuf::from("/tmp"),
+                    started_at: Timestamp::now(),
+                    elapsed_ms: 100,
+                    outcome: RecordedExecutionOutcome::Completed { exit_code: Some(0) },
+                    cost: None,
+                },
+            ))
+            .unwrap();
+            log.append(&Event::new(
+                task_id,
+                EventKind::Judged {
+                    verdict: Verdict::Accepted,
+                },
+            ))
+            .unwrap();
+        }
+
+        let history = log.read_all().unwrap();
+        let profiles = [profile.clone()];
+        let (segments, projection, advice) =
+            prepare_advice_for_task(&history.events, &tags, &profiles, &profiles);
+
+        assert_eq!(segments.len(), 8);
+        assert_eq!(projection.scorecards[0].scores.len(), 8);
+        let AdviceOutcome::Proposed {
+            profile_id,
+            evidence,
+        } = advice.outcome
+        else {
+            panic!("enough evidence across all tags should produce advice");
+        };
+        assert_eq!(profile_id, profile.id);
+        assert_eq!(evidence.len(), 7);
+        for (index, evidence) in evidence.iter().enumerate().skip(5).take(2) {
+            assert_eq!(
+                evidence.segment,
+                EvidenceSegment::Tag(format!("tag-{index}"))
+            );
+            assert_eq!(evidence.acceptance.summary.count, 3);
+        }
+    }
+
+    #[test]
+    fn escapes_terminal_controls_in_advice_display_fields() {
+        let mut profile = safe_test_profile();
+        profile.declaration.name = "\x1b[31mcrew".to_owned();
+        profile.id = "\x1b[31mprofile-id".to_owned();
+        let evidence = |segment, currency| AdviceEvidence {
+            segment,
+            acceptance: EvidenceAcceptance {
+                summary: agent_dock::EvidenceAxisSummary {
+                    count: 0,
+                    latest_started_at: None,
+                },
+                accepted: 0,
+            },
+            duration: EvidenceDuration {
+                summary: agent_dock::EvidenceAxisSummary {
+                    count: 0,
+                    latest_started_at: None,
+                },
+                median_ms: None,
+            },
+            cost: EvidenceCost {
+                summary: agent_dock::EvidenceAxisSummary {
+                    count: 1,
+                    latest_started_at: None,
+                },
+                currency,
+                total_minor_units: Some(42),
+                missing_count: 0,
+            },
+        };
+        let score = SegmentScore {
+            segment: Segment::Tag("scorecard".to_owned()),
+            execution_count: 1,
+            excluded_count: 0,
+            acceptance: agent_dock::AcceptanceAxis::default(),
+            duration: agent_dock::DurationAxis::default(),
+            cost: agent_dock::CostAxis {
+                summary: agent_dock::AxisSummary {
+                    count: 1,
+                    latest_started_at: None,
+                },
+                currency: Some("\x1b[31mEUR".to_owned()),
+                total_minor_units: Some(42),
+                missing_count: 0,
+            },
+            origins: agent_dock::OriginCounts::default(),
+        };
+        let cases = [
+            (
+                "profile name",
+                render_advice_proposal(&profile.id, &[profile.clone()]),
+                r"\u{1b}[31mcrew",
+            ),
+            (
+                "profile id",
+                render_advice_proposal(&profile.id, &[profile.clone()]),
+                r"\u{1b}[31mprofile-id",
+            ),
+            (
+                "tag",
+                render_advice_evidence(
+                    &evidence(EvidenceSegment::Tag("\x1b[31mtag".to_owned()), None),
+                    Timestamp::now(),
+                ),
+                r"\u{1b}[31mtag",
+            ),
+            (
+                "advice currency",
+                render_advice_evidence(
+                    &evidence(EvidenceSegment::Untagged, Some("\x1b[31mUSD".to_owned())),
+                    Timestamp::now(),
+                ),
+                r"\u{1b}[31mUSD",
+            ),
+            (
+                "scorecard currency",
+                render_segment(&score, Timestamp::now()),
+                r"\u{1b}[31mEUR",
+            ),
+        ];
+
+        for (case, rendered, expected) in cases {
+            assert!(rendered.contains(expected), "case={case}: {rendered}");
+            assert!(!rendered.contains('\x1b'), "case={case}: {rendered}");
+        }
     }
 
     #[test]

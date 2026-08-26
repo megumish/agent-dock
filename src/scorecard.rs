@@ -112,15 +112,14 @@ struct DirectTask<'a> {
 pub fn segments_for_tags(tags: &[String]) -> Vec<Segment> {
     let mut result = vec![Segment::Overall];
     let mut seen = HashSet::new();
-    if tags.is_empty() {
+    for tag in tags {
+        let tag = tag.trim();
+        if !tag.is_empty() && seen.insert(tag.to_owned()) {
+            result.push(Segment::Tag(tag.to_owned()));
+        }
+    }
+    if result.len() == 1 {
         result.push(Segment::Untagged);
-    } else {
-        result.extend(
-            tags.iter()
-                .filter(|tag| seen.insert((*tag).clone()))
-                .cloned()
-                .map(Segment::Tag),
-        );
     }
     result
 }
@@ -331,8 +330,8 @@ pub fn project(
 fn matches_segment(segment: &Segment, tags: &[String]) -> bool {
     match segment {
         Segment::Overall => true,
-        Segment::Untagged => tags.is_empty(),
-        Segment::Tag(tag) => tags.contains(tag),
+        Segment::Untagged => tags.iter().all(|tag| tag.trim().is_empty()),
+        Segment::Tag(tag) => tags.iter().any(|candidate| candidate.trim() == tag),
     }
 }
 
@@ -563,6 +562,52 @@ mod tests {
 
     fn judged(task_id: Uuid, _execution_event_id: Uuid, verdict: Verdict) -> Event {
         Event::new(task_id, EventKind::Judged { verdict })
+    }
+
+    #[test]
+    fn ignores_advice_events_when_projecting_the_scorecard() {
+        let profile = safe_test_profile();
+        let task_id = Uuid::now_v7();
+        let advice_event_id = Uuid::now_v7();
+        let events = vec![
+            Event::new(
+                task_id,
+                EventKind::Advised {
+                    referenced_segments: vec![crate::EvidenceSegment::Untagged],
+                    outcome: crate::AdviceOutcome::Abstained {
+                        reason: crate::AdviceReason::NoEvidence {
+                            max_judged: vec![crate::AdviceSegmentCount {
+                                segment: crate::EvidenceSegment::Untagged,
+                                max_judged: 0,
+                            }],
+                        },
+                    },
+                    threshold: 3,
+                },
+            ),
+            Event::new(
+                task_id,
+                EventKind::Approved {
+                    advice_event_id,
+                    profile_id: profile.id.clone(),
+                },
+            ),
+            Event::new(task_id, EventKind::Declined { advice_event_id }),
+            Event::new(
+                task_id,
+                EventKind::Designated {
+                    advice_event_id,
+                    profile_id: profile.id.clone(),
+                },
+            ),
+        ];
+        let expected = project(&[], std::slice::from_ref(&profile), &[Segment::Untagged]);
+        let actual = project(
+            &events,
+            std::slice::from_ref(&profile),
+            &[Segment::Untagged],
+        );
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -994,8 +1039,45 @@ mod tests {
                     Segment::Tag("docs".to_owned()),
                 ],
             ),
+            (
+                vec![" rust ".to_owned()],
+                vec![Segment::Overall, Segment::Tag("rust".to_owned())],
+            ),
+            (
+                vec!["  ".to_owned(), "\t".to_owned()],
+                vec![Segment::Overall, Segment::Untagged],
+            ),
+            (
+                vec!["Rust".to_owned()],
+                vec![Segment::Overall, Segment::Tag("Rust".to_owned())],
+            ),
         ] {
             assert_eq!(segments_for_tags(&tags), expected);
+        }
+
+        for (segment, tags, expected) in [
+            (
+                Segment::Tag("rust".to_owned()),
+                vec![" rust ".to_owned()],
+                true,
+            ),
+            (
+                Segment::Tag("rust".to_owned()),
+                vec!["Rust".to_owned()],
+                false,
+            ),
+            (
+                Segment::Untagged,
+                vec![" ".to_owned(), "\t".to_owned()],
+                true,
+            ),
+            (
+                Segment::Untagged,
+                vec!["rust".to_owned(), " ".to_owned()],
+                false,
+            ),
+        ] {
+            assert_eq!(matches_segment(&segment, &tags), expected);
         }
 
         let task_id = Uuid::now_v7();

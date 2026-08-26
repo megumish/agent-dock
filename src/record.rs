@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{CliKind, ExecutionPlatform, ExecutionProfile, ProfileDeclaration};
 
-pub const EVENT_FORMAT_VERSION: &str = "agent-dock/events/v1alpha3";
+pub const EVENT_FORMAT_VERSION: &str = "agent-dock/events/v1alpha4";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
@@ -74,6 +74,74 @@ pub enum ExecutionOrigin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum EvidenceSegment {
+    Overall,
+    Untagged,
+    Tag(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceAxisSummary {
+    pub count: u64,
+    pub latest_started_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceAcceptance {
+    pub summary: EvidenceAxisSummary,
+    pub accepted: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceDuration {
+    pub summary: EvidenceAxisSummary,
+    pub median_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceCost {
+    pub summary: EvidenceAxisSummary,
+    pub currency: Option<String>,
+    pub total_minor_units: Option<u64>,
+    pub missing_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdviceEvidence {
+    pub segment: EvidenceSegment,
+    pub acceptance: EvidenceAcceptance,
+    pub duration: EvidenceDuration,
+    pub cost: EvidenceCost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdviceSegmentCount {
+    pub segment: EvidenceSegment,
+    pub max_judged: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum AdviceReason {
+    NoEvidence { max_judged: Vec<AdviceSegmentCount> },
+    InsufficientEvidence { max_judged: Vec<AdviceSegmentCount> },
+    NoUniqueLeader { profile_ids: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "data", rename_all = "snake_case")]
+pub enum AdviceOutcome {
+    Proposed {
+        profile_id: String,
+        evidence: Vec<AdviceEvidence>,
+    },
+    Abstained {
+        reason: AdviceReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum EventKind {
     TaskReceived {
@@ -81,7 +149,20 @@ pub enum EventKind {
         prompt: Option<String>,
         prompt_chars: usize,
     },
-    Assigned {
+    Advised {
+        referenced_segments: Vec<EvidenceSegment>,
+        outcome: AdviceOutcome,
+        threshold: u64,
+    },
+    Approved {
+        advice_event_id: Uuid,
+        profile_id: String,
+    },
+    Declined {
+        advice_event_id: Uuid,
+    },
+    Designated {
+        advice_event_id: Uuid,
         profile_id: String,
     },
     Executed {
@@ -1038,10 +1119,57 @@ mod tests {
                 },
             )
         });
+        let advice_event_id = Uuid::now_v7();
+        let evidence = AdviceEvidence {
+            segment: EvidenceSegment::Tag("rust".to_owned()),
+            acceptance: EvidenceAcceptance {
+                summary: EvidenceAxisSummary {
+                    count: 3,
+                    latest_started_at: Some(Timestamp::now()),
+                },
+                accepted: 2,
+            },
+            duration: EvidenceDuration {
+                summary: EvidenceAxisSummary {
+                    count: 2,
+                    latest_started_at: Some(Timestamp::now()),
+                },
+                median_ms: None,
+            },
+            cost: EvidenceCost {
+                summary: EvidenceAxisSummary {
+                    count: 2,
+                    latest_started_at: Some(Timestamp::now()),
+                },
+                currency: None,
+                total_minor_units: None,
+                missing_count: 1,
+            },
+        };
         let events: Vec<_> = [
             Event::new(
                 task_id,
-                EventKind::Assigned {
+                EventKind::Advised {
+                    referenced_segments: vec![EvidenceSegment::Tag("rust".to_owned())],
+                    outcome: AdviceOutcome::Proposed {
+                        profile_id: profile.id.clone(),
+                        evidence: vec![evidence],
+                    },
+                    threshold: 3,
+                },
+            ),
+            Event::new(
+                task_id,
+                EventKind::Approved {
+                    advice_event_id,
+                    profile_id: profile.id.clone(),
+                },
+            ),
+            Event::new(task_id, EventKind::Declined { advice_event_id }),
+            Event::new(
+                task_id,
+                EventKind::Designated {
+                    advice_event_id,
                     profile_id: profile.id.clone(),
                 },
             ),
@@ -1057,6 +1185,100 @@ mod tests {
         .collect();
 
         for event in events {
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn round_trips_every_advice_outcome_and_abstention_reason() {
+        let task_id = Uuid::now_v7();
+        let max_judged = vec![AdviceSegmentCount {
+            segment: EvidenceSegment::Untagged,
+            max_judged: 0,
+        }];
+        let some_evidence = AdviceEvidence {
+            segment: EvidenceSegment::Tag("rust".to_owned()),
+            acceptance: EvidenceAcceptance {
+                summary: EvidenceAxisSummary {
+                    count: 3,
+                    latest_started_at: Some(Timestamp::now()),
+                },
+                accepted: 2,
+            },
+            duration: EvidenceDuration {
+                summary: EvidenceAxisSummary {
+                    count: 3,
+                    latest_started_at: Some(Timestamp::now()),
+                },
+                median_ms: Some(1_234),
+            },
+            cost: EvidenceCost {
+                summary: EvidenceAxisSummary {
+                    count: 3,
+                    latest_started_at: Some(Timestamp::now()),
+                },
+                currency: Some("USD".to_owned()),
+                total_minor_units: Some(42),
+                missing_count: 0,
+            },
+        };
+        let none_evidence = AdviceEvidence {
+            segment: EvidenceSegment::Untagged,
+            acceptance: EvidenceAcceptance {
+                summary: EvidenceAxisSummary {
+                    count: 0,
+                    latest_started_at: None,
+                },
+                accepted: 0,
+            },
+            duration: EvidenceDuration {
+                summary: EvidenceAxisSummary {
+                    count: 0,
+                    latest_started_at: None,
+                },
+                median_ms: None,
+            },
+            cost: EvidenceCost {
+                summary: EvidenceAxisSummary {
+                    count: 0,
+                    latest_started_at: None,
+                },
+                currency: None,
+                total_minor_units: None,
+                missing_count: 0,
+            },
+        };
+        let outcomes = [
+            AdviceOutcome::Proposed {
+                profile_id: "profile-id".to_owned(),
+                evidence: vec![some_evidence, none_evidence],
+            },
+            AdviceOutcome::Abstained {
+                reason: AdviceReason::NoEvidence {
+                    max_judged: max_judged.clone(),
+                },
+            },
+            AdviceOutcome::Abstained {
+                reason: AdviceReason::InsufficientEvidence {
+                    max_judged: max_judged.clone(),
+                },
+            },
+            AdviceOutcome::Abstained {
+                reason: AdviceReason::NoUniqueLeader {
+                    profile_ids: vec!["first".to_owned(), "second".to_owned()],
+                },
+            },
+        ];
+        for outcome in outcomes {
+            let event = Event::new(
+                task_id,
+                EventKind::Advised {
+                    referenced_segments: vec![EvidenceSegment::Untagged],
+                    outcome,
+                    threshold: 3,
+                },
+            );
             let encoded = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
         }

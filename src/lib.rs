@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod advice;
 pub mod config;
 pub mod execution;
 pub mod hook;
@@ -12,6 +13,7 @@ pub use adapter::{
     CliKind, CommandSpec, ExecutionPlatform, ExecutionProfile, ProfileDeclaration, PromptTransport,
     safe_test_declaration, safe_test_profile,
 };
+pub use advice::{ADVICE_MIN_JUDGED, Advice, advise};
 pub use config::{Config, ConfigError, ConfigRevision, ReplaceConfigOutcome, default_config_path};
 pub use execution::{
     ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionRequest, OutputSource, execute,
@@ -27,10 +29,12 @@ pub use observation::{
 };
 pub use observe_cli::{ObserveCliCommand, parse_observe_args};
 pub use record::{
-    ActualCost, AppendBatchOutcome, AppendJudgementOutcome, AttributionFailure,
-    BackupEventLogOutcome, ConfigurationBoundary, EVENT_FORMAT_VERSION, Event, EventKind, EventLog,
-    ExecutionOrigin, FailureKind, ObservationAnomaly, ObservedConfiguration, ObservedTaskStatus,
-    ObservedValue, ProfileAttribution, ProfileSnapshot, Provenance, ReadEvents, RecordError,
+    ActualCost, AdviceEvidence, AdviceOutcome, AdviceReason, AdviceSegmentCount,
+    AppendBatchOutcome, AppendJudgementOutcome, AttributionFailure, BackupEventLogOutcome,
+    ConfigurationBoundary, EVENT_FORMAT_VERSION, Event, EventKind, EventLog, EvidenceAcceptance,
+    EvidenceAxisSummary, EvidenceCost, EvidenceDuration, EvidenceSegment, ExecutionOrigin,
+    FailureKind, ObservationAnomaly, ObservedConfiguration, ObservedTaskStatus, ObservedValue,
+    ProfileAttribution, ProfileSnapshot, Provenance, ReadEvents, RecordError,
     RecordedExecutionOutcome, SessionPhase, SkippedLine, SkippedLineReason, Verdict,
     default_events_path,
 };
