@@ -12,17 +12,17 @@ use std::{
 use agent_dock::{
     Advice, AdviceEvidence, AdviceOutcome, AdviceReason, AdviceSegmentCount, AppendBatchOutcome,
     AppendJudgementOutcome, AttributionFailure, BackupEventLogOutcome, Config, ConfigError,
-    EVENT_FORMAT_VERSION, Event, EventKind, EventLog, EvidenceAcceptance, EvidenceCost,
-    EvidenceDuration, EvidenceSegment, ExclusionReason, ExecutionError, ExecutionEvent,
-    ExecutionOrigin, ExecutionOutcome, ExecutionPlatform, ExecutionProfile, ExecutionReport,
-    ExecutionRequest, FailureKind, HookEvent, JudgementCandidate, MAX_HOOK_INPUT_BYTES,
-    ObservationCommand, ObserveCliCommand, OutputSource, ProfileAttribution, ProfileDeclaration,
-    ProfileSnapshot, Projection, Provenance, ReadEvents, RecordedExecutionOutcome,
-    ReplaceConfigOutcome, Segment, SegmentScore, SessionPhase, SkippedLineReason, Verdict, advise,
-    apply_observation, configuration_for_profile, default_config_path, default_events_path,
-    escape_terminal, execute, format_acceptance, format_duration, format_recency,
-    judgement_candidates, parse_hook_observation, parse_observe_args, project,
-    resolve_observed_session, safe_test_profile, segments_for_tags,
+    EVENT_FORMAT_VERSION, EstimatedCostSummary, Event, EventKind, EventLog, EvidenceAcceptance,
+    EvidenceCost, EvidenceDuration, EvidenceSegment, ExclusionReason, ExecutionError,
+    ExecutionEvent, ExecutionOrigin, ExecutionOutcome, ExecutionPlatform, ExecutionProfile,
+    ExecutionReport, ExecutionRequest, FailureKind, HookEvent, JudgementCandidate,
+    MAX_HOOK_INPUT_BYTES, ObservationCommand, ObserveCliCommand, OutputSource, ProfileAttribution,
+    ProfileDeclaration, ProfileSnapshot, Projection, Provenance, ReadEvents,
+    RecordedExecutionOutcome, ReplaceConfigOutcome, Segment, SegmentScore, SessionPhase,
+    SkippedLineReason, Verdict, advise, apply_observation, configuration_for_profile,
+    default_config_path, default_events_path, escape_terminal, execute, format_acceptance,
+    format_duration, format_recency, judgement_candidates, parse_hook_observation,
+    parse_observe_args, project, resolve_observed_session, safe_test_profile, segments_for_tags,
 };
 use jiff::Timestamp;
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -1345,6 +1345,10 @@ fn render_profile_choices(
                 let visible_score_count = card.scores.len().saturating_sub(hidden_tags);
                 for score in card.scores.iter().take(visible_score_count) {
                     lines.push(format!("     {}", render_segment(score, now)));
+                    lines.push(format!(
+                        "         {}",
+                        render_reported_disclosure(&score.reported, now)
+                    ));
                 }
             }
             if hidden_tags > 0 {
@@ -1384,6 +1388,49 @@ fn render_segment(score: &SegmentScore, now: Timestamp) -> String {
         format_cost(&score.cost),
         excluded,
     )
+}
+
+fn render_reported_disclosure(
+    disclosure: &agent_dock::ReportedDisclosure,
+    now: Timestamp,
+) -> String {
+    if disclosure.brokered_count == 0 {
+        return "CLI-reported: not applicable".to_owned();
+    }
+    let latest = format_recency(now, disclosure.latest_started_at)
+        .map(|value| format!(" | latest {value}"))
+        .unwrap_or_default();
+    format!(
+        "CLI-reported (not actual cost): reported {}/{} | none {} | failures parse {} / limit {} / model {} | {}{}",
+        disclosure.reported_count,
+        disclosure.brokered_count,
+        disclosure.missing_count,
+        disclosure.failures.parse,
+        disclosure.failures.limit,
+        disclosure.failures.model,
+        format_estimated_cost(&disclosure.estimated_cost),
+        latest,
+    )
+}
+
+fn format_estimated_cost(cost: &EstimatedCostSummary) -> String {
+    match cost {
+        EstimatedCostSummary::None => "est none".to_owned(),
+        EstimatedCostSummary::Total {
+            currency,
+            amount_micros,
+            count,
+        } => format!(
+            "est {} {}.{:06} ({count})",
+            escape_terminal(currency),
+            amount_micros / 1_000_000,
+            amount_micros % 1_000_000,
+        ),
+        EstimatedCostSummary::MixedCurrencies { count } => {
+            format!("est mixed currencies ({count})")
+        }
+        EstimatedCostSummary::Overflow => "est overflow".to_owned(),
+    }
 }
 
 fn format_cost(cost: &agent_dock::CostAxis) -> String {
@@ -3462,6 +3509,7 @@ mod tests {
             acceptance: agent_dock::AcceptanceAxis::default(),
             duration: agent_dock::DurationAxis::default(),
             cost: agent_dock::CostAxis::default(),
+            reported: agent_dock::ReportedDisclosure::default(),
             origins: agent_dock::OriginCounts::default(),
         };
         let scores = std::iter::once(score(Segment::Overall))
@@ -3475,15 +3523,128 @@ mod tests {
         let rendered = render_profile_choices(&[profile], &scorecards, 3, Timestamp::now());
         let lines: Vec<_> = rendered[0].lines().collect();
 
-        assert_eq!(lines.len(), 8);
+        assert_eq!(lines.len(), 14);
         assert_eq!(lines[1], "     Overall: No history");
-        for (line, index) in lines[2..7].iter().zip(0..5) {
-            assert_eq!(*line, format!("     Tag \"tag-{index}\": No history"));
+        assert_eq!(lines[2], "         CLI-reported: not applicable");
+        for (index, tag_index) in (0..5).enumerate() {
+            let line_index = 3 + index * 2;
+            assert_eq!(
+                lines[line_index],
+                format!("     Tag \"tag-{tag_index}\": No history")
+            );
+            assert_eq!(
+                lines[line_index + 1],
+                "         CLI-reported: not applicable"
+            );
         }
-        assert_eq!(lines[7], "     ... 3 more tags");
+        assert_eq!(lines[13], "     ... 3 more tags");
         assert!(lines.iter().all(|line| {
             !line.contains("tag-5") && !line.contains("tag-6") && !line.contains("tag-7")
         }));
+    }
+
+    #[test]
+    fn renders_all_reported_disclosure_states_in_a_table() {
+        let now: Timestamp = "2026-01-04T00:00:00Z".parse().unwrap();
+        let latest = Some("2026-01-01T00:00:00Z".parse().unwrap());
+        let cases: [(&str, agent_dock::ReportedDisclosure, &str); 6] = [
+            (
+                "none",
+                agent_dock::ReportedDisclosure {
+                    brokered_count: 3,
+                    reported_count: 0,
+                    missing_count: 3,
+                    failures: Default::default(),
+                    estimated_cost: EstimatedCostSummary::None,
+                    latest_started_at: None,
+                },
+                "CLI-reported (not actual cost): reported 0/3 | none 3 | failures parse 0 / limit 0 / model 0 | est none",
+            ),
+            (
+                "total",
+                agent_dock::ReportedDisclosure {
+                    brokered_count: 5,
+                    reported_count: 2,
+                    missing_count: 3,
+                    failures: agent_dock::ReportFailureCounts {
+                        parse: 1,
+                        limit: 0,
+                        model: 0,
+                    },
+                    estimated_cost: EstimatedCostSummary::Total {
+                        currency: "USD".to_owned(),
+                        amount_micros: 3_000_003,
+                        count: 2,
+                    },
+                    latest_started_at: latest,
+                },
+                "CLI-reported (not actual cost): reported 2/5 | none 3 | failures parse 1 / limit 0 / model 0 | est USD 3.000003 (2) | latest 3d ago",
+            ),
+            (
+                "usage only",
+                agent_dock::ReportedDisclosure {
+                    brokered_count: 1,
+                    reported_count: 1,
+                    missing_count: 0,
+                    failures: Default::default(),
+                    estimated_cost: EstimatedCostSummary::None,
+                    latest_started_at: latest,
+                },
+                "CLI-reported (not actual cost): reported 1/1 | none 0 | failures parse 0 / limit 0 / model 0 | est none | latest 3d ago",
+            ),
+            (
+                "mixed currencies",
+                agent_dock::ReportedDisclosure {
+                    brokered_count: 2,
+                    reported_count: 2,
+                    missing_count: 0,
+                    failures: Default::default(),
+                    estimated_cost: EstimatedCostSummary::MixedCurrencies { count: 2 },
+                    latest_started_at: latest,
+                },
+                "CLI-reported (not actual cost): reported 2/2 | none 0 | failures parse 0 / limit 0 / model 0 | est mixed currencies (2) | latest 3d ago",
+            ),
+            (
+                "overflow",
+                agent_dock::ReportedDisclosure {
+                    brokered_count: 2,
+                    reported_count: 2,
+                    missing_count: 0,
+                    failures: Default::default(),
+                    estimated_cost: EstimatedCostSummary::Overflow,
+                    latest_started_at: latest,
+                },
+                "CLI-reported (not actual cost): reported 2/2 | none 0 | failures parse 0 / limit 0 / model 0 | est overflow | latest 3d ago",
+            ),
+            (
+                "not applicable",
+                agent_dock::ReportedDisclosure::default(),
+                "CLI-reported: not applicable",
+            ),
+        ];
+        for (case, disclosure, expected) in cases {
+            assert_eq!(
+                render_reported_disclosure(&disclosure, now),
+                expected,
+                "case={case}"
+            );
+        }
+
+        let escaped = agent_dock::ReportedDisclosure {
+            brokered_count: 1,
+            reported_count: 1,
+            missing_count: 0,
+            failures: Default::default(),
+            estimated_cost: EstimatedCostSummary::Total {
+                currency: "\x1b[31mUSD\\".to_owned(),
+                amount_micros: 1,
+                count: 1,
+            },
+            latest_started_at: None,
+        };
+        let rendered = render_reported_disclosure(&escaped, now);
+        assert!(rendered.contains(r"est \u{1b}[31mUSD\\ 0.000001 (1)"));
+        assert!(!rendered.contains('\x1b'));
     }
 
     #[test]
@@ -3600,6 +3761,7 @@ mod tests {
                 total_minor_units: Some(42),
                 missing_count: 0,
             },
+            reported: agent_dock::ReportedDisclosure::default(),
             origins: agent_dock::OriginCounts::default(),
         };
         let cases = [
@@ -3651,6 +3813,7 @@ mod tests {
             acceptance: agent_dock::AcceptanceAxis::default(),
             duration: agent_dock::DurationAxis::default(),
             cost: agent_dock::CostAxis::default(),
+            reported: agent_dock::ReportedDisclosure::default(),
             origins: agent_dock::OriginCounts::default(),
         };
 

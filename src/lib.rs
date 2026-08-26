@@ -40,7 +40,8 @@ pub use record::{
     TokenUsage, Verdict, default_events_path,
 };
 pub use scorecard::{
-    AcceptanceAxis, AxisSummary, CostAxis, DurationAxis, ExclusionReason, ExclusionSummary,
-    OriginCounts, ProfileScorecard, Projection, Segment, SegmentScore, escape_terminal,
-    format_acceptance, format_duration, format_recency, project, segments_for_tags,
+    AcceptanceAxis, AxisSummary, CostAxis, DurationAxis, EstimatedCostSummary, ExclusionReason,
+    ExclusionSummary, OriginCounts, ProfileScorecard, Projection, ReportFailureCounts,
+    ReportedDisclosure, Segment, SegmentScore, escape_terminal, format_acceptance, format_duration,
+    format_recency, project, segments_for_tags,
 };

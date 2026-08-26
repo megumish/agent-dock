@@ -4,9 +4,9 @@ use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::{
-    ActualCost, AttributionFailure, Event, EventKind, ExecutionOrigin, ExecutionProfile,
-    ObservedTaskStatus, ProfileAttribution, RecordedExecutionOutcome, Verdict,
-    judgement::latest_verdicts,
+    ActualCost, AttributionFailure, EstimatedCost, Event, EventKind, ExecutionOrigin,
+    ExecutionProfile, ObservedTaskStatus, ProfileAttribution, RecordedExecutionOutcome,
+    ReportFailure, TokenUsage, Verdict, judgement::latest_verdicts,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -42,6 +42,38 @@ pub struct CostAxis {
     pub missing_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReportFailureCounts {
+    pub parse: usize,
+    pub limit: usize,
+    pub model: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EstimatedCostSummary {
+    #[default]
+    None,
+    Total {
+        currency: String,
+        amount_micros: u64,
+        count: usize,
+    },
+    MixedCurrencies {
+        count: usize,
+    },
+    Overflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReportedDisclosure {
+    pub brokered_count: usize,
+    pub reported_count: usize,
+    pub missing_count: usize,
+    pub failures: ReportFailureCounts,
+    pub estimated_cost: EstimatedCostSummary,
+    pub latest_started_at: Option<Timestamp>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentScore {
     pub segment: Segment,
@@ -50,6 +82,7 @@ pub struct SegmentScore {
     pub acceptance: AcceptanceAxis,
     pub duration: DurationAxis,
     pub cost: CostAxis,
+    pub reported: ReportedDisclosure,
     pub origins: OriginCounts,
 }
 
@@ -95,6 +128,9 @@ struct Execution<'a> {
     elapsed_ms: u64,
     completed: bool,
     actual_cost: Option<&'a ActualCost>,
+    estimated_cost: Option<&'a EstimatedCost>,
+    usage: Option<&'a TokenUsage>,
+    report_failure: Option<ReportFailure>,
     origin: ExecutionOrigin,
     tags: &'a [String],
 }
@@ -158,6 +194,9 @@ pub fn project(
             elapsed_ms,
             outcome,
             cost,
+            estimated_cost,
+            usage,
+            report_failure,
             ..
         } = &event.kind
         else {
@@ -192,6 +231,9 @@ pub fn project(
                 elapsed_ms: *elapsed_ms,
                 completed: matches!(outcome, RecordedExecutionOutcome::Completed { .. }),
                 actual_cost: cost.as_ref(),
+                estimated_cost: estimated_cost.as_ref(),
+                usage: usage.as_ref(),
+                report_failure: *report_failure,
                 origin: *origin,
                 tags: task_tags.get(&task_id).copied().unwrap_or(&empty_tags),
             });
@@ -283,6 +325,9 @@ pub fn project(
                 elapsed_ms: task.elapsed_ms.expect("validated above"),
                 completed: true,
                 actual_cost: task.actual_cost,
+                estimated_cost: None,
+                usage: None,
+                report_failure: None,
                 origin: ExecutionOrigin::DirectObservation,
                 tags: task_tags.get(&task_id).copied().unwrap_or(&empty_tags),
             });
@@ -389,6 +434,7 @@ fn score_segment(
             .iter()
             .fold(0_u64, |total, cost| total.saturating_add(cost.minor_units))
     });
+    let reported = reported_disclosure(executions);
     SegmentScore {
         segment,
         execution_count: executions.len(),
@@ -409,7 +455,70 @@ fn score_segment(
             total_minor_units,
             missing_count: executions.len().saturating_sub(costs.len()),
         },
+        reported,
         origins,
+    }
+}
+
+fn reported_disclosure(executions: &[&Execution<'_>]) -> ReportedDisclosure {
+    let brokered = executions
+        .iter()
+        .filter(|execution| execution.origin == ExecutionOrigin::Brokered);
+    let mut disclosure = ReportedDisclosure {
+        brokered_count: brokered.clone().count(),
+        ..ReportedDisclosure::default()
+    };
+    let mut estimated_costs = Vec::new();
+    for execution in brokered {
+        match execution.report_failure {
+            Some(ReportFailure::ParseFailure) => disclosure.failures.parse += 1,
+            Some(ReportFailure::OutputLimitExceeded) => disclosure.failures.limit += 1,
+            Some(ReportFailure::ModelMismatch) => disclosure.failures.model += 1,
+            None => {}
+        }
+        let has_usage = execution.usage.is_some_and(usage_has_reported_value);
+        let has_reported_value = execution.estimated_cost.is_some() || has_usage;
+        if has_reported_value {
+            disclosure.reported_count += 1;
+            disclosure.latest_started_at =
+                latest(disclosure.latest_started_at, execution.started_at);
+        }
+        if let Some(estimated_cost) = execution.estimated_cost {
+            estimated_costs.push(estimated_cost);
+        }
+    }
+    disclosure.missing_count = disclosure
+        .brokered_count
+        .saturating_sub(disclosure.reported_count);
+    disclosure.estimated_cost = summarize_estimated_cost(&estimated_costs);
+    disclosure
+}
+
+fn usage_has_reported_value(usage: &TokenUsage) -> bool {
+    usage.input_tokens.is_some()
+        || usage.output_tokens.is_some()
+        || usage.cached_input_tokens.is_some()
+        || usage.reasoning_tokens.is_some()
+}
+
+fn summarize_estimated_cost(costs: &[&EstimatedCost]) -> EstimatedCostSummary {
+    let Some(first) = costs.first() else {
+        return EstimatedCostSummary::None;
+    };
+    if costs.iter().any(|cost| cost.currency != first.currency) {
+        return EstimatedCostSummary::MixedCurrencies { count: costs.len() };
+    }
+    let mut amount_micros = 0_u64;
+    for cost in costs {
+        let Some(total) = amount_micros.checked_add(cost.amount_micros) else {
+            return EstimatedCostSummary::Overflow;
+        };
+        amount_micros = total;
+    }
+    EstimatedCostSummary::Total {
+        currency: first.currency.clone(),
+        amount_micros,
+        count: costs.len(),
     }
 }
 
@@ -562,6 +671,55 @@ mod tests {
                 report_failure: None,
             },
         }
+    }
+
+    fn reported_execution(
+        profile: &ExecutionProfile,
+        task_id: Uuid,
+        at: &str,
+        estimated_cost: Option<crate::EstimatedCost>,
+        usage: Option<crate::TokenUsage>,
+        report_failure: Option<crate::ReportFailure>,
+    ) -> Event {
+        let mut event = Event::new(
+            task_id,
+            EventKind::Executed {
+                origin: crate::ExecutionOrigin::Brokered,
+                profile: ProfileSnapshot::from(profile),
+                working_directory: PathBuf::from("/tmp"),
+                started_at: timestamp(at),
+                elapsed_ms: 100,
+                outcome: RecordedExecutionOutcome::Completed { exit_code: Some(0) },
+                cost: None,
+                estimated_cost,
+                usage,
+                report_failure,
+            },
+        );
+        event.occurred_at = timestamp(at);
+        event
+    }
+
+    fn judged_execution(
+        profile: &ExecutionProfile,
+        tags: &[&str],
+        at: &str,
+        accepted: bool,
+    ) -> Vec<Event> {
+        let task_id = Uuid::now_v7();
+        vec![
+            task(task_id, at, tags),
+            reported_execution(profile, task_id, at, None, None, None),
+            judged(
+                task_id,
+                Uuid::now_v7(),
+                if accepted {
+                    Verdict::Accepted
+                } else {
+                    Verdict::Rejected
+                },
+            ),
+        ]
     }
 
     fn judged(task_id: Uuid, _execution_event_id: Uuid, verdict: Verdict) -> Event {
@@ -804,10 +962,519 @@ mod tests {
             std::slice::from_ref(&profile),
             &[Segment::Overall],
         );
-        assert_eq!(reported_projection, baseline_projection);
+        let baseline_score = &baseline_projection.scorecards[0].scores[0];
+        let reported_score = &reported_projection.scorecards[0].scores[0];
+        assert_eq!(
+            reported_score.execution_count,
+            baseline_score.execution_count
+        );
+        assert_eq!(reported_score.excluded_count, baseline_score.excluded_count);
+        assert_eq!(reported_score.acceptance, baseline_score.acceptance);
+        assert_eq!(reported_score.duration, baseline_score.duration);
+        assert_eq!(reported_score.cost, baseline_score.cost);
+        assert_eq!(reported_score.origins, baseline_score.origins);
+        assert_ne!(reported_score.reported, baseline_score.reported);
         assert_eq!(
             crate::advise(&reported_projection, &[], std::slice::from_ref(&profile)),
             crate::advise(&baseline_projection, &[], std::slice::from_ref(&profile))
+        );
+    }
+
+    #[test]
+    fn aggregates_reported_values_by_profile_and_segment() {
+        let first = safe_test_profile();
+        let mut declaration = crate::safe_test_declaration();
+        declaration.name = "Second".to_owned();
+        declaration.model = Some("second".to_owned());
+        let second = declaration.resolve(PathBuf::from("/usr/bin/true")).unwrap();
+        let first_task = Uuid::now_v7();
+        let second_task = Uuid::now_v7();
+        let third_task = Uuid::now_v7();
+        let events = vec![
+            task(first_task, "2026-01-01T00:00:00Z", &["rust"]),
+            reported_execution(
+                &first,
+                first_task,
+                "2026-01-01T00:00:01Z",
+                Some(crate::EstimatedCost {
+                    currency: "USD".to_owned(),
+                    amount_micros: 1_000_001,
+                }),
+                None,
+                None,
+            ),
+            task(second_task, "2026-01-02T00:00:00Z", &["docs"]),
+            reported_execution(
+                &first,
+                second_task,
+                "2026-01-02T00:00:01Z",
+                None,
+                Some(crate::TokenUsage {
+                    output_tokens: Some(4),
+                    ..crate::TokenUsage::default()
+                }),
+                None,
+            ),
+            task(third_task, "2026-01-03T00:00:00Z", &["rust"]),
+            reported_execution(
+                &second,
+                third_task,
+                "2026-01-03T00:00:01Z",
+                Some(crate::EstimatedCost {
+                    currency: "USD".to_owned(),
+                    amount_micros: 2_000_000,
+                }),
+                None,
+                None,
+            ),
+        ];
+        let segments = [
+            Segment::Overall,
+            Segment::Tag("rust".to_owned()),
+            Segment::Tag("docs".to_owned()),
+        ];
+        let projection = project(&events, &[first.clone(), second.clone()], &segments);
+        let first_scores = &projection.scorecards[0].scores;
+        assert_eq!(projection.scorecards[0].profile_id, first.id);
+        assert_eq!(first_scores[0].reported.brokered_count, 2);
+        assert_eq!(first_scores[0].reported.reported_count, 2);
+        assert_eq!(first_scores[0].reported.missing_count, 0);
+        assert_eq!(
+            first_scores[0].reported.latest_started_at,
+            Some(timestamp("2026-01-02T00:00:01Z"))
+        );
+        assert_eq!(first_scores[1].reported.brokered_count, 1);
+        assert_eq!(first_scores[1].reported.reported_count, 1);
+        assert_eq!(first_scores[2].reported.brokered_count, 1);
+        assert_eq!(first_scores[2].reported.reported_count, 1);
+        assert_eq!(
+            first_scores[0].reported.estimated_cost,
+            EstimatedCostSummary::Total {
+                currency: "USD".to_owned(),
+                amount_micros: 1_000_001,
+                count: 1,
+            }
+        );
+        let second_scores = &projection.scorecards[1].scores;
+        assert_eq!(projection.scorecards[1].profile_id, second.id);
+        assert_eq!(second_scores[0].reported.brokered_count, 1);
+        assert_eq!(second_scores[0].reported.reported_count, 1);
+        assert_eq!(second_scores[1].reported.brokered_count, 1);
+        assert_eq!(second_scores[2].reported.brokered_count, 0);
+        assert_eq!(second_scores[2].reported, ReportedDisclosure::default());
+    }
+
+    #[test]
+    fn counts_only_brokered_executions_and_marks_direct_only_as_not_applicable() {
+        let profile = safe_test_profile();
+        let task_id = Uuid::now_v7();
+        let mut direct = reported_execution(
+            &profile,
+            task_id,
+            "2026-01-01T00:00:00Z",
+            Some(crate::EstimatedCost {
+                currency: "USD".to_owned(),
+                amount_micros: 10,
+            }),
+            Some(crate::TokenUsage {
+                input_tokens: Some(1),
+                ..crate::TokenUsage::default()
+            }),
+            Some(crate::ReportFailure::ParseFailure),
+        );
+        let EventKind::Executed { origin, .. } = &mut direct.kind else {
+            unreachable!()
+        };
+        *origin = ExecutionOrigin::DirectObservation;
+        let events = vec![task(task_id, "2026-01-01T00:00:00Z", &[]), direct];
+        let projection = project(&events, std::slice::from_ref(&profile), &[Segment::Overall]);
+        let reported = &projection.scorecards[0].scores[0].reported;
+        assert_eq!(reported, &ReportedDisclosure::default());
+    }
+
+    #[test]
+    fn reported_disclosure_counts_only_brokered_execution_with_attributed_direct_observation() {
+        let (_, profile) = interactive_profile();
+        let brokered_task_id = Uuid::now_v7();
+        let direct_task_id = Uuid::now_v7();
+        let session_id = Uuid::now_v7();
+        let direct_event = |kind, at: &str| {
+            let mut event = Event::for_task(direct_task_id, crate::Provenance::CliHook, kind);
+            event.occurred_at = timestamp(at);
+            event
+        };
+        let events = vec![
+            task(brokered_task_id, "2026-01-01T00:00:00Z", &["rust"]),
+            reported_execution(
+                &profile,
+                brokered_task_id,
+                "2026-01-01T00:00:01Z",
+                Some(crate::EstimatedCost {
+                    currency: "USD".to_owned(),
+                    amount_micros: 7,
+                }),
+                None,
+                Some(crate::ReportFailure::ParseFailure),
+            ),
+            direct_event(
+                EventKind::ObservedTaskStarted {
+                    session_id,
+                    origin: ExecutionOrigin::DirectObservation,
+                    tags: vec!["rust".to_owned()],
+                    prompt: None,
+                    prompt_chars: 0,
+                },
+                "2026-01-01T00:00:02Z",
+            ),
+            direct_event(
+                EventKind::ObservedTaskEnded {
+                    session_id,
+                    status: crate::ObservedTaskStatus::Completed,
+                },
+                "2026-01-01T00:00:03Z",
+            ),
+            direct_event(
+                EventKind::MeasurementObserved {
+                    session_id,
+                    elapsed_ms: Some(200),
+                    actual_cost: None,
+                },
+                "2026-01-01T00:00:04Z",
+            ),
+            direct_event(
+                EventKind::ProfileAttributed {
+                    session_id,
+                    attribution: crate::ProfileAttribution::Matched {
+                        profile: ProfileSnapshot::from(&profile),
+                    },
+                },
+                "2026-01-01T00:00:05Z",
+            ),
+            judged(direct_task_id, Uuid::now_v7(), Verdict::Accepted),
+        ];
+
+        let projection = project(
+            &events,
+            std::slice::from_ref(&profile),
+            &[Segment::Tag("rust".to_owned())],
+        );
+        let score = &projection.scorecards[0].scores[0];
+
+        assert_eq!(score.execution_count, 2);
+        assert_eq!(
+            score.origins,
+            OriginCounts {
+                brokered: 1,
+                direct_observation: 1,
+            }
+        );
+        assert_eq!(score.reported.brokered_count, 1);
+        assert_eq!(score.reported.reported_count, 1);
+        assert_eq!(score.reported.missing_count, 0);
+        assert_eq!(
+            score.reported.failures,
+            ReportFailureCounts {
+                parse: 1,
+                limit: 0,
+                model: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn counts_usage_without_estimated_cost_but_not_an_empty_usage_object() {
+        let profile = safe_test_profile();
+        let valued_task = Uuid::now_v7();
+        let empty_usage_task = Uuid::now_v7();
+        let missing_task = Uuid::now_v7();
+        let events = vec![
+            task(valued_task, "2026-01-01T00:00:00Z", &[]),
+            reported_execution(
+                &profile,
+                valued_task,
+                "2026-01-01T00:00:01Z",
+                None,
+                Some(crate::TokenUsage {
+                    input_tokens: Some(0),
+                    ..crate::TokenUsage::default()
+                }),
+                None,
+            ),
+            task(empty_usage_task, "2026-01-02T00:00:00Z", &[]),
+            reported_execution(
+                &profile,
+                empty_usage_task,
+                "2026-01-02T00:00:01Z",
+                None,
+                Some(crate::TokenUsage::default()),
+                None,
+            ),
+            task(missing_task, "2026-01-03T00:00:00Z", &[]),
+            reported_execution(
+                &profile,
+                missing_task,
+                "2026-01-03T00:00:01Z",
+                None,
+                None,
+                None,
+            ),
+        ];
+        let projection = project(&events, std::slice::from_ref(&profile), &[Segment::Overall]);
+        let reported = &projection.scorecards[0].scores[0].reported;
+        assert_eq!(reported.brokered_count, 3);
+        assert_eq!(reported.reported_count, 1);
+        assert_eq!(reported.missing_count, 2);
+        assert_eq!(reported.estimated_cost, EstimatedCostSummary::None);
+        assert_eq!(
+            reported.latest_started_at,
+            Some(timestamp("2026-01-01T00:00:01Z"))
+        );
+    }
+
+    #[test]
+    fn summarizes_zero_mixed_and_overflowing_estimated_costs() {
+        let profile = safe_test_profile();
+        let cases: [(
+            &str,
+            Vec<Option<crate::EstimatedCost>>,
+            EstimatedCostSummary,
+        ); 5] = [
+            ("none", vec![None], EstimatedCostSummary::None),
+            (
+                "zero",
+                vec![Some(crate::EstimatedCost {
+                    currency: "USD".to_owned(),
+                    amount_micros: 0,
+                })],
+                EstimatedCostSummary::Total {
+                    currency: "USD".to_owned(),
+                    amount_micros: 0,
+                    count: 1,
+                },
+            ),
+            (
+                "same currency nonzero",
+                vec![
+                    Some(crate::EstimatedCost {
+                        currency: "USD".to_owned(),
+                        amount_micros: 1_000_001,
+                    }),
+                    Some(crate::EstimatedCost {
+                        currency: "USD".to_owned(),
+                        amount_micros: 2_000_002,
+                    }),
+                ],
+                EstimatedCostSummary::Total {
+                    currency: "USD".to_owned(),
+                    amount_micros: 3_000_003,
+                    count: 2,
+                },
+            ),
+            (
+                "mixed",
+                vec![
+                    Some(crate::EstimatedCost {
+                        currency: "USD".to_owned(),
+                        amount_micros: 1,
+                    }),
+                    Some(crate::EstimatedCost {
+                        currency: "EUR".to_owned(),
+                        amount_micros: 2,
+                    }),
+                ],
+                EstimatedCostSummary::MixedCurrencies { count: 2 },
+            ),
+            (
+                "overflow",
+                vec![
+                    Some(crate::EstimatedCost {
+                        currency: "USD".to_owned(),
+                        amount_micros: u64::MAX,
+                    }),
+                    Some(crate::EstimatedCost {
+                        currency: "USD".to_owned(),
+                        amount_micros: 1,
+                    }),
+                ],
+                EstimatedCostSummary::Overflow,
+            ),
+        ];
+        for (name, costs, expected) in cases {
+            let mut events = Vec::new();
+            for (index, estimated_cost) in costs.into_iter().enumerate() {
+                let task_id = Uuid::now_v7();
+                let at = format!("2026-01-0{}T00:00:00Z", index + 1);
+                events.push(task(task_id, &at, &[]));
+                events.push(reported_execution(
+                    &profile,
+                    task_id,
+                    &at,
+                    estimated_cost,
+                    None,
+                    None,
+                ));
+            }
+            let projection = project(&events, std::slice::from_ref(&profile), &[Segment::Overall]);
+            assert_eq!(
+                projection.scorecards[0].scores[0].reported.estimated_cost, expected,
+                "case={name}"
+            );
+        }
+    }
+
+    #[test]
+    fn advice_candidate_and_evidence_ignore_reported_execution_values() {
+        let leader = {
+            let mut declaration = crate::safe_test_declaration();
+            declaration.name = "leader".to_owned();
+            declaration.model = Some("leader".to_owned());
+            declaration.resolve(PathBuf::from("/usr/bin/true")).unwrap()
+        };
+        let other = {
+            let mut declaration = crate::safe_test_declaration();
+            declaration.name = "other".to_owned();
+            declaration.model = Some("other".to_owned());
+            declaration.resolve(PathBuf::from("/usr/bin/true")).unwrap()
+        };
+        let profiles = [leader.clone(), other.clone()];
+        assert!(
+            profiles
+                .iter()
+                .all(|profile| profile.execution_platform() == crate::ExecutionPlatform::Headless)
+        );
+
+        let mut baseline_events = Vec::new();
+        for (tag, month) in [("rust", "01"), ("docs", "02")] {
+            for index in 0..3 {
+                baseline_events.extend(judged_execution(
+                    &leader,
+                    &[tag],
+                    &format!("2026-{month}-{:02}T00:00:00Z", index + 1),
+                    true,
+                ));
+                baseline_events.extend(judged_execution(
+                    &other,
+                    &[tag],
+                    &format!("2026-{month}-{:02}T01:00:00Z", index + 1),
+                    true,
+                ));
+            }
+            baseline_events.extend(judged_execution(
+                &other,
+                &[tag],
+                &format!("2026-{month}-04T01:00:00Z"),
+                false,
+            ));
+        }
+
+        let mut reported_events = baseline_events.clone();
+        let mut changed_executions = 0;
+        for event in &mut reported_events {
+            let EventKind::Executed {
+                estimated_cost,
+                usage,
+                report_failure,
+                ..
+            } = &mut event.kind
+            else {
+                continue;
+            };
+            *estimated_cost = Some(crate::EstimatedCost {
+                currency: "USD".to_owned(),
+                amount_micros: 1,
+            });
+            *usage = Some(crate::TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                cached_input_tokens: None,
+                reasoning_tokens: None,
+            });
+            *report_failure = Some(crate::ReportFailure::ParseFailure);
+            changed_executions += 1;
+        }
+        assert_eq!(changed_executions, 14);
+
+        let segments = [
+            Segment::Tag("rust".to_owned()),
+            Segment::Tag("docs".to_owned()),
+        ];
+        let tags = ["rust".to_owned(), "docs".to_owned()];
+        let baseline_projection = project(&baseline_events, &profiles, &segments);
+        let reported_projection = project(&reported_events, &profiles, &segments);
+        let baseline_advice = crate::advise(&baseline_projection, &tags, &profiles);
+        let reported_advice = crate::advise(&reported_projection, &tags, &profiles);
+
+        let (baseline_profile_id, baseline_evidence) = match &baseline_advice.outcome {
+            crate::AdviceOutcome::Proposed {
+                profile_id,
+                evidence,
+            } => (profile_id, evidence),
+            outcome => panic!("expected Proposed advice, got {outcome:?}"),
+        };
+        let (reported_profile_id, reported_evidence) = match &reported_advice.outcome {
+            crate::AdviceOutcome::Proposed {
+                profile_id,
+                evidence,
+            } => (profile_id, evidence),
+            outcome => panic!("expected Proposed advice, got {outcome:?}"),
+        };
+        assert_eq!(baseline_profile_id, &leader.id);
+        assert_eq!(reported_profile_id, baseline_profile_id);
+        assert_eq!(reported_evidence, baseline_evidence);
+    }
+
+    #[test]
+    fn counts_report_failures_independently_from_missing_reported_values() {
+        let profile = safe_test_profile();
+        let parse_task = Uuid::now_v7();
+        let limit_task = Uuid::now_v7();
+        let model_task = Uuid::now_v7();
+        let events = vec![
+            task(parse_task, "2026-01-01T00:00:00Z", &[]),
+            reported_execution(
+                &profile,
+                parse_task,
+                "2026-01-01T00:00:01Z",
+                None,
+                Some(crate::TokenUsage {
+                    output_tokens: Some(5),
+                    ..crate::TokenUsage::default()
+                }),
+                Some(crate::ReportFailure::ParseFailure),
+            ),
+            task(limit_task, "2026-01-02T00:00:00Z", &[]),
+            reported_execution(
+                &profile,
+                limit_task,
+                "2026-01-02T00:00:01Z",
+                None,
+                None,
+                Some(crate::ReportFailure::OutputLimitExceeded),
+            ),
+            task(model_task, "2026-01-03T00:00:00Z", &[]),
+            reported_execution(
+                &profile,
+                model_task,
+                "2026-01-03T00:00:01Z",
+                Some(crate::EstimatedCost {
+                    currency: "USD".to_owned(),
+                    amount_micros: 0,
+                }),
+                None,
+                Some(crate::ReportFailure::ModelMismatch),
+            ),
+        ];
+        let projection = project(&events, std::slice::from_ref(&profile), &[Segment::Overall]);
+        let reported = &projection.scorecards[0].scores[0].reported;
+        assert_eq!(reported.brokered_count, 3);
+        assert_eq!(reported.reported_count, 2);
+        assert_eq!(reported.missing_count, 1);
+        assert_eq!(reported.failures.parse, 1);
+        assert_eq!(reported.failures.limit, 1);
+        assert_eq!(reported.failures.model, 1);
+        assert_eq!(
+            reported.latest_started_at,
+            Some(timestamp("2026-01-03T00:00:01Z"))
         );
     }
 
@@ -870,6 +1537,7 @@ mod tests {
             assert_eq!(score.acceptance.accepted, 1);
             assert_eq!(score.duration.summary.count, 1);
             assert_eq!(score.cost.missing_count, 1);
+            assert_eq!(score.reported, ReportedDisclosure::default());
         }
     }
 
@@ -993,7 +1661,8 @@ mod tests {
                 ),
             ]);
         }
-        let projection = project(&events, &[], &[Segment::Overall]);
+        let profile = safe_test_profile();
+        let projection = project(&events, std::slice::from_ref(&profile), &[Segment::Overall]);
         assert_eq!(
             projection.exclusions,
             vec![
@@ -1026,6 +1695,10 @@ mod tests {
                     count: 1
                 },
             ]
+        );
+        assert_eq!(
+            projection.scorecards[0].scores[0].reported,
+            ReportedDisclosure::default()
         );
     }
 

@@ -247,6 +247,7 @@ fn empty_score(segment: Segment) -> SegmentScore {
         acceptance: Default::default(),
         duration: Default::default(),
         cost: Default::default(),
+        reported: Default::default(),
         origins: Default::default(),
     }
 }
@@ -369,6 +370,7 @@ mod tests {
                     total_minor_units: Some(total_minor_units),
                     missing_count: 0,
                 },
+                reported: Default::default(),
                 origins: Default::default(),
             }],
         }
@@ -888,6 +890,7 @@ mod tests {
                 median_ms: None,
             },
             cost,
+            reported: Default::default(),
             origins: Default::default(),
         };
         let scores = vec![
