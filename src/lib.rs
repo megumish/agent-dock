@@ -16,7 +16,8 @@ pub use adapter::{
 pub use advice::{ADVICE_MIN_JUDGED, Advice, advise};
 pub use config::{Config, ConfigError, ConfigRevision, ReplaceConfigOutcome, default_config_path};
 pub use execution::{
-    ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionRequest, OutputSource, execute,
+    ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionReport, ExecutionRequest,
+    MAX_EXECUTION_OUTPUT_BYTES, OutputSource, execute,
 };
 pub use hook::{
     HookEvent, HookObservation, HookParseError, MAX_HOOK_INPUT_BYTES, Provider,
@@ -31,12 +32,12 @@ pub use observe_cli::{ObserveCliCommand, parse_observe_args};
 pub use record::{
     ActualCost, AdviceEvidence, AdviceOutcome, AdviceReason, AdviceSegmentCount,
     AppendBatchOutcome, AppendJudgementOutcome, AttributionFailure, BackupEventLogOutcome,
-    ConfigurationBoundary, EVENT_FORMAT_VERSION, Event, EventKind, EventLog, EvidenceAcceptance,
-    EvidenceAxisSummary, EvidenceCost, EvidenceDuration, EvidenceSegment, ExecutionOrigin,
-    FailureKind, ObservationAnomaly, ObservedConfiguration, ObservedTaskStatus, ObservedValue,
-    ProfileAttribution, ProfileSnapshot, Provenance, ReadEvents, RecordError,
-    RecordedExecutionOutcome, SessionPhase, SkippedLine, SkippedLineReason, Verdict,
-    default_events_path,
+    ConfigurationBoundary, EVENT_FORMAT_VERSION, EstimatedCost, Event, EventKind, EventLog,
+    EvidenceAcceptance, EvidenceAxisSummary, EvidenceCost, EvidenceDuration, EvidenceSegment,
+    ExecutionOrigin, FailureKind, ObservationAnomaly, ObservedConfiguration, ObservedTaskStatus,
+    ObservedValue, ProfileAttribution, ProfileSnapshot, Provenance, ReadEvents, RecordError,
+    RecordedExecutionOutcome, ReportFailure, SessionPhase, SkippedLine, SkippedLineReason,
+    TokenUsage, Verdict, default_events_path,
 };
 pub use scorecard::{
     AcceptanceAxis, AxisSummary, CostAxis, DurationAxis, ExclusionReason, ExclusionSummary,

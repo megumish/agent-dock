@@ -1286,6 +1286,41 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_v1alpha4_history_on_both_observation_entry_points() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            br#"{"format_version":"agent-dock/events/v1alpha4"}
+"#,
+        )
+        .unwrap();
+        let log = EventLog::new(path);
+        let history = log.read_all().unwrap();
+
+        assert!(matches!(
+            apply_observation(
+                &log,
+                &[],
+                ObservationCommand::ObserveSession {
+                    session_id: None,
+                    cli: CliKind::Codex,
+                    phase: SessionPhase::Started,
+                    external_session_id: None,
+                    working_directory: None,
+                    configuration: None,
+                    provenance: Provenance::ManualMark,
+                },
+            ),
+            Err(ObservationError::InvalidHistory)
+        ));
+        assert!(matches!(
+            resolve_observed_session(&history, CliKind::Codex, "vendor-session"),
+            Err(ObservationError::InvalidHistory)
+        ));
+    }
+
+    #[test]
     fn missing_or_changed_configuration_never_attributes() {
         let profile = profile("Codex direct", "gpt-5");
         let complete = configuration_for_profile(&profile);

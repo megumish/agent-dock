@@ -42,11 +42,12 @@ DEPENDENCIES と AGENTS は、この具体化の順序とは別に、それぞ�
 1. [VISION.md](./VISION.md)
 2. [DESIGN.md](./DESIGN.md)
 3. [DEPENDENCIES.md](./DEPENDENCIES.md)
-4. [現在のリリース文書](./docs/releases/0.1.0-alpha.7.md)
+4. [現在のリリース文書](./docs/releases/0.1.0-alpha.8.md)
 
-## 0.1.0-alpha.7
+## 0.1.0-alpha.8
 
-0.1.0-alpha.7 は、一つのタスクを登録済みの実行プロファイルへ依頼する仲介実行、ユーザーが直接起動した Claude Code と Codex CLI の対話セッションの観測に加え、スコアカードを根拠とする助言を提供する。
+0.1.0-alpha.8 は、一つのタスクを登録済みの実行プロファイルへ依頼する仲介実行、ユーザーが直接起動した Claude Code と Codex CLI の対話セッションの観測、スコアカードを根拠とする助言を提供する。
+仲介実行は各 CLI の機械可読出力で起動し、CLI が申告する推定コストとトークン利用量を実支出と区別した申告値として記録する。
 仲介実行では Claude Code、Codex CLI、Gemini CLI、Antigravity CLI のヘッドレス実行を扱う。
 対応 OS は macOS に限り、ほかの OS での動作は保証しない。
 
@@ -108,5 +109,5 @@ hook からモデルまたは必要な識別項目を取得できない場合は
 終了境界では、タスク開始後に改めて届いた構成だけを使うため、終了まで構成を再通知しない Claude Code では通常この明示申告または後続の帰属訂正が必要になる。
 誤った帰属は `task-attribute` または `task-unattribute` で訂正し、過去イベントを上書きせず新しい帰属イベントを追記する。
 
-0.1.0-alpha.7 は助言までを対象とし、実支出は取得しない。
-現在の実装範囲と挙動は [0.1.0-alpha.7 のリリース文書](./docs/releases/0.1.0-alpha.7.md) に記録する。
+0.1.0-alpha.8 は申告値の記録までを対象とし、実支出は取得せず、申告値のスコアカード表示は後続リリースで行う。
+現在の実装範囲と挙動は [0.1.0-alpha.8 のリリース文書](./docs/releases/0.1.0-alpha.8.md) に記録する。

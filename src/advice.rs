@@ -312,6 +312,9 @@ mod tests {
                 elapsed_ms: 100,
                 outcome: RecordedExecutionOutcome::Completed { exit_code: Some(0) },
                 cost: None,
+                estimated_cost: None,
+                usage: None,
+                report_failure: None,
             },
         );
         execution.occurred_at = at.parse().unwrap();

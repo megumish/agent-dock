@@ -157,6 +157,7 @@ pub fn project(
             started_at,
             elapsed_ms,
             outcome,
+            cost,
             ..
         } = &event.kind
         else {
@@ -190,7 +191,7 @@ pub fn project(
                 started_at: *started_at,
                 elapsed_ms: *elapsed_ms,
                 completed: matches!(outcome, RecordedExecutionOutcome::Completed { .. }),
-                actual_cost: None,
+                actual_cost: cost.as_ref(),
                 origin: *origin,
                 tags: task_tags.get(&task_id).copied().unwrap_or(&empty_tags),
             });
@@ -556,6 +557,9 @@ mod tests {
                     RecordedExecutionOutcome::Cancelled
                 },
                 cost: None,
+                estimated_cost: None,
+                usage: None,
+                report_failure: None,
             },
         }
     }
@@ -742,6 +746,69 @@ mod tests {
             Some(timestamp("2026-01-01T00:00:01Z"))
         );
         assert_eq!(score.excluded_count, 0);
+    }
+
+    #[test]
+    fn connects_an_actual_execution_cost_to_the_cost_axis() {
+        let task_id = Uuid::now_v7();
+        let mut event = execution(task_id, Uuid::now_v7(), "2026-01-01T00:00:00Z", 20, true);
+        let EventKind::Executed { cost, .. } = &mut event.kind else {
+            unreachable!()
+        };
+        *cost = Some(ActualCost {
+            currency: "USD".to_owned(),
+            minor_units: 42,
+        });
+
+        let projection = project(&[event], &[safe_test_profile()], &[Segment::Overall]);
+        let score = &projection.scorecards[0].scores[0];
+        assert_eq!(score.cost.summary.count, 1);
+        assert_eq!(score.cost.total_minor_units, Some(42));
+        assert_eq!(score.cost.currency.as_deref(), Some("USD"));
+        assert_eq!(score.cost.missing_count, 0);
+    }
+
+    #[test]
+    fn reported_values_do_not_change_axes_or_advice() {
+        let task_id = Uuid::now_v7();
+        let baseline = execution(task_id, Uuid::now_v7(), "2026-01-01T00:00:00Z", 20, true);
+        let mut reported = baseline.clone();
+        let EventKind::Executed {
+            estimated_cost,
+            usage,
+            report_failure,
+            ..
+        } = &mut reported.kind
+        else {
+            unreachable!()
+        };
+        *estimated_cost = Some(crate::EstimatedCost {
+            currency: "USD".to_owned(),
+            amount_micros: 1,
+        });
+        *usage = Some(crate::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            cached_input_tokens: Some(3),
+            reasoning_tokens: Some(4),
+        });
+        *report_failure = Some(crate::ReportFailure::ParseFailure);
+        let profile = safe_test_profile();
+        let baseline_projection = project(
+            std::slice::from_ref(&baseline),
+            std::slice::from_ref(&profile),
+            &[Segment::Overall],
+        );
+        let reported_projection = project(
+            std::slice::from_ref(&reported),
+            std::slice::from_ref(&profile),
+            &[Segment::Overall],
+        );
+        assert_eq!(reported_projection, baseline_projection);
+        assert_eq!(
+            crate::advise(&reported_projection, &[], std::slice::from_ref(&profile)),
+            crate::advise(&baseline_projection, &[], std::slice::from_ref(&profile))
+        );
     }
 
     #[test]

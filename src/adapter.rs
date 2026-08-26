@@ -214,21 +214,25 @@ impl ExecutionProfile {
             CliKind::Test => args.extend(self.args().to_owned()),
             CliKind::Claude => {
                 args.push("--print".to_owned());
+                args.extend(["--output-format".to_owned(), "json".to_owned()]);
                 push_model(&mut args, self.model());
                 args.extend(self.args().to_owned());
             }
             CliKind::Codex => {
                 args.push("exec".to_owned());
+                args.push("--json".to_owned());
                 push_model(&mut args, self.model());
                 args.extend(self.args().to_owned());
                 args.push("-".to_owned());
             }
             CliKind::Gemini => {
+                args.extend(["--output-format".to_owned(), "json".to_owned()]);
                 push_model(&mut args, self.model());
                 args.extend(self.args().to_owned());
                 args.extend(["--prompt".to_owned(), String::new()]);
             }
             CliKind::Antigravity => {
+                args.extend(["--output-format".to_owned(), "json".to_owned()]);
                 push_model(&mut args, self.model());
                 args.extend(self.args().to_owned());
                 args.push("-p".to_owned());
@@ -282,10 +286,10 @@ fn push_option_string(
 fn cli_owned_arguments(cli: CliKind) -> &'static [&'static str] {
     match cli {
         CliKind::Test => &[],
-        CliKind::Claude => &["-p", "--print", "--model"],
-        CliKind::Codex => &["exec", "-m", "--model", "-C", "--cd"],
-        CliKind::Gemini => &["-p", "--prompt", "-m", "--model"],
-        CliKind::Antigravity => &["-p", "--print", "--model"],
+        CliKind::Claude => &["-p", "--print", "--output-format", "--model"],
+        CliKind::Codex => &["exec", "--json", "-m", "--model", "-C", "--cd"],
+        CliKind::Gemini => &["-p", "--prompt", "-m", "--model", "--output-format", "-o"],
+        CliKind::Antigravity => &["-p", "--print", "--model", "--output-format"],
     }
 }
 
@@ -426,13 +430,27 @@ mod tests {
                     .resolve("claude".into())
                     .unwrap(),
                 "claude",
-                vec!["--print", "--model", "test-model", "--safe-option"],
+                vec![
+                    "--print",
+                    "--output-format",
+                    "json",
+                    "--model",
+                    "test-model",
+                    "--safe-option",
+                ],
                 PromptTransport::Stdin,
             ),
             (
                 declaration(CliKind::Codex).resolve("codex".into()).unwrap(),
                 "codex",
-                vec!["exec", "--model", "test-model", "--safe-option", "-"],
+                vec![
+                    "exec",
+                    "--json",
+                    "--model",
+                    "test-model",
+                    "--safe-option",
+                    "-",
+                ],
                 PromptTransport::Stdin,
             ),
             (
@@ -440,7 +458,15 @@ mod tests {
                     .resolve("gemini".into())
                     .unwrap(),
                 "gemini",
-                vec!["--model", "test-model", "--safe-option", "--prompt", ""],
+                vec![
+                    "--output-format",
+                    "json",
+                    "--model",
+                    "test-model",
+                    "--safe-option",
+                    "--prompt",
+                    "",
+                ],
                 PromptTransport::Stdin,
             ),
             (
@@ -448,7 +474,14 @@ mod tests {
                     .resolve("agy".into())
                     .unwrap(),
                 "agy",
-                vec!["--model", "test-model", "--safe-option", "-p"],
+                vec![
+                    "--output-format",
+                    "json",
+                    "--model",
+                    "test-model",
+                    "--safe-option",
+                    "-p",
+                ],
                 PromptTransport::Argument,
             ),
         ];
@@ -464,9 +497,18 @@ mod tests {
     fn rejects_invalid_profile_declarations() {
         for (cli, argument) in [
             (CliKind::Claude, "--print"),
+            (CliKind::Claude, "--output-format"),
+            (CliKind::Claude, "--output-format=json"),
             (CliKind::Codex, "--model=other"),
+            (CliKind::Codex, "--json"),
             (CliKind::Gemini, "--prompt"),
+            (CliKind::Gemini, "--output-format"),
+            (CliKind::Gemini, "--output-format=json"),
+            (CliKind::Gemini, "-o"),
+            (CliKind::Gemini, "-o=json"),
             (CliKind::Antigravity, "-p"),
+            (CliKind::Antigravity, "--output-format"),
+            (CliKind::Antigravity, "--output-format=json"),
         ] {
             let mut profile = declaration(cli);
             profile.args = vec![argument.to_owned()];

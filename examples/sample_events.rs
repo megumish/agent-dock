@@ -319,6 +319,30 @@ fn execution(
     elapsed_ms: u64,
     outcome: Outcome,
 ) -> Event {
+    let (estimated_cost, usage) = match profile.cli() {
+        agent_dock::CliKind::Claude => (
+            Some(agent_dock::EstimatedCost {
+                currency: "USD".to_owned(),
+                amount_micros: 1_234_567,
+            }),
+            Some(agent_dock::TokenUsage {
+                input_tokens: Some(1_200),
+                output_tokens: Some(340),
+                cached_input_tokens: Some(80),
+                reasoning_tokens: None,
+            }),
+        ),
+        agent_dock::CliKind::Codex => (
+            None,
+            Some(agent_dock::TokenUsage {
+                input_tokens: Some(900),
+                output_tokens: Some(250),
+                cached_input_tokens: Some(40),
+                reasoning_tokens: Some(120),
+            }),
+        ),
+        _ => (None, None),
+    };
     Event::new(
         task_id,
         EventKind::Executed {
@@ -338,6 +362,9 @@ fn execution(
                 _ => RecordedExecutionOutcome::Completed { exit_code: Some(0) },
             },
             cost: None,
+            estimated_cost,
+            usage,
+            report_failure: None,
         },
     )
 }
@@ -429,6 +456,28 @@ mod tests {
         let history = EventLog::new(target).read_all().unwrap();
         assert_eq!(history.events.len(), 68);
         assert!(history.skipped_lines.is_empty());
+        assert!(history.events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::Executed {
+                profile,
+                estimated_cost: Some(estimated_cost),
+                usage: Some(usage),
+                ..
+            } if profile.cli == agent_dock::CliKind::Claude
+                && estimated_cost.currency == "USD"
+                && estimated_cost.amount_micros == 1_234_567
+                && usage.input_tokens == Some(1_200)
+        )));
+        assert!(history.events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::Executed {
+                profile,
+                estimated_cost: None,
+                usage: Some(usage),
+                ..
+            } if profile.cli == agent_dock::CliKind::Codex
+                && usage.reasoning_tokens == Some(120)
+        )));
 
         let profiles = sample_profiles();
         let projection = project(&history.events, &profiles, &[Segment::Overall]);

@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{CliKind, ExecutionPlatform, ExecutionProfile, ProfileDeclaration};
 
-pub const EVENT_FORMAT_VERSION: &str = "agent-dock/events/v1alpha4";
+pub const EVENT_FORMAT_VERSION: &str = "agent-dock/events/v1alpha5";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
@@ -172,7 +172,10 @@ pub enum EventKind {
         started_at: Timestamp,
         elapsed_ms: u64,
         outcome: RecordedExecutionOutcome,
-        cost: Option<()>,
+        cost: Option<ActualCost>,
+        estimated_cost: Option<EstimatedCost>,
+        usage: Option<TokenUsage>,
+        report_failure: Option<ReportFailure>,
     },
     Judged {
         verdict: Verdict,
@@ -274,6 +277,29 @@ pub enum AttributionFailure {
 pub struct ActualCost {
     pub currency: String,
     pub minor_units: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EstimatedCost {
+    pub currency: String,
+    /// The currency's micro-unit amount; unlike `ActualCost::minor_units`, this is not a minor unit.
+    pub amount_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportFailure {
+    ParseFailure,
+    OutputLimitExceeded,
+    ModelMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -928,6 +954,9 @@ mod tests {
                 elapsed_ms: 10,
                 outcome: RecordedExecutionOutcome::Completed { exit_code: Some(0) },
                 cost: None,
+                estimated_cost: None,
+                usage: None,
+                report_failure: None,
             },
         )
     }
@@ -1116,6 +1145,9 @@ mod tests {
                     elapsed_ms: 42,
                     outcome,
                     cost: None,
+                    estimated_cost: None,
+                    usage: None,
+                    report_failure: None,
                 },
             )
         });
@@ -1187,6 +1219,77 @@ mod tests {
         for event in events {
             let encoded = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn round_trips_every_reported_execution_value_combination() {
+        let task_id = Uuid::now_v7();
+        let profile = ProfileSnapshot {
+            id: "reported-values".to_owned(),
+            name: "Reported values".to_owned(),
+            cli: CliKind::Claude,
+            execution_platform: ExecutionPlatform::Headless,
+            executable_override: None,
+            model: Some("claude-model".to_owned()),
+            args: Vec::new(),
+            identity: Default::default(),
+            resolved_executable: Some(PathBuf::from("/usr/local/bin/claude")),
+        };
+        let costs = [
+            None,
+            Some(ActualCost {
+                currency: "USD".to_owned(),
+                minor_units: 7,
+            }),
+        ];
+        let estimated_costs = [
+            None,
+            Some(EstimatedCost {
+                currency: "USD".to_owned(),
+                amount_micros: 500_001,
+            }),
+        ];
+        let usages = [
+            None,
+            Some(TokenUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                cached_input_tokens: None,
+                reasoning_tokens: Some(4),
+            }),
+        ];
+        let failures = [
+            None,
+            Some(ReportFailure::ParseFailure),
+            Some(ReportFailure::OutputLimitExceeded),
+            Some(ReportFailure::ModelMismatch),
+        ];
+
+        for cost in &costs {
+            for estimated_cost in &estimated_costs {
+                for usage in &usages {
+                    for report_failure in &failures {
+                        let event = Event::new(
+                            task_id,
+                            EventKind::Executed {
+                                origin: ExecutionOrigin::Brokered,
+                                profile: profile.clone(),
+                                working_directory: PathBuf::from("/work"),
+                                started_at: Timestamp::now(),
+                                elapsed_ms: 42,
+                                outcome: RecordedExecutionOutcome::Completed { exit_code: Some(0) },
+                                cost: cost.clone(),
+                                estimated_cost: estimated_cost.clone(),
+                                usage: usage.clone(),
+                                report_failure: *report_failure,
+                            },
+                        );
+                        let encoded = serde_json::to_string(&event).unwrap();
+                        assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+                    }
+                }
+            }
         }
     }
 

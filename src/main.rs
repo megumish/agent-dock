@@ -14,15 +14,15 @@ use agent_dock::{
     AppendJudgementOutcome, AttributionFailure, BackupEventLogOutcome, Config, ConfigError,
     EVENT_FORMAT_VERSION, Event, EventKind, EventLog, EvidenceAcceptance, EvidenceCost,
     EvidenceDuration, EvidenceSegment, ExclusionReason, ExecutionError, ExecutionEvent,
-    ExecutionOrigin, ExecutionOutcome, ExecutionPlatform, ExecutionProfile, ExecutionRequest,
-    FailureKind, HookEvent, JudgementCandidate, MAX_HOOK_INPUT_BYTES, ObservationCommand,
-    ObserveCliCommand, OutputSource, ProfileAttribution, ProfileDeclaration, ProfileSnapshot,
-    Projection, Provenance, ReadEvents, RecordedExecutionOutcome, ReplaceConfigOutcome, Segment,
-    SegmentScore, SessionPhase, SkippedLineReason, Verdict, advise, apply_observation,
-    configuration_for_profile, default_config_path, default_events_path, escape_terminal, execute,
-    format_acceptance, format_duration, format_recency, judgement_candidates,
-    parse_hook_observation, parse_observe_args, project, resolve_observed_session,
-    safe_test_profile, segments_for_tags,
+    ExecutionOrigin, ExecutionOutcome, ExecutionPlatform, ExecutionProfile, ExecutionReport,
+    ExecutionRequest, FailureKind, HookEvent, JudgementCandidate, MAX_HOOK_INPUT_BYTES,
+    ObservationCommand, ObserveCliCommand, OutputSource, ProfileAttribution, ProfileDeclaration,
+    ProfileSnapshot, Projection, Provenance, ReadEvents, RecordedExecutionOutcome,
+    ReplaceConfigOutcome, Segment, SegmentScore, SessionPhase, SkippedLineReason, Verdict, advise,
+    apply_observation, configuration_for_profile, default_config_path, default_events_path,
+    escape_terminal, execute, format_acceptance, format_duration, format_recency,
+    judgement_candidates, parse_hook_observation, parse_observe_args, project,
+    resolve_observed_session, safe_test_profile, segments_for_tags,
 };
 use jiff::Timestamp;
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -196,70 +196,22 @@ async fn run_task() -> Result<i32, AppError> {
             let _ = cancellation_sender.send(());
         }
     });
-    let started_at = Timestamp::now();
-    let attempt_started = Instant::now();
-    let execution = execute(
+    let execution = execute_and_record(
+        &event_log,
         profile,
-        ExecutionRequest {
-            prompt: prompt.clone(),
-            working_directory: working_directory.clone(),
-        },
+        task_id,
+        prompt,
+        working_directory,
         cancellation_receiver,
         print_event,
     )
     .await;
     signal_task.abort();
 
-    let outcome = match execution {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let message = error.to_string();
-            eprintln!("Execution failed: {message}");
-            event_log.append(&Event::new(
-                task_id,
-                EventKind::Executed {
-                    origin: ExecutionOrigin::Brokered,
-                    profile: ProfileSnapshot::from(profile),
-                    working_directory,
-                    started_at,
-                    elapsed_ms: elapsed_millis(attempt_started.elapsed()),
-                    outcome: RecordedExecutionOutcome::Failed {
-                        failure_kind: failure_kind(&error),
-                        message,
-                    },
-                    cost: None,
-                },
-            ))?;
-            return Ok(1);
-        }
+    let Some(outcome) = execution? else {
+        return Ok(1);
     };
-
-    match &outcome {
-        ExecutionOutcome::Completed { exit_code, elapsed } => {
-            println!(
-                "Finished in {:.2?} with exit code {:?}.",
-                elapsed, exit_code
-            );
-        }
-        ExecutionOutcome::Cancelled { elapsed } => {
-            eprintln!("Cancelled after {:.2?}.", elapsed);
-        }
-    }
     let process_exit_code = outcome.process_exit_code();
-    let (recorded_outcome, elapsed_ms) = recorded_execution_outcome(&outcome);
-    let executed = Event::new(
-        task_id,
-        EventKind::Executed {
-            origin: ExecutionOrigin::Brokered,
-            profile: ProfileSnapshot::from(profile),
-            working_directory,
-            started_at,
-            elapsed_ms,
-            outcome: recorded_outcome,
-            cost: None,
-        },
-    );
-    event_log.append(&executed)?;
 
     if !should_ask_immediate_judgement(&outcome) {
         return Ok(process_exit_code);
@@ -283,6 +235,82 @@ async fn run_task() -> Result<i32, AppError> {
         },
     ))?;
     Ok(process_exit_code)
+}
+
+async fn execute_and_record(
+    event_log: &EventLog,
+    profile: &ExecutionProfile,
+    task_id: Uuid,
+    prompt: String,
+    working_directory: PathBuf,
+    cancellation: oneshot::Receiver<()>,
+    mut on_event: impl FnMut(ExecutionEvent),
+) -> Result<Option<ExecutionOutcome>, AppError> {
+    let started_at = Timestamp::now();
+    let attempt_started = Instant::now();
+    let mut report = ExecutionReport::default();
+    let execution = execute(
+        profile,
+        ExecutionRequest {
+            prompt,
+            working_directory: working_directory.clone(),
+        },
+        cancellation,
+        |event| {
+            if let ExecutionEvent::Report { report: parsed } = &event {
+                report = parsed.clone();
+            }
+            on_event(event);
+        },
+    )
+    .await;
+
+    let outcome = match execution {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let message = error.to_string();
+            eprintln!("Execution failed: {message}");
+            let kind = executed_event_kind(
+                ProfileSnapshot::from(profile),
+                working_directory,
+                started_at,
+                elapsed_millis(attempt_started.elapsed()),
+                RecordedExecutionOutcome::Failed {
+                    failure_kind: failure_kind(&error),
+                    message,
+                },
+                report,
+            );
+            event_log.append(&Event::new(task_id, kind))?;
+            return Ok(None);
+        }
+    };
+
+    match &outcome {
+        ExecutionOutcome::Completed { exit_code, elapsed } => {
+            println!(
+                "Finished in {:.2?} with exit code {:?}.",
+                elapsed, exit_code
+            );
+        }
+        ExecutionOutcome::Cancelled { elapsed } => {
+            eprintln!("Cancelled after {:.2?}.", elapsed);
+        }
+    }
+    let (recorded_outcome, elapsed_ms) = recorded_execution_outcome(&outcome);
+    let executed = Event::new(
+        task_id,
+        executed_event_kind(
+            ProfileSnapshot::from(profile),
+            working_directory,
+            started_at,
+            elapsed_ms,
+            recorded_outcome,
+            report,
+        ),
+    );
+    event_log.append(&executed)?;
+    Ok(Some(outcome))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1507,6 +1535,28 @@ fn recorded_execution_outcome(outcome: &ExecutionOutcome) -> (RecordedExecutionO
     }
 }
 
+fn executed_event_kind(
+    profile: ProfileSnapshot,
+    working_directory: PathBuf,
+    started_at: Timestamp,
+    elapsed_ms: u64,
+    outcome: RecordedExecutionOutcome,
+    report: ExecutionReport,
+) -> EventKind {
+    EventKind::Executed {
+        origin: ExecutionOrigin::Brokered,
+        profile,
+        working_directory,
+        started_at,
+        elapsed_ms,
+        outcome,
+        cost: None,
+        estimated_cost: report.estimated_cost,
+        usage: report.usage,
+        report_failure: report.report_failure,
+    }
+}
+
 fn should_ask_immediate_judgement(outcome: &ExecutionOutcome) -> bool {
     matches!(outcome, ExecutionOutcome::Completed { .. })
 }
@@ -1637,13 +1687,33 @@ fn print_event(event: ExecutionEvent) {
         ExecutionEvent::Output {
             source: OutputSource::Stdout,
             line,
-        } => println!("[stdout] {line}"),
+        } => println!("{}", format_stdout_output(&line)),
         ExecutionEvent::Output {
             source: OutputSource::Stderr,
             line,
         } => eprintln!("[stderr] {line}"),
+        ExecutionEvent::Warning { message } => {
+            eprintln!("Warning: {}", escape_terminal(&message));
+        }
+        ExecutionEvent::Report { .. } => {}
         ExecutionEvent::Finished => {}
     }
+}
+
+fn format_stdout_output(line: &str) -> String {
+    format!("[stdout] {}", escape_stdout_controls(line))
+}
+
+fn escape_stdout_controls(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character != '\n' && character.is_control() {
+            escaped.push_str(&format!("\\u{{{:x}}}", character as u32));
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 fn normalize_exit_code(code: i32) -> u8 {
@@ -1692,6 +1762,8 @@ impl AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     #[test]
@@ -1758,6 +1830,9 @@ mod tests {
                 elapsed_ms: 100,
                 outcome: candidate.outcome,
                 cost: None,
+                estimated_cost: None,
+                usage: None,
+                report_failure: None,
             },
         );
         execution.event_id = candidate.target_event_id;
@@ -1826,6 +1901,185 @@ mod tests {
             },
             threshold: agent_dock::ADVICE_MIN_JUDGED,
         }
+    }
+
+    fn write_test_executable(directory: &Path, source: &str) -> PathBuf {
+        let path = directory.join("fake-agent");
+        fs::write(&path, source).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    fn test_claude_profile(executable: PathBuf) -> ExecutionProfile {
+        ProfileDeclaration {
+            name: "Fake Claude".to_owned(),
+            cli: agent_dock::CliKind::Claude,
+            execution_platform: ExecutionPlatform::Headless,
+            executable: Some(executable.clone()),
+            model: None,
+            args: Vec::new(),
+            identity: Default::default(),
+        }
+        .resolve(executable)
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn execute_and_record_persists_reports_for_completed_cancelled_and_parse_failed_runs() {
+        let cases = [
+            (
+                "#!/bin/sh\nprintf '%s\\n' '{\"result\":\"done\",\"total_cost_usd\":0.25,\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}'\n",
+                false,
+                Some(agent_dock::EstimatedCost {
+                    currency: "USD".to_owned(),
+                    amount_micros: 250_000,
+                }),
+                Some(agent_dock::TokenUsage {
+                    input_tokens: Some(1),
+                    output_tokens: Some(2),
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                }),
+                None,
+            ),
+            (
+                "#!/bin/sh\ntrap 'exit 0' INT\nprintf '%s\\n' '{\"result\":\"cancelled\",\"total_cost_usd\":0.25,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}'\nprintf 'ready\\n' >&2\nwhile :; do sleep 1; done\n",
+                true,
+                Some(agent_dock::EstimatedCost {
+                    currency: "USD".to_owned(),
+                    amount_micros: 250_000,
+                }),
+                Some(agent_dock::TokenUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(4),
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                }),
+                None,
+            ),
+            (
+                "#!/bin/sh\nprintf 'not-json\\n'\n",
+                false,
+                None,
+                None,
+                Some(agent_dock::ReportFailure::ParseFailure),
+            ),
+        ];
+
+        for (index, (script, should_cancel, expected_cost, expected_usage, expected_failure)) in
+            cases.into_iter().enumerate()
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let executable = write_test_executable(directory.path(), script);
+            let profile = test_claude_profile(executable);
+            let log = EventLog::new(directory.path().join("events.jsonl"));
+            let task_id = Uuid::now_v7();
+            let (cancellation_sender, cancellation) = oneshot::channel();
+            let trigger = Arc::new(Mutex::new(should_cancel.then_some(cancellation_sender)));
+            let trigger_for_callback = trigger.clone();
+
+            let recorded = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                execute_and_record(
+                    &log,
+                    &profile,
+                    task_id,
+                    format!("fixture {index}"),
+                    directory.path().to_path_buf(),
+                    cancellation,
+                    move |event| {
+                        if should_cancel
+                            && matches!(
+                                &event,
+                                ExecutionEvent::Output {
+                                    source: OutputSource::Stderr,
+                                    line
+                                } if line == "ready"
+                            )
+                            && let Some(sender) = trigger_for_callback.lock().unwrap().take()
+                        {
+                            let _ = sender.send(());
+                        }
+                    },
+                ),
+            )
+            .await
+            .expect("fixture execution should not hang")
+            .unwrap()
+            .expect("execution should append an executed event");
+
+            assert_eq!(
+                matches!(recorded, ExecutionOutcome::Cancelled { .. }),
+                should_cancel
+            );
+            let events = log.read_all().unwrap().events;
+            assert_eq!(events.len(), 1);
+            let EventKind::Executed {
+                cost,
+                estimated_cost,
+                usage,
+                report_failure,
+                ..
+            } = &events[0].kind
+            else {
+                panic!("the helper should append an executed event");
+            };
+            assert_eq!(events[0].task_id, Some(task_id));
+            assert_eq!(cost, &None);
+            assert_eq!(estimated_cost, &expected_cost);
+            assert_eq!(usage, &expected_usage);
+            assert_eq!(*report_failure, expected_failure);
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_and_record_records_spawn_failure_for_missing_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = test_claude_profile(directory.path().join("missing-agent"));
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let task_id = Uuid::now_v7();
+        let (_cancellation_sender, cancellation) = oneshot::channel();
+
+        let recorded = execute_and_record(
+            &log,
+            &profile,
+            task_id,
+            "missing executable".to_owned(),
+            directory.path().to_path_buf(),
+            cancellation,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(recorded.is_none());
+        let events = log.read_all().unwrap().events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].task_id, Some(task_id));
+        let EventKind::Executed {
+            outcome,
+            cost,
+            estimated_cost,
+            usage,
+            report_failure,
+            ..
+        } = &events[0].kind
+        else {
+            panic!("the helper should append a failed executed event");
+        };
+        assert!(matches!(
+            outcome,
+            RecordedExecutionOutcome::Failed {
+                failure_kind: FailureKind::Spawn,
+                ..
+            }
+        ));
+        assert_eq!(cost, &None);
+        assert_eq!(estimated_cost, &None);
+        assert_eq!(usage, &None);
+        assert_eq!(*report_failure, None);
     }
 
     #[test]
@@ -2022,6 +2276,115 @@ mod tests {
         assert_eq!(
             render_judgement_candidate(&judgement_candidate()),
             "0198a8e2-9a80-7000-8000-000000000001 | 2026-08-01T01:02:03Z | Historical\\nProfile [test; model\\tname; profile-id] | completed with exit code 2 | tags: rust\\nreview | current: rejected"
+        );
+    }
+
+    #[test]
+    fn builds_executed_event_kind_for_completed_cancelled_and_parse_failed_reports() {
+        let profile = safe_test_profile();
+        let profile_snapshot = ProfileSnapshot::from(&profile);
+        let working_directory = PathBuf::from("/tmp/project");
+        let started_at: Timestamp = "2026-08-01T01:02:03Z".parse().unwrap();
+        let cases = vec![
+            (
+                RecordedExecutionOutcome::Completed { exit_code: Some(0) },
+                ExecutionReport {
+                    estimated_cost: Some(agent_dock::EstimatedCost {
+                        currency: "USD".to_owned(),
+                        amount_micros: 42,
+                    }),
+                    usage: Some(agent_dock::TokenUsage {
+                        input_tokens: Some(1),
+                        output_tokens: Some(2),
+                        cached_input_tokens: Some(3),
+                        reasoning_tokens: Some(4),
+                    }),
+                    report_failure: None,
+                },
+                7,
+            ),
+            (
+                RecordedExecutionOutcome::Cancelled,
+                ExecutionReport {
+                    estimated_cost: None,
+                    usage: Some(agent_dock::TokenUsage {
+                        input_tokens: Some(5),
+                        output_tokens: None,
+                        cached_input_tokens: None,
+                        reasoning_tokens: None,
+                    }),
+                    report_failure: None,
+                },
+                11,
+            ),
+            (
+                RecordedExecutionOutcome::Completed { exit_code: None },
+                ExecutionReport {
+                    estimated_cost: None,
+                    usage: None,
+                    report_failure: Some(agent_dock::ReportFailure::ParseFailure),
+                },
+                13,
+            ),
+        ];
+
+        for (outcome, report, elapsed_ms) in cases {
+            let expected = EventKind::Executed {
+                origin: ExecutionOrigin::Brokered,
+                profile: profile_snapshot.clone(),
+                working_directory: working_directory.clone(),
+                started_at,
+                elapsed_ms,
+                outcome: outcome.clone(),
+                cost: None,
+                estimated_cost: report.estimated_cost.clone(),
+                usage: report.usage.clone(),
+                report_failure: report.report_failure,
+            };
+            assert_eq!(
+                executed_event_kind(
+                    profile_snapshot.clone(),
+                    working_directory.clone(),
+                    started_at,
+                    elapsed_ms,
+                    outcome,
+                    report,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn escapes_terminal_controls_in_machine_readable_and_raw_output_display() {
+        let machine_readable_fixture = r#"{"result":"json \u001b]8;;https://example.invalid\u0007link\u001b]8;;\u0007 carriage\rreturn"}"#;
+        let machine_readable_line =
+            serde_json::from_str::<serde_json::Value>(machine_readable_fixture).unwrap()["result"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        assert_eq!(
+            format_stdout_output(&machine_readable_line),
+            "[stdout] json \\u{1b}]8;;https://example.invalid\\u{7}link\\u{1b}]8;;\\u{7} carriage\\u{d}return"
+        );
+
+        let raw_output_line = "raw \x1b[2J bell\x07 carriage\rreturn";
+        assert_eq!(
+            format_stdout_output(raw_output_line),
+            "[stdout] raw \\u{1b}[2J bell\\u{7} carriage\\u{d}return"
+        );
+    }
+
+    #[test]
+    fn stdout_display_preserves_backslashes_and_escapes_all_terminal_controls() {
+        let printable = r"Windows C:\work\agent\output.txt regex ^\d+\s+$";
+        assert_eq!(
+            format_stdout_output(printable),
+            r"[stdout] Windows C:\work\agent\output.txt regex ^\d+\s+$"
+        );
+        assert_eq!(
+            format_stdout_output("line\nnext\x7f c1\u{009d} osc\x1b]0;title\x07"),
+            "[stdout] line\nnext\\u{7f} c1\\u{9d} osc\\u{1b}]0;title\\u{7}"
         );
     }
 
@@ -2408,6 +2771,9 @@ mod tests {
                 elapsed_ms: 100,
                 outcome: RecordedExecutionOutcome::Completed { exit_code: Some(0) },
                 cost: None,
+                estimated_cost: None,
+                usage: None,
+                report_failure: None,
             },
         ))
         .unwrap();
@@ -2956,7 +3322,7 @@ mod tests {
             "{}\n{}\n{}\n",
             serde_json::to_string(&current).unwrap(),
             serde_json::to_string(&old_event_with_format("old")).unwrap(),
-            serde_json::to_string(&old_event_with_format("agent-dock/events/v1alpha3")).unwrap()
+            serde_json::to_string(&old_event_with_format("agent-dock/events/v1alpha4")).unwrap()
         );
         fs::write(&path, &original).unwrap();
         let mut ask = |prompt: &str, default: bool| {
@@ -2986,7 +3352,7 @@ mod tests {
     fn preserves_an_incompatible_event_log_if_recreation_is_declined() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        for format_version in ["old", "agent-dock/events/v1alpha3"] {
+        for format_version in ["old", "agent-dock/events/v1alpha4"] {
             let original =
                 serde_json::to_string(&old_event_with_format(format_version)).unwrap() + "\n";
             fs::write(&path, &original).unwrap();
@@ -3008,7 +3374,7 @@ mod tests {
     fn preserves_an_incompatible_event_log_if_confirmation_is_interrupted() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        for format_version in ["old", "agent-dock/events/v1alpha3"] {
+        for format_version in ["old", "agent-dock/events/v1alpha4"] {
             let original =
                 serde_json::to_string(&old_event_with_format(format_version)).unwrap() + "\n";
             fs::write(&path, &original).unwrap();
@@ -3031,7 +3397,7 @@ mod tests {
     fn non_interactive_history_reads_reject_old_formats_without_changing_the_log() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        for format_version in ["old", "agent-dock/events/v1alpha3"] {
+        for format_version in ["old", "agent-dock/events/v1alpha4"] {
             let original =
                 serde_json::to_string(&old_event_with_format(format_version)).unwrap() + "\n";
             fs::write(&path, &original).unwrap();
@@ -3148,6 +3514,9 @@ mod tests {
                     elapsed_ms: 100,
                     outcome: RecordedExecutionOutcome::Completed { exit_code: Some(0) },
                     cost: None,
+                    estimated_cost: None,
+                    usage: None,
+                    report_failure: None,
                 },
             ))
             .unwrap();

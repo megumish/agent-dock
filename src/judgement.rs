@@ -192,6 +192,9 @@ mod tests {
                 elapsed_ms: 100,
                 outcome,
                 cost: None,
+                estimated_cost: None,
+                usage: None,
+                report_failure: None,
             },
         )
     }
