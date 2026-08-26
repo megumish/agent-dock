@@ -21,8 +21,9 @@ use agent_dock::{
     RecordedExecutionOutcome, ReplaceConfigOutcome, Segment, SegmentScore, SessionPhase,
     SkippedLineReason, Verdict, advise, apply_observation, configuration_for_profile,
     default_config_path, default_events_path, escape_terminal, execute, format_acceptance,
-    format_duration, format_recency, judgement_candidates, parse_hook_observation,
-    parse_observe_args, project, resolve_observed_session, safe_test_profile, segments_for_tags,
+    format_duration, format_recency, judgement_candidates, observe_cli_version,
+    parse_hook_observation, parse_observe_args, project, resolve_observed_session,
+    safe_test_profile, segments_for_tags,
 };
 use jiff::Timestamp;
 use rustyline::{DefaultEditor, error::ReadlineError};
@@ -246,6 +247,7 @@ async fn execute_and_record(
     cancellation: oneshot::Receiver<()>,
     mut on_event: impl FnMut(ExecutionEvent),
 ) -> Result<Option<ExecutionOutcome>, AppError> {
+    let observed_cli_version = observe_cli_version(profile).await;
     let started_at = Timestamp::now();
     let attempt_started = Instant::now();
     let mut report = ExecutionReport::default();
@@ -280,6 +282,7 @@ async fn execute_and_record(
                     message,
                 },
                 report,
+                observed_cli_version,
             );
             event_log.append(&Event::new(task_id, kind))?;
             return Ok(None);
@@ -307,6 +310,7 @@ async fn execute_and_record(
             elapsed_ms,
             recorded_outcome,
             report,
+            observed_cli_version,
         ),
     );
     event_log.append(&executed)?;
@@ -1163,7 +1167,12 @@ fn advice_default_index(advice: &Advice, profiles: &[ExecutionProfile]) -> usize
     advice
         .proposed_profile_id()
         .and_then(|profile_id| profiles.iter().position(|profile| profile.id == profile_id))
-        .unwrap_or(0)
+        .unwrap_or_else(|| {
+            profiles
+                .iter()
+                .position(|profile| profile.cli() != agent_dock::CliKind::Test)
+                .unwrap_or(0)
+        })
 }
 
 fn print_advice(advice: &Advice, profiles: &[ExecutionProfile], now: Timestamp) {
@@ -1589,6 +1598,7 @@ fn executed_event_kind(
     elapsed_ms: u64,
     outcome: RecordedExecutionOutcome,
     report: ExecutionReport,
+    observed_cli_version: Option<String>,
 ) -> EventKind {
     EventKind::Executed {
         origin: ExecutionOrigin::Brokered,
@@ -1601,6 +1611,8 @@ fn executed_event_kind(
         estimated_cost: report.estimated_cost,
         usage: report.usage,
         report_failure: report.report_failure,
+        observed_cli_version,
+        observed_models: report.observed_models,
     }
 }
 
@@ -1880,6 +1892,8 @@ mod tests {
                 estimated_cost: None,
                 usage: None,
                 report_failure: None,
+                observed_cli_version: None,
+                observed_models: Vec::new(),
             },
         );
         execution.event_id = candidate.target_event_id;
@@ -1977,7 +1991,7 @@ mod tests {
     async fn execute_and_record_persists_reports_for_completed_cancelled_and_parse_failed_runs() {
         let cases = [
             (
-                "#!/bin/sh\nprintf '%s\\n' '{\"result\":\"done\",\"total_cost_usd\":0.25,\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}'\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'fixture-cli 1.0\\n'; exit 0; fi\nprintf '%s\\n' '{\"result\":\"done\",\"total_cost_usd\":0.25,\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}'\n",
                 false,
                 Some(agent_dock::EstimatedCost {
                     currency: "USD".to_owned(),
@@ -1992,7 +2006,7 @@ mod tests {
                 None,
             ),
             (
-                "#!/bin/sh\ntrap 'exit 0' INT\nprintf '%s\\n' '{\"result\":\"cancelled\",\"total_cost_usd\":0.25,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}'\nprintf 'ready\\n' >&2\nwhile :; do sleep 1; done\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'fixture-cli 1.0\\n'; exit 0; fi\ntrap 'exit 0' INT\nprintf '%s\\n' '{\"result\":\"cancelled\",\"total_cost_usd\":0.25,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}'\nprintf 'ready\\n' >&2\nwhile :; do sleep 1; done\n",
                 true,
                 Some(agent_dock::EstimatedCost {
                     currency: "USD".to_owned(),
@@ -2007,7 +2021,7 @@ mod tests {
                 None,
             ),
             (
-                "#!/bin/sh\nprintf 'not-json\\n'\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'fixture-cli 1.0\\n'; exit 0; fi\nprintf 'not-json\\n'\n",
                 false,
                 None,
                 None,
@@ -2068,6 +2082,8 @@ mod tests {
                 estimated_cost,
                 usage,
                 report_failure,
+                observed_cli_version,
+                observed_models,
                 ..
             } = &events[0].kind
             else {
@@ -2078,7 +2094,105 @@ mod tests {
             assert_eq!(estimated_cost, &expected_cost);
             assert_eq!(usage, &expected_usage);
             assert_eq!(*report_failure, expected_failure);
+            assert_eq!(observed_cli_version.as_deref(), Some("fixture-cli 1.0"));
+            assert!(observed_models.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn execute_and_record_excludes_cli_version_observation_from_elapsed_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = write_test_executable(
+            directory.path(),
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    sleep 1
+    printf 'slow-fixture 1.0\n'
+    exit 0
+fi
+printf '%s\n' '{"result":"done"}'
+"#,
+        );
+        let profile = test_claude_profile(executable);
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let (_cancellation_sender, cancellation) = oneshot::channel();
+
+        let recorded = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            execute_and_record(
+                &log,
+                &profile,
+                Uuid::now_v7(),
+                "slow version observation".to_owned(),
+                directory.path().to_path_buf(),
+                cancellation,
+                |_| {},
+            ),
+        )
+        .await
+        .expect("slow version observation should not hang")
+        .unwrap()
+        .expect("execution should append an executed event");
+
+        let events = log.read_all().unwrap().events;
+        let EventKind::Executed {
+            elapsed_ms,
+            observed_cli_version,
+            ..
+        } = &events[0].kind
+        else {
+            panic!("the helper should append an executed event");
+        };
+        assert!(matches!(recorded, ExecutionOutcome::Completed { .. }));
+        assert_eq!(observed_cli_version.as_deref(), Some("slow-fixture 1.0"));
+        assert!(
+            *elapsed_ms < 500,
+            "recorded execution elapsed time included version observation: {elapsed_ms}ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_and_record_persists_claude_cli_and_model_observations() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = write_test_executable(
+            directory.path(),
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    printf 'fixture-claude 3.1\n'
+    exit 0
+fi
+printf '%s\n' '{"result":"done","modelUsage":{"claude-sonnet":{}}}'
+"#,
+        );
+        let profile = test_claude_profile(executable);
+        let log = EventLog::new(directory.path().join("events.jsonl"));
+        let (_cancellation_sender, cancellation) = oneshot::channel();
+
+        let recorded = execute_and_record(
+            &log,
+            &profile,
+            Uuid::now_v7(),
+            "model observation".to_owned(),
+            directory.path().to_path_buf(),
+            cancellation,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(recorded.is_some());
+        let events = log.read_all().unwrap().events;
+        assert_eq!(events.len(), 1);
+        let EventKind::Executed {
+            observed_cli_version,
+            observed_models,
+            ..
+        } = &events[0].kind
+        else {
+            panic!("the helper should append an executed event");
+        };
+        assert_eq!(observed_cli_version.as_deref(), Some("fixture-claude 3.1"));
+        assert_eq!(observed_models, &["claude-sonnet".to_owned()]);
     }
 
     #[tokio::test]
@@ -2347,6 +2461,7 @@ mod tests {
                         reasoning_tokens: Some(4),
                     }),
                     report_failure: None,
+                    observed_models: Vec::new(),
                 },
                 7,
             ),
@@ -2361,6 +2476,7 @@ mod tests {
                         reasoning_tokens: None,
                     }),
                     report_failure: None,
+                    observed_models: Vec::new(),
                 },
                 11,
             ),
@@ -2370,6 +2486,7 @@ mod tests {
                     estimated_cost: None,
                     usage: None,
                     report_failure: Some(agent_dock::ReportFailure::ParseFailure),
+                    observed_models: Vec::new(),
                 },
                 13,
             ),
@@ -2387,6 +2504,8 @@ mod tests {
                 estimated_cost: report.estimated_cost.clone(),
                 usage: report.usage.clone(),
                 report_failure: report.report_failure,
+                observed_cli_version: None,
+                observed_models: report.observed_models.clone(),
             };
             assert_eq!(
                 executed_event_kind(
@@ -2396,10 +2515,40 @@ mod tests {
                     elapsed_ms,
                     outcome,
                     report,
+                    None,
                 ),
                 expected
             );
         }
+    }
+
+    #[test]
+    fn records_runtime_cli_and_model_observations_in_executed_events() {
+        let profile = safe_test_profile();
+        let event = executed_event_kind(
+            ProfileSnapshot::from(&profile),
+            PathBuf::from("/tmp/project"),
+            "2026-08-01T01:02:03Z".parse().unwrap(),
+            7,
+            RecordedExecutionOutcome::Completed { exit_code: Some(0) },
+            ExecutionReport {
+                estimated_cost: None,
+                usage: None,
+                report_failure: None,
+                observed_models: vec!["model-a".to_owned(), "model-b".to_owned()],
+            },
+            Some("fixture-cli 1.2.3".to_owned()),
+        );
+
+        assert!(matches!(
+            event,
+            EventKind::Executed {
+                observed_cli_version: Some(version),
+                observed_models,
+                ..
+            } if version == "fixture-cli 1.2.3"
+                && observed_models == ["model-a", "model-b"]
+        ));
     }
 
     #[test]
@@ -2821,6 +2970,8 @@ mod tests {
                 estimated_cost: None,
                 usage: None,
                 report_failure: None,
+                observed_cli_version: None,
+                observed_models: Vec::new(),
             },
         ))
         .unwrap();
@@ -3188,11 +3339,17 @@ mod tests {
     fn chooses_the_proposed_profile_as_the_default_by_id() {
         let first = safe_test_profile();
         let mut declaration = agent_dock::safe_test_declaration();
+        declaration.cli = agent_dock::CliKind::Codex;
         declaration.model = Some("second".to_owned());
         let second = declaration.resolve(PathBuf::from("/usr/bin/true")).unwrap();
         let proposed = proposed_test_advice(&second.id);
         assert_eq!(advice_default_index(&proposed, &[first, second.clone()]), 1);
-        assert_eq!(advice_default_index(&test_advice(), &[second]), 0);
+        let first = safe_test_profile();
+        assert_eq!(advice_default_index(&test_advice(), &[first, second]), 1);
+        assert_eq!(
+            advice_default_index(&test_advice(), &[safe_test_profile()]),
+            0
+        );
     }
 
     #[test]
@@ -3369,7 +3526,7 @@ mod tests {
             "{}\n{}\n{}\n",
             serde_json::to_string(&current).unwrap(),
             serde_json::to_string(&old_event_with_format("old")).unwrap(),
-            serde_json::to_string(&old_event_with_format("agent-dock/events/v1alpha4")).unwrap()
+            serde_json::to_string(&old_event_with_format("agent-dock/events/v1alpha5")).unwrap()
         );
         fs::write(&path, &original).unwrap();
         let mut ask = |prompt: &str, default: bool| {
@@ -3399,7 +3556,7 @@ mod tests {
     fn preserves_an_incompatible_event_log_if_recreation_is_declined() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        for format_version in ["old", "agent-dock/events/v1alpha4"] {
+        for format_version in ["old", "agent-dock/events/v1alpha5"] {
             let original =
                 serde_json::to_string(&old_event_with_format(format_version)).unwrap() + "\n";
             fs::write(&path, &original).unwrap();
@@ -3421,7 +3578,7 @@ mod tests {
     fn preserves_an_incompatible_event_log_if_confirmation_is_interrupted() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        for format_version in ["old", "agent-dock/events/v1alpha4"] {
+        for format_version in ["old", "agent-dock/events/v1alpha5"] {
             let original =
                 serde_json::to_string(&old_event_with_format(format_version)).unwrap() + "\n";
             fs::write(&path, &original).unwrap();
@@ -3444,7 +3601,7 @@ mod tests {
     fn non_interactive_history_reads_reject_old_formats_without_changing_the_log() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        for format_version in ["old", "agent-dock/events/v1alpha4"] {
+        for format_version in ["old", "agent-dock/events/v1alpha5"] {
             let original =
                 serde_json::to_string(&old_event_with_format(format_version)).unwrap() + "\n";
             fs::write(&path, &original).unwrap();
@@ -3651,7 +3808,10 @@ mod tests {
     fn advises_from_all_tag_segments_in_event_log() {
         let directory = tempfile::tempdir().unwrap();
         let log = EventLog::new(directory.path().join("events.jsonl"));
-        let profile = safe_test_profile();
+        let mut declaration = agent_dock::safe_test_declaration();
+        declaration.cli = agent_dock::CliKind::Codex;
+        declaration.name = "Tag history fixture".to_owned();
+        let profile = declaration.resolve(PathBuf::from("/usr/bin/true")).unwrap();
         let tags: Vec<_> = (0..7).map(|index| format!("tag-{index}")).collect();
 
         for index in 0..3 {
@@ -3678,6 +3838,8 @@ mod tests {
                     estimated_cost: None,
                     usage: None,
                     report_failure: None,
+                    observed_cli_version: None,
+                    observed_models: Vec::new(),
                 },
             ))
             .unwrap();

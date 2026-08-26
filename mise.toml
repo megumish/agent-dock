@@ -7,5 +7,9 @@ run = "cargo run"
 raw = true
 
 [tasks.sample]
-description = "Replace the event log with a sample scenario"
+description = "Replace an explicitly selected event log with a sample scenario"
+usage = '''
+arg "<event-log-path>" help="Path to a development event log"
+arg "[scenario]" help="Synthetic scenario name"
+'''
 run = "cargo run --example sample_events --"

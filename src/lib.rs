@@ -17,7 +17,7 @@ pub use advice::{ADVICE_MIN_JUDGED, Advice, advise};
 pub use config::{Config, ConfigError, ConfigRevision, ReplaceConfigOutcome, default_config_path};
 pub use execution::{
     ExecutionError, ExecutionEvent, ExecutionOutcome, ExecutionReport, ExecutionRequest,
-    MAX_EXECUTION_OUTPUT_BYTES, OutputSource, execute,
+    MAX_CLI_VERSION_BYTES, MAX_EXECUTION_OUTPUT_BYTES, OutputSource, execute, observe_cli_version,
 };
 pub use hook::{
     HookEvent, HookObservation, HookParseError, MAX_HOOK_INPUT_BYTES, Provider,

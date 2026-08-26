@@ -669,6 +669,8 @@ mod tests {
                 estimated_cost: None,
                 usage: None,
                 report_failure: None,
+                observed_cli_version: None,
+                observed_models: Vec::new(),
             },
         }
     }
@@ -694,6 +696,8 @@ mod tests {
                 estimated_cost,
                 usage,
                 report_failure,
+                observed_cli_version: None,
+                observed_models: Vec::new(),
             },
         );
         event.occurred_at = timestamp(at);
@@ -1323,15 +1327,17 @@ mod tests {
     }
 
     #[test]
-    fn advice_candidate_and_evidence_ignore_reported_execution_values() {
+    fn projection_and_advice_ignore_reported_and_observed_execution_values() {
         let leader = {
             let mut declaration = crate::safe_test_declaration();
+            declaration.cli = crate::CliKind::Codex;
             declaration.name = "leader".to_owned();
             declaration.model = Some("leader".to_owned());
             declaration.resolve(PathBuf::from("/usr/bin/true")).unwrap()
         };
         let other = {
             let mut declaration = crate::safe_test_declaration();
+            declaration.cli = crate::CliKind::Codex;
             declaration.name = "other".to_owned();
             declaration.model = Some("other".to_owned());
             declaration.resolve(PathBuf::from("/usr/bin/true")).unwrap()
@@ -1394,6 +1400,23 @@ mod tests {
         }
         assert_eq!(changed_executions, 14);
 
+        let mut observed_events = baseline_events.clone();
+        let mut observed_executions = 0;
+        for event in &mut observed_events {
+            let EventKind::Executed {
+                observed_cli_version,
+                observed_models,
+                ..
+            } = &mut event.kind
+            else {
+                continue;
+            };
+            *observed_cli_version = Some("fixture-cli 1.2.3".to_owned());
+            *observed_models = vec!["observed-model".to_owned()];
+            observed_executions += 1;
+        }
+        assert_eq!(observed_executions, 14);
+
         let segments = [
             Segment::Tag("rust".to_owned()),
             Segment::Tag("docs".to_owned()),
@@ -1401,8 +1424,12 @@ mod tests {
         let tags = ["rust".to_owned(), "docs".to_owned()];
         let baseline_projection = project(&baseline_events, &profiles, &segments);
         let reported_projection = project(&reported_events, &profiles, &segments);
+        let observed_projection = project(&observed_events, &profiles, &segments);
+        assert_eq!(observed_projection, baseline_projection);
         let baseline_advice = crate::advise(&baseline_projection, &tags, &profiles);
         let reported_advice = crate::advise(&reported_projection, &tags, &profiles);
+        let observed_advice = crate::advise(&observed_projection, &tags, &profiles);
+        assert_eq!(observed_advice, baseline_advice);
 
         let (baseline_profile_id, baseline_evidence) = match &baseline_advice.outcome {
             crate::AdviceOutcome::Proposed {

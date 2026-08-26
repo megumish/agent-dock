@@ -1,12 +1,15 @@
 use std::{
     collections::BTreeMap,
-    io,
+    fmt, io,
     os::unix::process::CommandExt,
     process::ExitStatus,
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Deserializer};
+use serde::{
+    Deserialize, Deserializer,
+    de::{IgnoredAny, MapAccess, Visitor},
+};
 use serde_json::value::RawValue;
 use thiserror::Error;
 use tokio::{
@@ -20,6 +23,9 @@ use crate::{CliKind, EstimatedCost, ExecutionProfile, PromptTransport, ReportFai
 
 const TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(3);
 pub const MAX_EXECUTION_OUTPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_CLI_VERSION_BYTES: usize = 256;
+const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const CLI_VERSION_CAPTURE_BYTES: usize = 4096;
 const RAW_OUTPUT_FORWARD_CHUNK_BYTES: usize = 8 * 1024;
 const RAW_OUTPUT_FORWARD_MAX_PENDING_BYTES: usize = RAW_OUTPUT_FORWARD_CHUNK_BYTES + 3;
 
@@ -49,6 +55,7 @@ pub struct ExecutionReport {
     pub estimated_cost: Option<EstimatedCost>,
     pub usage: Option<TokenUsage>,
     pub report_failure: Option<ReportFailure>,
+    pub observed_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +67,76 @@ pub enum ExecutionOutcome {
     Cancelled {
         elapsed: Duration,
     },
+}
+
+pub async fn observe_cli_version(profile: &ExecutionProfile) -> Option<String> {
+    if profile.cli() == CliKind::Test {
+        return None;
+    }
+
+    let mut command = Command::new(&profile.resolved_executable);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    command.as_std_mut().process_group(0);
+    let mut child = command.spawn().ok()?;
+    let process_id = child.id();
+    let stdout = child.stdout.take()?;
+    let reader = tokio::spawn(read_cli_version_stdout(stdout));
+    let result = timeout(CLI_VERSION_TIMEOUT, async {
+        let status = child.wait().await.map_err(|_| ())?;
+        let bytes = reader.await.map_err(|_| ())?.map_err(|_| ())?;
+        Ok::<_, ()>((status, bytes))
+    })
+    .await;
+    let (status, bytes) = match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(())) | Err(_) => {
+            if let Some(process_id) = process_id {
+                let _ = signal_process_group(process_id, libc::SIGKILL);
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None;
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let output = String::from_utf8(bytes).ok()?;
+    let output = output.trim();
+    let length = utf8_prefix_len(output.as_bytes(), MAX_CLI_VERSION_BYTES);
+    Some(output[..length].to_owned()).filter(|output| !output.is_empty())
+}
+
+async fn read_cli_version_stdout(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+) -> io::Result<Vec<u8>> {
+    let mut first_line = Vec::new();
+    let mut first_line_complete = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        if first_line_complete {
+            continue;
+        }
+        let chunk = &buffer[..read];
+        let line_length = chunk
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(chunk.len());
+        let remaining = CLI_VERSION_CAPTURE_BYTES.saturating_sub(first_line.len());
+        first_line.extend_from_slice(&chunk[..line_length.min(remaining)]);
+        if line_length < chunk.len() {
+            first_line_complete = true;
+        }
+    }
+    Ok(first_line)
 }
 
 impl ExecutionOutcome {
@@ -493,6 +570,7 @@ struct ParsedSingleOutput {
 fn parse_claude_output(bytes: &[u8]) -> Result<ParsedSingleOutput, String> {
     let document = serde_json::from_slice::<ClaudeOutput>(bytes)
         .map_err(|error| format!("could not parse Claude JSON output: {error}"))?;
+    let observed_models = document.model_usage.clone().unwrap_or_default();
     let mut warnings = Vec::new();
     let mut report_failure = None;
     let estimated_cost = match document.total_cost_usd {
@@ -536,6 +614,7 @@ fn parse_claude_output(bytes: &[u8]) -> Result<ParsedSingleOutput, String> {
             estimated_cost,
             usage,
             report_failure,
+            observed_models,
         },
         warnings,
     })
@@ -552,11 +631,18 @@ fn parse_gemini_output(
     };
     let mut report = ExecutionReport::default();
     let mut warnings = Vec::new();
-    if let Some(models) = document.stats.and_then(|stats| stats.models) {
-        if models.len() == 1 {
-            let Some((model_name, model)) = models.iter().next() else {
-                unreachable!("a one-entry model map must have an entry");
-            };
+    let models = document
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.models.as_ref());
+    let observed_models = models.map_or_else(Vec::new, |models| models.names.clone());
+    if let Some(models) = models {
+        if models.names.len() == 1 {
+            let model_name = &models.names[0];
+            let model = models
+                .values
+                .get(model_name)
+                .expect("a one-entry model map must have an entry");
             if profile_model.is_none() || profile_model == Some(model_name.as_str()) {
                 report.usage = Some(TokenUsage {
                     input_tokens: model.tokens.as_ref().and_then(|tokens| tokens.prompt),
@@ -571,7 +657,7 @@ fn parse_gemini_output(
                         .to_owned(),
                 );
             }
-        } else if models.len() > 1 {
+        } else if models.names.len() > 1 {
             report.report_failure = Some(ReportFailure::ModelMismatch);
             warnings.push(
                 "Gemini usage was not recorded because stats.models did not identify one model"
@@ -581,7 +667,10 @@ fn parse_gemini_output(
     }
     Ok(ParsedSingleOutput {
         response: Some(response),
-        report,
+        report: ExecutionReport {
+            observed_models,
+            ..report
+        },
         warnings,
     })
 }
@@ -604,6 +693,7 @@ fn parse_antigravity_output(bytes: &[u8]) -> Result<ParsedSingleOutput, String> 
             estimated_cost: None,
             usage,
             report_failure: None,
+            observed_models: Vec::new(),
         },
         warnings: Vec::new(),
     })
@@ -616,6 +706,57 @@ struct ClaudeOutput {
     #[serde(default, deserialize_with = "deserialize_optional_raw_value")]
     total_cost_usd: Option<Option<Box<RawValue>>>,
     usage: Option<ClaudeUsage>,
+    #[serde(
+        rename = "modelUsage",
+        default,
+        deserialize_with = "deserialize_model_names"
+    )]
+    model_usage: Option<Vec<String>>,
+}
+
+fn deserialize_model_names<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ModelNamesVisitor;
+
+    impl<'de> Visitor<'de> for ModelNamesVisitor {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a JSON object containing model names")
+        }
+
+        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut names = Vec::new();
+            while let Some(name) = access.next_key::<String>()? {
+                access.next_value::<IgnoredAny>()?;
+                if !names.iter().any(|candidate| candidate == &name) {
+                    names.push(name);
+                }
+            }
+            Ok(Some(names))
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(ModelNamesVisitor)
 }
 
 fn deserialize_optional_raw_value<'de, D>(
@@ -642,7 +783,47 @@ struct GeminiOutput {
 
 #[derive(Debug, Deserialize)]
 struct GeminiStats {
-    models: Option<BTreeMap<String, GeminiModel>>,
+    models: Option<GeminiModels>,
+}
+
+#[derive(Debug)]
+struct GeminiModels {
+    names: Vec<String>,
+    values: BTreeMap<String, GeminiModel>,
+}
+
+impl<'de> Deserialize<'de> for GeminiModels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct GeminiModelsVisitor;
+
+        impl<'de> Visitor<'de> for GeminiModelsVisitor {
+            type Value = GeminiModels;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object containing Gemini model usage")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut names = Vec::new();
+                let mut values = BTreeMap::new();
+                while let Some((name, value)) = access.next_entry::<String, GeminiModel>()? {
+                    if !names.iter().any(|candidate| candidate == &name) {
+                        names.push(name.clone());
+                    }
+                    values.insert(name, value);
+                }
+                Ok(GeminiModels { names, values })
+            }
+        }
+
+        deserializer.deserialize_map(GeminiModelsVisitor)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -862,6 +1043,7 @@ impl CodexReportAccumulator {
             } else {
                 self.parse_failure.then_some(ReportFailure::ParseFailure)
             },
+            observed_models: Vec::new(),
         }
     }
 
@@ -1390,6 +1572,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observes_the_first_trimmed_version_line_before_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = write_script(
+            directory.path(),
+            "#!/bin/sh\nprintf ' \tfixture-cli 1.2.3  \r\nignored\\n'\n",
+        );
+
+        assert_eq!(
+            observe_cli_version(&profile(executable)).await,
+            Some("fixture-cli 1.2.3".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn treats_version_spawn_failure_and_empty_output_as_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = profile(directory.path().join("missing-agent"));
+        assert_eq!(observe_cli_version(&missing).await, None);
+
+        let empty = write_script(directory.path(), "#!/bin/sh\nexit 0\n");
+        assert_eq!(observe_cli_version(&profile(empty)).await, None);
+    }
+
+    #[tokio::test]
+    async fn treats_nonzero_version_exit_and_invalid_utf8_output_as_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let nonzero = write_script(
+            directory.path(),
+            "#!/bin/sh\nprintf 'fixture-cli 2.0\\n'\nexit 7\n",
+        );
+        assert_eq!(observe_cli_version(&profile(nonzero)).await, None);
+
+        let invalid_utf8 = write_script(directory.path(), "#!/bin/sh\nprintf '\\377\\n'\n");
+        assert_eq!(observe_cli_version(&profile(invalid_utf8)).await, None);
+    }
+
+    #[tokio::test]
+    async fn times_out_version_observation_without_blocking_forever() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = write_script(directory.path(), "#!/bin/sh\nwhile :; do sleep 1; done\n");
+
+        let started = Instant::now();
+        assert_eq!(observe_cli_version(&profile(executable)).await, None);
+        assert!(started.elapsed() >= CLI_VERSION_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn does_not_observe_a_version_for_the_test_adapter() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("invoked");
+        let executable = write_script(
+            directory.path(),
+            &format!(
+                "#!/bin/sh\ntouch {}\nprintf 'fixture\\n'\n",
+                marker.display()
+            ),
+        );
+
+        assert_eq!(observe_cli_version(&test_profile(executable)).await, None);
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn truncates_a_long_observed_version_without_splitting_utf8() {
+        let directory = tempfile::tempdir().unwrap();
+        let version = "版".repeat(MAX_CLI_VERSION_BYTES);
+        let executable = write_script(
+            directory.path(),
+            &format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n"),
+        );
+
+        let observed = observe_cli_version(&profile(executable)).await.unwrap();
+
+        assert_eq!(observed.len(), MAX_CLI_VERSION_BYTES - 1);
+        assert_eq!(observed, "版".repeat(MAX_CLI_VERSION_BYTES / "版".len()));
+    }
+
+    #[tokio::test]
     async fn passes_antigravity_prompt_as_an_argument() {
         let directory = tempfile::tempdir().unwrap();
         let executable = write_script(
@@ -1479,7 +1739,8 @@ mod tests {
                 "output_tokens":34,
                 "cache_read_input_tokens":5,
                 "cache_creation_input_tokens":99
-            }
+            },
+            "modelUsage":{"claude-sonnet":{},"claude-opus":{}}
         }"#;
         let parsed = parse_claude_output(fixture).unwrap();
         assert_eq!(parsed.response, Some("Claude answer".to_owned()));
@@ -1498,6 +1759,19 @@ mod tests {
                 cached_input_tokens: Some(5),
                 reasoning_tokens: None,
             })
+        );
+        assert_eq!(
+            parsed.report.observed_models,
+            vec!["claude-sonnet".to_owned(), "claude-opus".to_owned()]
+        );
+
+        let duplicate_models = parse_claude_output(
+            br#"{"result":"Claude answer","modelUsage":{"claude-sonnet":{},"claude-sonnet":{},"claude-opus":{}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            duplicate_models.report.observed_models,
+            vec!["claude-sonnet".to_owned(), "claude-opus".to_owned()]
         );
     }
 
@@ -1591,6 +1865,7 @@ mod tests {
                 reasoning_tokens: Some(4),
             })
         );
+        assert_eq!(parsed.report.observed_models, vec!["gemini-pro".to_owned()]);
         assert_eq!(parsed.report.report_failure, None);
 
         let parsed = parse_gemini_output(fixture, None).unwrap();
@@ -1615,6 +1890,10 @@ mod tests {
         let parsed = parse_gemini_output(mixed, Some("gemini-pro")).unwrap();
         assert_eq!(parsed.report.usage, None);
         assert_eq!(
+            parsed.report.observed_models,
+            vec!["gemini-pro".to_owned(), "gemini-flash".to_owned()]
+        );
+        assert_eq!(
             parsed.report.report_failure,
             Some(crate::ReportFailure::ModelMismatch)
         );
@@ -1637,6 +1916,7 @@ mod tests {
             ] {
                 let parsed = parse_gemini_output(fixture, profile_model).unwrap();
                 assert_eq!(parsed.report.usage, None);
+                assert!(parsed.report.observed_models.is_empty());
                 assert_eq!(parsed.report.report_failure, None);
             }
         }
@@ -1661,6 +1941,7 @@ mod tests {
                 reasoning_tokens: Some(4),
             })
         );
+        assert!(parsed.report.observed_models.is_empty());
     }
 
     #[test]
@@ -1694,6 +1975,7 @@ mod tests {
             let (events, report) =
                 single_output_events(bytes, exceeded, raw_output_forwarded, CliKind::Gemini, None);
             assert_eq!(report.report_failure, Some(failure));
+            assert!(report.observed_models.is_empty());
             assert!(!event_output_lines(&events).is_empty());
             assert_eq!(event_warnings(&events).len(), 1);
         }
@@ -1730,6 +2012,7 @@ mod tests {
             })
         );
         assert_eq!(result.report_failure, None);
+        assert!(result.observed_models.is_empty());
     }
 
     #[test]

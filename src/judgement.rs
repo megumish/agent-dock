@@ -195,6 +195,8 @@ mod tests {
                 estimated_cost: None,
                 usage: None,
                 report_failure: None,
+                observed_cli_version: None,
+                observed_models: Vec::new(),
             },
         )
     }

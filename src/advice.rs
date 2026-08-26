@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, collections::HashSet};
 
 use crate::{
-    AdviceEvidence, AdviceOutcome, AdviceReason, AdviceSegmentCount, EvidenceAcceptance,
+    AdviceEvidence, AdviceOutcome, AdviceReason, AdviceSegmentCount, CliKind, EvidenceAcceptance,
     EvidenceAxisSummary, EvidenceCost, EvidenceDuration, EvidenceSegment, ExecutionPlatform,
     ExecutionProfile, Projection, Segment, SegmentScore,
 };
@@ -60,6 +60,7 @@ pub fn advise(
     let profiles = selectable_profiles
         .iter()
         .filter(|profile| profile.execution_platform() == ExecutionPlatform::Headless)
+        .filter(|profile| profile.cli() != CliKind::Test)
         .filter_map(|profile| {
             seen_profiles
                 .insert(profile.id.as_str())
@@ -272,6 +273,7 @@ mod tests {
 
     fn profile(name: &str, model: &str) -> ExecutionProfile {
         let mut declaration = safe_test_declaration();
+        declaration.cli = CliKind::Codex;
         declaration.name = name.to_owned();
         declaration.model = Some(model.to_owned());
         declaration.resolve(PathBuf::from("/usr/bin/true")).unwrap()
@@ -316,6 +318,8 @@ mod tests {
                 estimated_cost: None,
                 usage: None,
                 report_failure: None,
+                observed_cli_version: None,
+                observed_models: Vec::new(),
             },
         );
         execution.occurred_at = at.parse().unwrap();
@@ -778,6 +782,23 @@ mod tests {
                 reason: AdviceReason::NoEvidence { .. }
             }
         ));
+    }
+
+    #[test]
+    fn excludes_test_profiles_from_candidates_even_when_their_evidence_is_best() {
+        let test = crate::safe_test_profile();
+        let real = profile("real", "real");
+        let projection = Projection {
+            scorecards: vec![
+                score_with_metrics(&test, 3, 100, 10),
+                score_with_metrics(&real, 0, 200, 20),
+            ],
+            ..Projection::default()
+        };
+
+        let advice = advise(&projection, &["rust".to_owned()], &[test, real.clone()]);
+
+        assert_eq!(advice.proposed_profile_id(), Some(real.id.as_str()));
     }
 
     #[test]

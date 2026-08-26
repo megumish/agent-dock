@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::{CliKind, ExecutionPlatform, ExecutionProfile, ProfileDeclaration};
 
-pub const EVENT_FORMAT_VERSION: &str = "agent-dock/events/v1alpha5";
+pub const EVENT_FORMAT_VERSION: &str = "agent-dock/events/v1alpha6";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
@@ -141,6 +141,7 @@ pub enum AdviceOutcome {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum EventKind {
@@ -176,6 +177,9 @@ pub enum EventKind {
         estimated_cost: Option<EstimatedCost>,
         usage: Option<TokenUsage>,
         report_failure: Option<ReportFailure>,
+        observed_cli_version: Option<String>,
+        #[serde(default)]
+        observed_models: Vec<String>,
     },
     Judged {
         verdict: Verdict,
@@ -957,6 +961,8 @@ mod tests {
                 estimated_cost: None,
                 usage: None,
                 report_failure: None,
+                observed_cli_version: None,
+                observed_models: Vec::new(),
             },
         )
     }
@@ -1089,6 +1095,32 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_observed_execution_fields_with_missing_and_empty_values() {
+        for (observed_cli_version, observed_models) in [
+            (
+                Some("fixture-cli 1.2.3".to_owned()),
+                vec!["model-a".to_owned(), "model-b".to_owned()],
+            ),
+            (None, Vec::new()),
+            (Some("fixture-cli".to_owned()), Vec::new()),
+        ] {
+            let mut event = completed_execution(Uuid::now_v7());
+            let EventKind::Executed {
+                observed_cli_version: event_version,
+                observed_models: event_models,
+                ..
+            } = &mut event.kind
+            else {
+                unreachable!("the helper creates an executed event");
+            };
+            *event_version = observed_cli_version;
+            *event_models = observed_models;
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+        }
+    }
+
+    #[test]
     fn distinguishes_an_unrecorded_prompt_from_an_empty_prompt() {
         let unrecorded = task_event(Uuid::now_v7(), None);
         let empty = task_event(Uuid::now_v7(), Some(""));
@@ -1148,6 +1180,8 @@ mod tests {
                     estimated_cost: None,
                     usage: None,
                     report_failure: None,
+                    observed_cli_version: None,
+                    observed_models: Vec::new(),
                 },
             )
         });
@@ -1283,6 +1317,8 @@ mod tests {
                                 estimated_cost: estimated_cost.clone(),
                                 usage: usage.clone(),
                                 report_failure: *report_failure,
+                                observed_cli_version: None,
+                                observed_models: Vec::new(),
                             },
                         );
                         let encoded = serde_json::to_string(&event).unwrap();

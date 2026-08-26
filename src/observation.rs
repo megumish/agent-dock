@@ -1286,12 +1286,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_v1alpha4_history_on_both_observation_entry_points() {
+    fn rejects_a_v1alpha5_history_on_both_observation_entry_points() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
         std::fs::write(
             &path,
-            br#"{"format_version":"agent-dock/events/v1alpha4"}
+            br#"{"format_version":"agent-dock/events/v1alpha5"}
 "#,
         )
         .unwrap();
