@@ -1,103 +1,106 @@
 # agent-dock
 
-agent-dock は、ローカルで制御するマルチエージェント環境を構築するプロジェクトである。
-本プロジェクトでは、この環境を**ドック**と呼ぶ。
-ドックは、AI モデルとツール、権限、実行基盤の組み合わせを**実行プロファイル**として登録し、実際の仕事で評価して役割ごとに使い分ける。
+> A local control plane for evaluating and routing AI agents using evidence from your own work.
 
-外部ベンチマークだけに頼らず、ユーザー自身の仕事から得た実測を証拠として蓄積する。
-蓄積した証拠に基づき、「このタスクには、どのモデルを、どの構成で使えば十分な品質を適切なコストで得られるか」を判断できるようにする。
-そのために、実際の仕事から適性判断に使う**スコア**を導く**評価**と、スコアに基づいて指示の委任先を選ぶ**振り分け**を同じ基盤で扱う。
-ドックが起動または仲介するすべての仕事を**評価イベント**として記録し、最終判断は常にユーザーが下す。
-理念と概念モデルの詳細は [VISION.md](./VISION.md) に記す。
+agent-dock is an experimental multi-agent environment designed to stay under the user's control. It treats each combination of an AI model, tools, permissions, and execution environment as an **execution profile**, evaluates those profiles on real work, and uses the resulting evidence to help decide which profile should handle future tasks.
 
-実装は `0.1.0-alpha.N` の開発確認版で評価と采配の循環を組み立て、最小のループが揃った `0.1.0` を最初の実用版としてリリースした。
-以後のマイルストーンは `0.2.0`、`0.3.0` と重ねる。
+The goal is not to find a universally "best" model. It is to answer a more practical question:
 
-## 文書の役割と関係
+> For this kind of task, which model and configuration are sufficient to produce acceptable results at an appropriate cost?
 
-製品の規範と設計は、**VISION（最上位の規範）→ DESIGN（0.1.0 の設計）→ ADR（0.2.0 以降の決定と理由）→ 実装**の順に具体化する。
-alpha の期間は ADR を作らず、実装しながら技術を探索する。
-下位の文書や実装を上位の文書と矛盾させることはできず、変更が必要な場合はユーザーの裁定により上位の文書から改定する。
-README は現在の利用方法への入口、リリース文書は各版で成立した事実の記録とし、規範や設計を再定義しない。
-DEPENDENCIES と AGENTS は、この具体化の順序とは別に、それぞれ依存関係と作業エージェントへ横断的な規則を課す。
-未決事項と将来の作業候補は Issue に置き、採択済みの規範や設計と区別する。
+External benchmarks are useful prior information, but they do not reflect every user's workflows, tools, permissions, prompts, or cost constraints. agent-dock therefore builds its primary evidence from the user's own work.
 
-<!-- markdownlint-disable MD013 -->
+The user's judgment remains authoritative. agent-dock can advise, record, and route, but the final decision stays with the user.
 
-| 文書 | 役割 |
-| --- | --- |
-| [README.md](./README.md) | プロジェクトの概要、現在の導入方法と利用方法、ほかの文書への入口を示す案内文書 |
-| [VISION.md](./VISION.md) | 理念、概念モデル、原則、成功基準、非目標を定め、数値や実装方式を扱わない最上位の規範文書 |
-| [DESIGN.md](./DESIGN.md) | 最初の実用版 0.1.0 の責務、不変条件、設計上の制約、対象範囲を定める設計文書 |
-| [DEPENDENCIES.md](./DEPENDENCIES.md) | 外部 crate の採用、更新、再評価に適用し、個別の依存一覧や版を扱わないプロジェクト共通の方針 |
-| [`docs/releases/`](./docs/releases/) | 各版で成立した機能、運用上の挙動、制限、変更履歴を保存し、規範や設計を再定義しない記録 |
-| `docs/adr/` | 0.2.0 以降の拡張で作成する決定と理由の記録であり、採択にはユーザーの承認が必要 |
-| [AGENTS.md](./AGENTS.md) | 作業エージェントに適用する手順と制約であり、製品の仕様を定めない運用文書 |
-| GitHub Issue | 未決事項、将来の作業候補、後続リリースで検討する内容を追跡する記録 |
+## How it works
 
-<!-- markdownlint-enable MD013 -->
+agent-dock connects **evaluation** and **routing** in one loop:
 
-## 推奨する読順
+1. Register execution profiles.
+2. Give agent-dock a task and its tags.
+3. agent-dock uses prior evidence to suggest a profile, or defers when the evidence is insufficient or ambiguous.
+4. The user approves the suggestion or chooses another profile.
+5. agent-dock either launches the selected CLI or observes a directly started session.
+6. The result is judged and recorded as an evaluation event.
+7. Those events are projected into scorecards that inform future routing decisions.
 
-1. [VISION.md](./VISION.md)
-2. [DESIGN.md](./DESIGN.md)
-3. [DEPENDENCIES.md](./DEPENDENCIES.md)
-4. [現在のリリース文書](./docs/releases/0.1.0.md)
+An execution profile is more than a model name. It represents the combination of model, provider, tools, permissions, and execution environment used for the work. This avoids attributing improvements from tooling or configuration changes to the underlying model itself.
 
-## 0.1.0
+### Local control
 
-0.1.0 は、評価と采配の循環がひととおり動く最初の実用版であり、成立した範囲は [0.1.0 のリリース文書](./docs/releases/0.1.0.md) に記録する。
-一つのタスクを登録済みの実行プロファイルへ依頼する仲介実行、ユーザーが直接起動した Claude Code と Codex CLI の対話セッションの観測、スコアカードを根拠とする助言を提供する。
-仲介実行は各 CLI の機械可読出力で起動し、CLI が申告する推定コストとトークン利用量を実支出と区別した申告値として記録し、スコアカードで開示する。
-仲介実行では Claude Code、Codex CLI、Gemini CLI、Antigravity CLI のヘッドレス実行を扱う。
-対応 OS は macOS に限り、ほかの OS での動作は保証しない。
+"Local" refers to control of the evidence, evaluation, and routing rules. Inference itself may happen locally or through a hosted API.
 
-Rust ツールチェーンは mise で管理する。
+agent-dock keeps its evaluation records locally and owns the boundary to external execution systems; it does not own the agents' output artifacts themselves.
+
+## Current status: 0.1.0
+
+0.1.0 is the first usable release containing the full basic evaluation-and-routing loop.
+
+It currently supports:
+
+- **Mediated headless execution** of Claude Code, Codex CLI, Gemini CLI, and Antigravity CLI using their machine-readable interfaces.
+- **Observation of directly started sessions** for Claude Code and Codex CLI through hooks.
+- **Append-only local evaluation events** for routing decisions, executions, attribution changes, and user judgments.
+- **Scorecards** derived from recorded evidence.
+- **Routing advice** based on evidence from tasks with matching tags.
+- **Explicit deferral** when there is not enough evidence or no unique candidate can be selected.
+
+The supported OS for 0.1.0 is **macOS**. Other operating systems are not currently guaranteed to work.
+
+For mediated executions, agent-dock records elapsed time together with usage and cost values reported by the underlying CLI when available. These reported values are kept separate from actual monetary spend. 0.1.0 does not obtain authoritative actual-spend data and records it as missing instead of estimating it.
+
+See [`docs/releases/0.1.0.md`](./docs/releases/0.1.0.md) for the exact behavior and limitations of the release.
+
+## Quick start
+
+The Rust toolchain is managed with [mise](https://mise.jdx.dev/).
 
 ```console
 mise install
 mise run
 ```
 
-過去実行へ受け入れ判定を追記する場合は、次のように起動する。
+On first launch, agent-dock can create four headless execution profiles plus interactive profiles for Claude Code and Codex CLI. The model, permission, and sandbox behavior used by each CLI continues to follow that CLI's normal configuration.
+
+### Judge a previous run
 
 ```console
 mise run default -- -- judge
 ```
 
-すべての登録済みプロファイルについて、仲介実行と帰属済みの直接実行を同じスコアカードで確認できる。
+### View scorecards
 
 ```console
 mise run default -- -- scorecard
 ```
 
-初回起動では、ユーザー設定ディレクトリに四つのヘッドレス実行プロファイルと、Claude Code、Codex CLI 用の二つの対話型プロファイルを作成するか確認する。
-実行する CLI のモデル、権限、サンドボックスは各 CLI の通常設定を継承する。
-対話型プロファイルへ直接実行を自動帰属させる場合は、実際に使うモデルと、必要に応じて `identity.permission_mode` を設定する。
+Mediated runs and attributed direct runs appear in the same scorecard system.
 
-タスクのタグを確定すると、候補の実行プロファイルを根拠とともに一件提示するか、証拠が不足しているか候補を一意に選べないあいだは理由とともに判断保留を返す。
-提示された候補は番号選択の既定値になり、従うか、別のプロファイルを指名するかはユーザーが選ぶ。
-候補の選定規則と根拠の内訳は [0.1.0-alpha.7 のリリース文書](./docs/releases/0.1.0-alpha.7.md) に、テストプロファイルの除外と判断保留時の既定値の変更は [0.1.0-alpha.10 のリリース文書](./docs/releases/0.1.0-alpha.10.md) に記録する。
+## Observing direct CLI sessions
 
-## 直接実行を観測する
+agent-dock can collect evaluation metadata from sessions that the user launches directly, without forcing every task through agent-dock itself.
 
-Claude Code の `SessionStart`、`SessionEnd`、`CwdChanged`、`StopFailure` hook には、標準入力を次のコマンドへ渡す。
+### Claude Code
+
+Pass hook input from Claude Code's `SessionStart`, `SessionEnd`, `CwdChanged`, and `StopFailure` hooks to:
 
 ```console
 agent-dock observe hook claude
 ```
 
-Codex CLI の `SessionStart`、`SessionEnd`、`Stop` hook には、標準入力を次のコマンドへ渡す。
+### Codex CLI
+
+Pass hook input from Codex CLI's `SessionStart`, `SessionEnd`, and `Stop` hooks to:
 
 ```console
 agent-dock observe hook codex
 ```
 
-hook の定義場所と command 型 hook の信頼確認は、それぞれの CLI の公式手順に従う。
-各コマンドは、許可したセッション識別子、作業ディレクトリ、モデル、権限モードだけを正規化し、会話記録のパス、入力、応答、ツールの引数と出力を保存しない。
+Follow each CLI's official instructions for configuring command hooks and trust/permission settings.
 
-タスクの開始と終了は自動推測せず、同じセッションで一つずつ明示する。
-外部セッション ID しか分からない場合は、最初にローカルセッション ID を取得する。
+The hook integration normalizes only the allowed session identifier, working directory, model, and permission mode. It does **not** store conversation transcript paths, prompts, responses, tool arguments, or tool outputs.
+
+Task boundaries are explicit rather than inferred automatically. If only an external session ID is known, first resolve the local session ID:
 
 ```console
 agent-dock observe session-find --cli codex --external-id <external-session-id>
@@ -105,10 +108,35 @@ agent-dock observe task-start --session <local-session-id> --tag rust
 agent-dock observe task-complete --session <local-session-id>
 ```
 
-中断したタスクは `task-interrupt` で閉じる。
-hook からモデルまたは必要な識別項目を取得できない場合は自動帰属せず、`task-start` と `task-complete` の両方へ `--profile '<対話型プロファイル名>'` を渡して構成を明示申告できる。
-終了境界では、タスク開始後に改めて届いた構成だけを使うため、終了まで構成を再通知しない Claude Code では通常この明示申告または後続の帰属訂正が必要になる。
-誤った帰属は `task-attribute` または `task-unattribute` で訂正し、過去イベントを上書きせず新しい帰属イベントを追記する。
+Use `task-interrupt` to close an interrupted task.
 
-0.1.0 は実支出を取得せず、欠測として明示する。
-現在の実装範囲と挙動は [0.1.0 のリリース文書](./docs/releases/0.1.0.md) に記録する。
+If hook metadata is insufficient for automatic attribution, pass `--profile '<interactive-profile-name>'` to both `task-start` and `task-complete`. Incorrect attribution can later be corrected with `task-attribute` or `task-unattribute`; corrections are appended as new events rather than rewriting the previous history.
+
+## Documentation
+
+The project's normative and implementation documents have distinct roles:
+
+| Document | Role |
+| --- | --- |
+| [`VISION.md`](./VISION.md) | Principles, conceptual model, success criteria, and non-goals. This is the highest-level normative document. |
+| [`DESIGN.md`](./DESIGN.md) | Responsibilities, invariants, constraints, and scope for 0.1.0. |
+| [`DEPENDENCIES.md`](./DEPENDENCIES.md) | Project-wide policy for adopting, updating, and reevaluating external crates. |
+| [`docs/releases/`](./docs/releases/) | Historical record of behavior, capabilities, limitations, and changes in each release. |
+| `docs/adr/` | Architectural decision records for changes from 0.2.0 onward. |
+| [`AGENTS.md`](./AGENTS.md) | Working instructions and constraints for coding agents contributing to the repository. |
+| GitHub Issues | Open questions and possible future work that have not yet become normative design decisions. |
+
+A useful reading order is:
+
+1. [`VISION.md`](./VISION.md)
+2. [`DESIGN.md`](./DESIGN.md)
+3. [`DEPENDENCIES.md`](./DEPENDENCIES.md)
+4. [`docs/releases/0.1.0.md`](./docs/releases/0.1.0.md)
+
+Most of the detailed design documentation is currently written in Japanese.
+
+## Design principle
+
+agent-dock is deliberately evidence-driven and user-controlled. It should not silently turn weak evidence into confident routing decisions, and it should not replace the user's value judgments with model-generated ones.
+
+When the evidence is insufficient, uncertainty is part of the answer.
